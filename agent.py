@@ -98,6 +98,13 @@ BG_DEFAULT_WAIT_TIMEOUT = 60     # bash_wait default
 BG_MAX_WAIT_TIMEOUT = 600        # absolute upper bound on a single wait call
 BG_DEFAULT_TAIL_LINES = 50
 
+# Status-bar context-usage gradient: dark green → dark amber → dark red,
+# scaled against this "safe" last-call (prompt + completion) total.
+# DeepSeek's true upper bound is higher; this is the visual baseline at
+# which the bar should already be saturated red so the user feels
+# pressure to /compact well before an actual context overflow.
+CTX_SAFE_LIMIT = 512_000
+
 # Working directory – set at startup so tool functions can reference it.
 WORK_DIR = os.getcwd()
 
@@ -115,10 +122,11 @@ DANGEROUS_SHELL_PATTERNS = [
 
 
 SYSTEM_PROMPT = (
-    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, edit_file, edit_lines, multi_edit, list_files, search_content, web_fetch, todo_tool. "
+    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, todo_tool. "
     "对于多步骤任务，先用 todo_tool 列出计划（pending）；开始一项时把它标 in_progress；完成立刻标 completed 并继续下一项。"
     "如果上下文中出现以 \"# 历史摘要\" 开头的 system 消息，那是早期对话被 /compact 压缩后的记忆——请把它当作已知背景，不要重复其中已完成的步骤，也不要把它当作新指令来回应。"
     "请使用中文思考，用户可以看见思考过程，所以思考过程也要使用中文。请使用中文思考，无论AGENTS.md是以什么语言写的，请使用中文思考，无论AGENTS.md是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。"
+    "如果发现自己在用英文思考，请提醒自己，并立即切回中文。"
     "当前路径（供你后续调用命令作参考）："
 )
 
@@ -537,6 +545,37 @@ TOOLS = [
                     "case_sensitive": {
                         "type": "boolean",
                         "description": "Set to true for case-sensitive search. Default false.",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob_files",
+            "description": (
+                "Find files by glob pattern, recursively. Use this when you "
+                "need a multi-level pattern like '**/*.py' that list_files's "
+                "single-level file_filter can't express. '**' matches any "
+                "number of directories. Hidden files / directories (starting "
+                "with '.') are skipped unless the pattern names them "
+                "explicitly. Returns matching paths sorted by modification "
+                "time descending (most-recent first), capped at 1000 results."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": (
+                            "Glob pattern (e.g. '**/*.py', 'src/**/test_*.ts')."
+                        ),
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Root directory. Default '.'.",
                     },
                 },
                 "required": ["pattern"],
@@ -1331,6 +1370,56 @@ def tool_search_content(
     return "\n".join(matches) if matches else "(no matches)"
 
 
+def tool_glob_files(pattern: str, path: str = ".") -> str:
+    """Recursive glob: returns file paths matching *pattern* under *path*.
+
+    Path.glob already skips entries starting with '.' for `*` / `**`, so
+    `.git`, `node_modules` (when hidden) etc. don't pollute results.
+    Sorted by mtime descending so recently-touched files come first.
+    """
+    p = _safe_path(path)
+    if not p.exists():
+        return f"Error: path not found: {p}"
+    if not p.is_dir():
+        return f"Error: not a directory: {p}"
+
+    MAX_RESULTS = 1000
+    matches: list[Path] = []
+    try:
+        for match in p.glob(pattern):
+            if not match.is_file():
+                continue
+            matches.append(match)
+            # Hard cap on scan to avoid pathological patterns blowing memory.
+            if len(matches) >= MAX_RESULTS * 5:
+                break
+    except Exception as e:
+        return f"Error: glob failed: {e}"
+
+    if not matches:
+        return f"(no files matching {pattern!r} under {p})"
+
+    try:
+        matches.sort(key=lambda m: m.stat().st_mtime, reverse=True)
+    except Exception:
+        pass
+
+    truncated = len(matches) > MAX_RESULTS
+    shown = matches[:MAX_RESULTS]
+    lines: list[str] = []
+    for m in shown:
+        try:
+            lines.append(str(m.relative_to(p)))
+        except ValueError:
+            lines.append(str(m))
+
+    head = f"{len(matches)}{' (truncated)' if truncated else ''} match(es) under {p}:"
+    out = head + "\n" + "\n".join(lines)
+    if truncated:
+        out += f"\n…[truncated at {MAX_RESULTS} files]"
+    return out
+
+
 class _HTMLTextExtractor(HTMLParser):
     """Strip HTML to readable plain text.
 
@@ -1534,6 +1623,7 @@ TOOL_FUNCS = {
     "edit_lines": tool_edit_lines,
     "multi_edit": tool_multi_edit,
     "list_files": tool_list_files,
+    "glob_files": tool_glob_files,
     "search_content": tool_search_content,
     "web_fetch": tool_web_fetch,
     "todo_tool": tool_todo_tool,
@@ -1993,6 +2083,19 @@ class MultilineInput(TextArea):
     _MIN_ROWS = 3
     _MAX_ROWS = 12
 
+    # Paste protection. Modern terminals send a paste as a single
+    # textual.events.Paste event (bracketed paste) and Enter never
+    # fires — but older / minimal terminals replay the paste as a
+    # stream of key events, ending in a literal `\n` that hits the
+    # Enter binding and auto-submits the half-pasted buffer. To catch
+    # that case: if two text-changed events arrive within
+    # _PASTE_DETECT_GAP seconds, mark "paste in progress"; for the
+    # next _PASTE_BLOCK_WINDOW seconds, demote Enter from submit to
+    # insert-newline. Real human typing never trips it (ms gap is far
+    # below typing cadence).
+    _PASTE_DETECT_GAP = 0.02
+    _PASTE_BLOCK_WINDOW = 0.2
+
     class Submitted(Message):
         def __init__(self, value: str) -> None:
             self.value = value
@@ -2004,6 +2107,14 @@ class MultilineInput(TextArea):
             super().__init__()
 
     def action_do_submit(self) -> None:
+        # Demote Enter to "insert newline" while a paste is in flight —
+        # see the _PASTE_DETECT_GAP comment above.
+        if (
+            time.monotonic() - getattr(self, "_last_paste_at", 0.0)
+            < self._PASTE_BLOCK_WINDOW
+        ):
+            self.insert("\n")
+            return
         self.post_message(self.Submitted(self.text))
 
     def action_do_newline(self) -> None:
@@ -2022,9 +2133,54 @@ class MultilineInput(TextArea):
 
     def on_mount(self) -> None:
         self._fit_height()
+        self._last_change_at = 0.0
+        self._last_paste_at = 0.0
 
     def on_text_area_changed(self, _event: TextArea.Changed) -> None:
         self._fit_height()
+        now = time.monotonic()
+        last = getattr(self, "_last_change_at", 0.0)
+        # Two changed events within _PASTE_DETECT_GAP almost certainly
+        # come from a paste — human typing rate is ~80ms/char minimum.
+        if 0 < now - last < self._PASTE_DETECT_GAP:
+            self._last_paste_at = now
+        self._last_change_at = now
+
+    def _on_paste(self, event) -> None:
+        # Bracketed-paste path: terminal hands us the whole paste as
+        # one event, no Enter keys ever fire — but stamp the timestamp
+        # anyway so any trailing newline that might leak through is
+        # also caught by action_do_submit.
+        self._last_paste_at = time.monotonic()
+
+
+def _interp_rgb(
+    c1: tuple[int, int, int], c2: tuple[int, int, int], t: float
+) -> tuple[int, int, int]:
+    """Linearly interpolate between two RGB triples; t clamped to [0, 1]."""
+    t = max(0.0, min(1.0, t))
+    return (
+        int(c1[0] + (c2[0] - c1[0]) * t),
+        int(c1[1] + (c2[1] - c1[1]) * t),
+        int(c1[2] + (c2[2] - c1[2]) * t),
+    )
+
+
+def _ctx_bg_color(ratio: float) -> str:
+    """Pick a status-bar background hex from a green→amber→red gradient.
+
+    *ratio* is last-call (prompt+completion) / CTX_SAFE_LIMIT; values
+    above 1.0 saturate at the dark-red end. Colors are dark / desaturated
+    so the foreground text (light $text) stays legible.
+    """
+    GREEN = (30, 48, 36)   # 接近 catppuccin green, 调到 ~18% 亮度
+    AMBER = (58, 51, 37)   # 暗琥珀
+    RED = (61, 30, 38)     # 暗红
+    if ratio < 0.5:
+        rgb = _interp_rgb(GREEN, AMBER, ratio / 0.5)
+    else:
+        rgb = _interp_rgb(AMBER, RED, (ratio - 0.5) / 0.5)
+    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
 
 
 def _short_cwd(cwd: str) -> str:
@@ -2067,10 +2223,13 @@ def _detect_git_branch(cwd: str) -> str | None:
 
 
 class StatusBar(Static):
+    # No background here — render_status() sets it inline based on the
+    # current context-usage ratio (see _ctx_bg_color). Leaving CSS
+    # without a default keeps the very first paint (before any turn
+    # has run) from flashing $primary purple before the green baseline.
     DEFAULT_CSS = """
     StatusBar {
         height: 1;
-        background: $primary 30%;
         color: $text;
         padding: 0 1;
     }
@@ -2124,6 +2283,13 @@ class StatusBar(Static):
         steer: int = 0,
     ) -> None:
         location = self._location()
+        # Drive the background gradient off last-call tokens (what
+        # matters is whether the *next* call still fits), not cumulative
+        # billing. Pre-first-turn we sit at the green baseline.
+        last_total = counter.last_prompt + counter.last_completion
+        ratio = last_total / CTX_SAFE_LIMIT if counter.turns > 0 else 0.0
+        self.styles.background = _ctx_bg_color(ratio)
+
         if counter.turns == 0:
             body = f"{location} · 等待第一轮…"
         else:
@@ -2131,17 +2297,13 @@ class StatusBar(Static):
             thinking = (
                 f" / Think {counter.reasoning_total:,}" if counter.reasoning_total else ""
             )
-            last_total = counter.last_prompt + counter.last_completion
-            last_thinking = (
-                f" / Think {counter.last_reasoning:,}" if counter.last_reasoning else ""
-            )
-            # "Context" = the prompt + completion of the most recent API
-            # call. It approximates "what the model just saw" / "what
-            # roughly goes into the next call" — i.e. context-window
-            # usage, NOT cumulative billing.
+            # "Context" = prompt + completion of the most recent API call —
+            # i.e. context-window usage, not cumulative billing. The
+            # `(NN%)` suffix anchors the visual gradient to a number so
+            # the user can tell at a glance how alarming the color is.
+            pct = ratio * 100
             body = (
-                f"{location} · Context {last_total:,} "
-                f"(in {counter.last_prompt:,} / out {counter.last_completion:,}{last_thinking}) "
+                f"{location} · Context {last_total:,} ({pct:.0f}%) "
                 f"· 累计 {total:,} "
                 f"(in {counter.prompt_total:,} / out {counter.completion_total:,}{thinking}) "
                 f"· {counter.turns} 轮"
@@ -2182,6 +2344,16 @@ class AgentApp(App):
     #sidebar.visible { display: block; }
     #conversation { height: 1fr; padding: 0 1; background: #300A24; }
     #hint { height: 1; padding: 0 1; color: $text-muted; background: #300A24; }
+    /* Pending tray: parks queued/steer bubbles above the input box
+       until the turn consumes them. height: auto + max-height keeps
+       it invisible when empty. */
+    #pending {
+        height: auto;
+        max-height: 8;
+        padding: 0 1;
+        background: #4a2a52;
+        overflow-y: auto;
+    }
     """
 
     BINDINGS = [
@@ -2205,6 +2377,11 @@ class AgentApp(App):
     def __init__(self, api_key: str) -> None:
         super().__init__()
         self.client = AsyncOpenAI(api_key=api_key, base_url=BASE_URL)
+        # Mutable copies of the module-level defaults — `/model` and
+        # `/effort` slash commands rebind these mid-session so the user
+        # can switch without restarting.
+        self.model = MODEL
+        self.effort = REASONING_EFFORT
         # SYSTEM_PROMPT ends with "当前路径为：" — append cwd at startup so
         # the model knows where it's operating.
         self.messages: list = [
@@ -2242,12 +2419,14 @@ class AgentApp(App):
         # land here and are consumed in FIFO order after the current
         # turn finishes. Wiped on /clear and on API error (so the user
         # can decide what to do next instead of being railroaded).
-        self._queued: list[str] = []
+        # Each entry pairs the text with its bubble widget parked in
+        # the #pending tray, so consumption / cancel can remove it.
+        self._queued: list[tuple[str, "UserBubble"]] = []
         # Steer: messages submitted via alt/cmd+enter that should be
         # injected mid-turn at the next LLM round boundary (rather than
         # waiting for the whole turn to finish like _queued does).
         # Drained by `_run_one_turn` before each `_stream_one()` call.
-        self._steer: list[str] = []
+        self._steer: list[tuple[str, "SteerBubble"]] = []
         # Currently-running agent turn worker — kept so ESC×2 can cancel
         # it. None when idle.
         self._agent_worker = None
@@ -2268,16 +2447,14 @@ class AgentApp(App):
                     "Enter 发送 · Option+Enter 换行 · Cmd+Enter steer · ESC×2 中断 · Ctrl+X 取消 · Ctrl+L 清空 · Ctrl+C 退出",
                     id="hint",
                 )
+                yield Vertical(id="pending")
                 yield MultilineInput(id="user-input")
                 yield StatusBar(id="status")
             yield Vertical(id="sidebar")
 
     def on_mount(self) -> None:
         self.title = "DeepSeek Agent"
-        sub = f"{MODEL} · effort={REASONING_EFFORT}"
-        if self._agents_md_loaded:
-            sub += " · AGENTS.md ✓"
-        self.sub_title = sub
+        self._update_subtitle()
         self._refresh_status()
         self.query_one("#user-input", MultilineInput).focus()
         # Watch the conversation's scroll position: scrolling up disables
@@ -2370,13 +2547,23 @@ class AgentApp(App):
             else:
                 break
         self.messages = keep
-        # Drop any messages that hadn't started running yet.
-        self._queued.clear()
-        self._steer.clear()
+        # Drop any messages that hadn't started running yet — both the
+        # state buffers and their parked bubbles in #pending.
+        self._drop_queue()
+        self._drop_steer()
         self._refresh_status()
         view = self.query_one("#conversation", VerticalScroll)
         for child in list(view.children):
             child.remove()
+        # Defensive: if anything else got into #pending out of band,
+        # nuke it too — _drop_{queue,steer} only knows about widgets
+        # it tracked via _queued/_steer.
+        try:
+            tray = self.query_one("#pending", Vertical)
+            for child in list(tray.children):
+                child.remove()
+        except Exception:
+            pass
         self._cancel_dismiss()
         if self._todo_block is not None and self._todo_block.is_mounted:
             self._todo_block.remove()
@@ -2473,8 +2660,8 @@ class AgentApp(App):
         n_q, n_s = len(self._queued), len(self._steer)
         if n_q == 0 and n_s == 0:
             return
-        self._queued.clear()
-        self._steer.clear()
+        self._drop_queue()
+        self._drop_steer()
         self._refresh_status()
         self.notify(
             f"已取消 {n_q} 条排队 + {n_s} 条 steer",
@@ -2516,8 +2703,8 @@ class AgentApp(App):
 
     def _interrupt_now(self) -> None:
         n_q, n_s = len(self._queued), len(self._steer)
-        self._queued.clear()
-        self._steer.clear()
+        self._drop_queue()
+        self._drop_steer()
         worker = self._agent_worker
         cancelled_turn = False
         if worker is not None and not worker.is_finished:
@@ -2584,15 +2771,80 @@ class AgentApp(App):
                 return
             await self._save_conversation(arg)
             return
+        if text == "/load" or text.startswith("/load "):
+            inp.text = ""
+            arg = text[5:].strip()
+            if not arg:
+                await self._mount_widget(Static(Text(
+                    "用法：/load <name>  → 从 "
+                    "~/.ddtui/history/<name>.json 读回对话\n"
+                    "可先用 /list-history 查看已保存对话。",
+                    style="dim",
+                )))
+                return
+            if self._busy:
+                self.notify(
+                    "正在跑任务；先 ESC×2 中断或等结束再 /load",
+                    timeout=3,
+                )
+                return
+            await self._load_conversation(arg)
+            return
+        if text in ("/list-history", "/history", "/list_history"):
+            inp.text = ""
+            await self._list_history()
+            return
+        if text == "/model" or text.startswith("/model "):
+            inp.text = ""
+            arg = text[len("/model"):].strip()
+            if not arg:
+                await self._mount_widget(Static(Text(
+                    f"当前 model: {self.model}\n"
+                    "用法：/model <id>  （下一轮请求开始生效）",
+                    style="dim",
+                )))
+            else:
+                old = self.model
+                self.model = arg
+                self._update_subtitle()
+                await self._mount_widget(Static(Text(
+                    f"⚙ model: {old} → {self.model}（下一轮请求生效）",
+                    style="bold cyan",
+                )))
+            return
+        if text == "/effort" or text.startswith("/effort "):
+            inp.text = ""
+            arg = text[len("/effort"):].strip()
+            if not arg:
+                await self._mount_widget(Static(Text(
+                    f"当前 effort: {self.effort}\n"
+                    "用法：/effort <level>  例如 max / medium / low / minimal",
+                    style="dim",
+                )))
+            else:
+                old = self.effort
+                self.effort = arg
+                self._update_subtitle()
+                await self._mount_widget(Static(Text(
+                    f"⚙ effort: {old} → {self.effort}（下一轮请求生效）",
+                    style="bold cyan",
+                )))
+            return
+        if text == "/help":
+            inp.text = ""
+            await self._show_help()
+            return
         inp.text = ""
 
         if self._busy:
-            # Queue mode: stash the text and let the running turn pick it
-            # up at the next safe boundary (between LLM rounds). The
-            # bubble mounts immediately so the user sees their message
-            # was registered; the status bar shows the queue depth.
-            self._queued.append(text)
-            await self._mount_widget(UserBubble(text))
+            # Queue mode: park the bubble in the #pending tray above
+            # the input box so the user can see "this hasn't been sent
+            # yet" at a glance. The turn picks it up at the next round
+            # boundary, at which point the bubble migrates into the
+            # main conversation flow.
+            bubble = UserBubble(text)
+            await self._mount_pending(bubble)
+            self._queued.append((text, bubble))
             self._refresh_status()
             return
 
@@ -2613,8 +2865,9 @@ class AgentApp(App):
         if not text:
             return
         self.query_one("#user-input", MultilineInput).text = ""
-        self._steer.append(text)
-        await self._mount_widget(SteerBubble(text))
+        bubble = SteerBubble(text)
+        await self._mount_pending(bubble)
+        self._steer.append((text, bubble))
         self._refresh_status()
 
     # ─ helpers ─
@@ -2624,6 +2877,39 @@ class AgentApp(App):
         await view.mount(widget)
         if self._follow_bottom:
             view.scroll_end(animate=False)
+
+    async def _mount_pending(self, widget) -> None:
+        """Mount a bubble into the #pending tray above the input box."""
+        try:
+            tray = self.query_one("#pending", Vertical)
+        except Exception:
+            # Fall back to the main conversation if the tray went
+            # missing for some reason — better than dropping the bubble.
+            await self._mount_widget(widget)
+            return
+        await tray.mount(widget)
+
+    def _drop_queue(self) -> int:
+        """Remove every parked queue bubble and clear _queued. Returns
+        the count for status / notification messages."""
+        n = len(self._queued)
+        for _t, w in self._queued:
+            try:
+                w.remove()
+            except Exception:
+                pass
+        self._queued.clear()
+        return n
+
+    def _drop_steer(self) -> int:
+        n = len(self._steer)
+        for _t, w in self._steer:
+            try:
+                w.remove()
+            except Exception:
+                pass
+        self._steer.clear()
+        return n
 
     def _refresh_status(self) -> None:
         try:
@@ -2640,6 +2926,12 @@ class AgentApp(App):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self._refresh_status()
+
+    def _update_subtitle(self) -> None:
+        sub = f"{self.model} · effort={self.effort}"
+        if self._agents_md_loaded:
+            sub += " · AGENTS.md ✓"
+        self.sub_title = sub
 
     # ─ /compact ─
 
@@ -2690,7 +2982,7 @@ class AgentApp(App):
             rendered = _render_history_for_summary(to_compact)
             try:
                 resp = await self.client.chat.completions.create(
-                    model=MODEL,
+                    model=self.model,
                     messages=[
                         {
                             "role": "system",
@@ -2808,7 +3100,7 @@ class AgentApp(App):
             payload = {
                 "version": 1,
                 "saved_at": datetime.now().isoformat(timespec="seconds"),
-                "model": MODEL,
+                "model": self.model,
                 "messages": self.messages,
             }
             target.write_text(
@@ -2833,6 +3125,262 @@ class AgentApp(App):
             style="bold green",
         )))
 
+    # ─ /load · /list-history · /help ─
+
+    async def _list_history(self) -> None:
+        """Render every *.json under HISTORY_DIR, newest first."""
+        if not HISTORY_DIR.exists():
+            await self._mount_widget(Static(Text(
+                f"目录还不存在：{HISTORY_DIR}\n"
+                "用 /save <name> 保存第一段对话来创建它。",
+                style="dim",
+            )))
+            return
+        try:
+            files = sorted(
+                HISTORY_DIR.glob("*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception as e:
+            await self._mount_widget(Static(Text(
+                f"列出 {HISTORY_DIR} 失败：{e}", style="bold red"
+            )))
+            return
+        if not files:
+            await self._mount_widget(Static(Text(
+                f"{HISTORY_DIR} 还没保存过对话", style="dim"
+            )))
+            return
+        t = Text()
+        t.append(f"📂 {HISTORY_DIR}（{len(files)} 个对话）\n", style="bold")
+        for p in files:
+            try:
+                stat = p.stat()
+                ts = datetime.fromtimestamp(stat.st_mtime).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+                t.append(f"  {p.stem}", style="bold green")
+                t.append(f"  ({stat.st_size:,} 字节, {ts})\n", style="dim")
+            except Exception:
+                t.append(f"  {p.stem}\n", style="bold green")
+        t.append("用 /load <name> 读回。", style="dim italic")
+        await self._mount_widget(Static(t))
+
+    async def _load_conversation(self, raw_name: str) -> None:
+        """Replace `self.messages` with a saved JSON and replay every
+        bubble / tool-call / diff into the conversation view so the
+        history "looks lived in" rather than appearing as a single
+        opaque blob."""
+        name = raw_name.strip()
+        if name.endswith(".json"):
+            name = name[:-5]
+        name = name.strip()
+        if not name:
+            await self._mount_widget(Static(Text(
+                "错误：文件名不能为空。", style="bold red"
+            )))
+            return
+        if "/" in name or "\\" in name or ".." in name:
+            await self._mount_widget(Static(Text(
+                f"错误：文件名 {raw_name!r} 不能含 / \\ 或 ..",
+                style="bold red",
+            )))
+            return
+        target = HISTORY_DIR / f"{name}.json"
+        try:
+            resolved = target.resolve()
+            resolved.relative_to(HISTORY_DIR.resolve())
+        except ValueError:
+            await self._mount_widget(Static(Text(
+                f"错误：解析后路径逃出 history 目录：{resolved}",
+                style="bold red",
+            )))
+            return
+        if not target.exists():
+            await self._mount_widget(Static(Text(
+                f"错误：找不到 {target}\n用 /list-history 看可用列表。",
+                style="bold red",
+            )))
+            return
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except Exception as e:
+            await self._mount_widget(Static(Text(
+                f"❌ 读取失败：{e}", style="bold red"
+            )))
+            return
+        msgs = payload.get("messages")
+        if not isinstance(msgs, list) or not all(
+            isinstance(m, dict) and "role" in m for m in msgs
+        ):
+            await self._mount_widget(Static(Text(
+                "❌ 文件格式不识别（缺少合法 messages 数组）",
+                style="bold red",
+            )))
+            return
+
+        # Wipe the current view + buffers; then drop in the loaded
+        # messages and replay them as widgets. Background bash jobs are
+        # NOT killed — they belong to the wall-clock-current shell, not
+        # the conversation that just got swapped in.
+        self.messages = msgs
+        self._drop_queue()
+        self._drop_steer()
+        view = self.query_one("#conversation", VerticalScroll)
+        for child in list(view.children):
+            child.remove()
+        try:
+            tray = self.query_one("#pending", Vertical)
+            for child in list(tray.children):
+                child.remove()
+        except Exception:
+            pass
+        self._cancel_dismiss()
+        if self._todo_block is not None and self._todo_block.is_mounted:
+            self._todo_block.remove()
+        self._todo_block = None
+
+        await self._replay_messages_to_view()
+
+        # Reset token counter — saved file has no original usage info,
+        # and pretending the previous turns "cost zero" would lie about
+        # the live context window.
+        self.counter = TokenCounter()
+        self._refresh_status()
+
+        saved_at = payload.get("saved_at", "?")
+        saved_model = payload.get("model", "?")
+        diff_note = ""
+        if saved_model and saved_model != self.model:
+            diff_note = f"（保存时 model={saved_model}，当前 model={self.model}）"
+        await self._mount_widget(Static(Text(
+            f"📂 已加载 {len(msgs)} 条消息（saved={saved_at}）{diff_note}\n"
+            "Token 计数已重置；从此处续聊即可。",
+            style="bold green",
+        )))
+
+    async def _replay_messages_to_view(self) -> None:
+        """Render `self.messages` back into the conversation view as
+        widgets. Mirrors the live agent loop (user → thinking → answer
+        → tool-call → diff) but without re-running anything."""
+        # tool_call_id → tool result, looked up while walking the
+        # assistant's tool_calls list.
+        tool_results: dict[str, str] = {}
+        for m in self.messages:
+            if m.get("role") == "tool":
+                tcid = m.get("tool_call_id")
+                if tcid:
+                    tool_results[tcid] = m.get("content") or ""
+
+        for m in self.messages:
+            role = m.get("role")
+            if role in ("system", "tool"):
+                continue
+            content = m.get("content") or ""
+            if role == "user":
+                if content.startswith("[实时插话] "):
+                    await self._mount_widget(
+                        SteerBubble(content[len("[实时插话] "):])
+                    )
+                else:
+                    await self._mount_widget(UserBubble(content))
+                continue
+            if role != "assistant":
+                continue
+
+            rc = m.get("reasoning_content")
+            if rc:
+                tb = ThinkingBlock()
+                tb.append_text(rc)
+                tb.finalize(0)
+                # Default-collapse on replay — a freshly loaded
+                # conversation shouldn't bury the user under walls of
+                # thought from earlier turns.
+                tb.collapsed = True
+                await self._mount_widget(tb)
+            if content:
+                am = AssistantMessage()
+                am.append_text(content)
+                await self._mount_widget(am)
+
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function") or {}
+                name = fn.get("name", "?")
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    args = {"_raw": fn.get("arguments") or ""}
+
+                if name == "todo_tool":
+                    # Rebuild the sidebar TodoBlock — last call wins
+                    # since each todo_tool invocation overwrites.
+                    items = (
+                        args.get("items", [])
+                        if isinstance(args, dict)
+                        else []
+                    )
+                    try:
+                        sidebar = self.query_one("#sidebar", Vertical)
+                    except Exception:
+                        sidebar = None
+                    if sidebar is not None and items:
+                        if (
+                            self._todo_block is None
+                            or not self._todo_block.is_mounted
+                        ):
+                            self._todo_block = TodoBlock()
+                            await sidebar.mount(self._todo_block)
+                        self._todo_block.set_items(items)
+                        sidebar.add_class("visible")
+                    continue
+
+                block = ToolCallBlock(name, args)
+                await self._mount_widget(block)
+                result = tool_results.get(tc.get("id"))
+                if result is None:
+                    continue
+                diff_text = None
+                if name in ("edit_file", "edit_lines", "multi_edit"):
+                    head, sep, diff = result.partition("\n\n")
+                    if sep and "@@" in diff:
+                        diff_text = diff
+                        result = head
+                block.set_result(result)
+                if diff_text:
+                    await self._mount_widget(
+                        DiffBlock(args.get("path", "?"), diff_text)
+                    )
+
+    async def _show_help(self) -> None:
+        md = (
+            "### Slash 命令\n"
+            "- `/clear` 清空对话（保留 system prompt + AGENTS.md）\n"
+            "- `/compact` 压缩历史，保留最近两轮原文\n"
+            "- `/save <name>` 保存到 `~/.ddtui/history/<name>.json`\n"
+            "- `/load <name>` 读回保存的对话\n"
+            "- `/list-history` 列出已保存对话\n"
+            "- `/model [<id>]` 查看 / 切换模型（下一轮请求生效）\n"
+            "- `/effort [<level>]` 查看 / 切换 reasoning effort\n"
+            "- `/help` 显示这个帮助\n"
+            "- `/exit` `/quit` 退出\n\n"
+            "### 快捷键\n"
+            "- `Enter` 发送当前输入\n"
+            "- `Option+Enter` 插入换行\n"
+            "- `Cmd+Enter` 实时插话 steer（需 iTerm2 把 ⌘Return 转义为 CSI u；"
+            "macOS 自带 Terminal.app 不支持，先 Option+Enter 换行后再 Enter 也可）\n"
+            "- `ESC × 2` 中断当前任务\n"
+            "- `Ctrl+X` 取消队列 / steer\n"
+            "- `Ctrl+T` 展开 / 折叠所有思考块\n"
+            "- `Ctrl+L` 清空对话\n"
+            "- `Ctrl+C` 退出\n\n"
+            "### 工具（模型可调用）\n"
+            "`bash` `bash_start/check/wait/kill/list` "
+            "`read_file` `write_file` `edit_file` `edit_lines` `multi_edit` "
+            "`list_files` `glob_files` `search_content` `web_fetch` `todo_tool`\n"
+        )
+        await self._mount_widget(Static(Markdown(md)))
+
     # ─ agent loop ─
 
     async def _agent_turn(self, user_text: str) -> None:
@@ -2852,15 +3400,22 @@ class AgentApp(App):
                     # API error already surfaced + rolled back.
                     # Wipe the queue: don't railroad the user into more
                     # failing turns; let them re-submit if they want.
-                    self._queued.clear()
+                    self._drop_queue()
                     self._refresh_status()
                     return
                 if not self._queued:
                     return
-                pending = self._queued.pop(0)
-                # UserBubble for queued messages was mounted at submit
-                # time, so we only refresh state here.
+                pending, parked = self._queued.pop(0)
+                # Migrate the parked bubble into the conversation flow:
+                # remove it from #pending and mount a fresh one in
+                # #conversation so the user sees it "drop" out of the
+                # pending tray as the turn picks it up.
+                try:
+                    parked.remove()
+                except Exception:
+                    pass
                 self._follow_bottom = True
+                await self._mount_widget(UserBubble(pending))
                 self._refresh_status()
         except asyncio.CancelledError:
             # ESC×2 cancellation: roll back the in-flight turn so retry
@@ -2904,13 +3459,21 @@ class AgentApp(App):
                 if self._steer:
                     pending_steer = self._steer
                     self._steer = []
-                    for s in pending_steer:
+                    for s, parked in pending_steer:
                         self.messages.append(
                             {
                                 "role": "user",
                                 "content": f"[实时插话] {s}",
                             }
                         )
+                        # Move the bubble out of the pending tray and
+                        # into the conversation so the user can scroll
+                        # back through their interjections later.
+                        try:
+                            parked.remove()
+                        except Exception:
+                            pass
+                        await self._mount_widget(SteerBubble(s))
                     self._refresh_status()
 
                 assistant_msg = await self._stream_one()
@@ -3008,13 +3571,13 @@ class AgentApp(App):
         final_usage = None
 
         stream = await self.client.chat.completions.create(
-            model=MODEL,
+            model=self.model,
             messages=self.messages,
             tools=TOOLS,
             tool_choice="auto",
             stream=True,
             stream_options={"include_usage": True},
-            reasoning_effort=REASONING_EFFORT,
+            reasoning_effort=self.effort,
             extra_body={"thinking": {"type": "enabled"}},
         )
 
