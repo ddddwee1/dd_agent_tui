@@ -1489,9 +1489,11 @@ class AgentApp(App):
         nesting). All tool calls still walk through `self.tool_confirm`
         so a user policy applies everywhere, not just to the parent.
 
-        We deliberately DON'T write `reasoning_content` back into the
-        subagent's messages — DeepSeek won't replay it as context, so
-        keeping it would just inflate each subsequent prompt.
+        `reasoning_content` is preserved on the assistant message and
+        written back. DeepSeek's thinking-mode API rejects requests
+        that strip it from the prior assistant turn ("The
+        `reasoning_content` in the thinking mode must be passed back
+        to the API."), so this is mandatory, not optional.
         """
         sub_ctx = ToolContext(work_dir=self.ctx.work_dir)
         sub_messages: list = [
@@ -1527,6 +1529,7 @@ class AgentApp(App):
                     return f"❌ subagent stream failed: {e}"
 
                 content = ""
+                reasoning = ""
                 tool_calls: dict[int, dict] = {}
                 final_usage = None
                 async for chunk in stream:
@@ -1535,6 +1538,9 @@ class AgentApp(App):
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
+                    rc = getattr(delta, "reasoning_content", None)
+                    if rc:
+                        reasoning += rc
                     text = getattr(delta, "content", None)
                     if text:
                         content += text
@@ -1562,6 +1568,11 @@ class AgentApp(App):
 
                 last_content = content
                 msg: dict = {"role": "assistant", "content": content}
+                if reasoning:
+                    # Mandatory: DeepSeek thinking mode 400s if the
+                    # prior assistant turn's reasoning_content is
+                    # missing on the next request.
+                    msg["reasoning_content"] = reasoning
                 if tool_calls:
                     msg["tool_calls"] = [
                         tool_calls[i] for i in sorted(tool_calls)
