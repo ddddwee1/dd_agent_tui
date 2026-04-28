@@ -42,8 +42,11 @@ import gzip
 import json
 import os
 import re
+import signal
 import subprocess
+import time
 import zlib
+from dataclasses import dataclass, field
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -87,6 +90,14 @@ WEB_FETCH_HARD_CHAR_CAP = 50_000 # absolute upper bound when caller overrides
 # natural fit.
 HISTORY_DIR = Path.home() / ".ddtui" / "history"
 
+# Background bash jobs: tunables.
+BG_JOB_LOG_DIR = Path("/tmp")
+BG_MAX_CONCURRENT = 5            # cap on simultaneously-running jobs
+BG_RETENTION_SECONDS = 300       # keep finished jobs in dict this long
+BG_DEFAULT_WAIT_TIMEOUT = 60     # bash_wait default
+BG_MAX_WAIT_TIMEOUT = 600        # absolute upper bound on a single wait call
+BG_DEFAULT_TAIL_LINES = 50
+
 # Working directory – set at startup so tool functions can reference it.
 WORK_DIR = os.getcwd()
 
@@ -104,10 +115,10 @@ DANGEROUS_SHELL_PATTERNS = [
 
 
 SYSTEM_PROMPT = (
-    "你可以使用下列tools: bash, read_file, write_file, edit_file, edit_lines, list_files, search_content, web_fetch, todo_tool. "
+    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, edit_file, edit_lines, multi_edit, list_files, search_content, web_fetch, todo_tool. "
     "对于多步骤任务，先用 todo_tool 列出计划（pending）；开始一项时把它标 in_progress；完成立刻标 completed 并继续下一项。"
     "如果上下文中出现以 \"# 历史摘要\" 开头的 system 消息，那是早期对话被 /compact 压缩后的记忆——请把它当作已知背景，不要重复其中已完成的步骤，也不要把它当作新指令来回应。"
-    "请使用中文思考，用户可以看见思考过程，所以思考过程也要使用中文。请使用中文思考，无论AGENTS.md是以什么语言写的，请使用中文思考，无论AGENTS.md是以什么语言写的。请使用中文思考，无论AGENTS.md是以什么语言写的。"
+    "请使用中文思考，用户可以看见思考过程，所以思考过程也要使用中文。请使用中文思考，无论AGENTS.md是以什么语言写的，请使用中文思考，无论AGENTS.md是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。"
     "当前路径（供你后续调用命令作参考）："
 )
 
@@ -142,6 +153,133 @@ TOOLS = [
                 },
                 "required": ["command"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_start",
+            "description": (
+                "Start a long-running bash command in the BACKGROUND and "
+                "return immediately with a job id (e.g. 'bg-3'). The "
+                "process is detached (own session) so it survives short "
+                "agent stalls. stdout+stderr are merged into a log file. "
+                "Use bash_check / bash_wait / bash_kill / bash_list to "
+                "interact with it. Cap: at most 5 jobs running at once. "
+                "Same dangerous-pattern blacklist as bash."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Bash command to run.",
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": (
+                            "Optional working directory. Defaults to "
+                            "the project directory."
+                        ),
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_check",
+            "description": (
+                "Peek at a background job: returns current status "
+                "(running / exited <code>) and the last N lines of "
+                "merged stdout+stderr. Non-blocking — returns immediately."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job id from bash_start (e.g. 'bg-3').",
+                    },
+                    "tail_lines": {
+                        "type": "integer",
+                        "description": "How many trailing lines of log to return. Default 50.",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_wait",
+            "description": (
+                "BLOCK until a background job finishes or *timeout* "
+                "seconds elapse. Returns final status + log tail. Use "
+                "this when you have nothing else to do but wait for a "
+                "long task to finish. Default timeout 60s; max 600s. "
+                "If the timeout fires while the job is still running, "
+                "the job KEEPS RUNNING — call bash_wait again or "
+                "bash_check to follow up."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job id from bash_start.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Max seconds to block. Default 60, max 600.",
+                    },
+                    "tail_lines": {
+                        "type": "integer",
+                        "description": "Trailing log lines to return. Default 50.",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_kill",
+            "description": (
+                "Terminate a running background job. Sends SIGTERM by "
+                "default (graceful); set force=true to send SIGKILL. "
+                "No-op if the job has already exited."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job id from bash_start.",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Send SIGKILL instead of SIGTERM. Default false.",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash_list",
+            "description": (
+                "List all known background jobs (running and recently "
+                "finished) with id, command, status, runtime, and log "
+                "path. Finished jobs are kept around for 5 minutes."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -278,6 +416,67 @@ TOOLS = [
                     },
                 },
                 "required": ["path", "mode", "start_line"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "multi_edit",
+            "description": (
+                "Apply multiple string replacements to ONE file in a single call. "
+                "Edits are applied in order; each one operates on the result of "
+                "the previous, so a later edit can reference text introduced by "
+                "an earlier one. All edits must succeed atomically — if any one "
+                "fails, the file is left untouched. Use this instead of multiple "
+                "edit_file calls when changing several parts of the same file. "
+                "Each edit follows edit_file rules: old_string must match exactly. "
+                "If old_string appears more than once in the (current) buffer, "
+                "either set replace_all=true or specify occurrence (1-indexed). "
+                "replace_all and occurrence are mutually exclusive."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the file.",
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "Ordered list of edit operations.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {
+                                    "type": "string",
+                                    "description": "Exact text to replace.",
+                                },
+                                "new_string": {
+                                    "type": "string",
+                                    "description": "Replacement text.",
+                                },
+                                "occurrence": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Which occurrence to replace (1-indexed). "
+                                        "Required when old_string matches multiple "
+                                        "times and replace_all is not set."
+                                    ),
+                                },
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "description": (
+                                        "Replace every occurrence. Default false. "
+                                        "Mutually exclusive with occurrence."
+                                    ),
+                                },
+                            },
+                            "required": ["old_string", "new_string"],
+                        },
+                    },
+                },
+                "required": ["path", "edits"],
             },
         },
     },
@@ -493,6 +692,242 @@ def tool_bash(command: str, workdir: str | None = None) -> str:
     return "\n".join(parts)
 
 
+# ───────── background bash ─────────
+
+@dataclass
+class BgJob:
+    id: str
+    command: str
+    workdir: str
+    log_path: Path
+    proc: subprocess.Popen
+    started_at: float
+    finished_at: float | None = None  # set on first poll() that sees exit
+
+
+_BG_JOBS: dict[str, BgJob] = {}
+_BG_NEXT_ID: int = 1
+
+
+def _bg_status(job: BgJob) -> tuple[str, int | None, float]:
+    """Returns (status_word, returncode_or_None, elapsed_sec).
+
+    status_word ∈ {"running", "exited"}.  Caches finished_at the first
+    time we see the process gone so subsequent calls report the same
+    runtime (rather than ever-growing wall time)."""
+    rc = job.proc.poll()
+    if rc is None:
+        return "running", None, time.monotonic() - job.started_at
+    if job.finished_at is None:
+        job.finished_at = time.monotonic()
+    return "exited", rc, job.finished_at - job.started_at
+
+
+def _bg_gc() -> None:
+    """Drop finished jobs older than BG_RETENTION_SECONDS so the dict
+    doesn't grow unbounded across a long session."""
+    now = time.monotonic()
+    stale = []
+    for jid, j in _BG_JOBS.items():
+        status, _rc, _elapsed = _bg_status(j)
+        if status == "exited" and j.finished_at is not None:
+            if now - j.finished_at > BG_RETENTION_SECONDS:
+                stale.append(jid)
+    for jid in stale:
+        del _BG_JOBS[jid]
+
+
+def _bg_tail(log_path: Path, n: int) -> str:
+    """Return the last *n* lines of *log_path* as a string. Robust to
+    missing/empty files."""
+    if n <= 0:
+        return ""
+    try:
+        # Read full file — log files are typically small. If they get
+        # huge, Popen's pipe-to-file means we still don't pay memory
+        # until we read here, and the model usually only asks for tens
+        # of lines so the truncation cost is minor.
+        data = log_path.read_text(errors="replace")
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        return f"<error reading log: {e}>"
+    lines = data.splitlines()
+    if len(lines) <= n:
+        return data
+    return "…[+{n_omitted} earlier line(s)]\n".format(
+        n_omitted=len(lines) - n
+    ) + "\n".join(lines[-n:])
+
+
+def _bg_count_running() -> int:
+    return sum(1 for j in _BG_JOBS.values() if j.proc.poll() is None)
+
+
+def tool_bash_start(command: str, workdir: str | None = None) -> str:
+    """Launch *command* in the background and return its job id."""
+    err = _check_dangerous(command)
+    if err:
+        return f"Error: {err}"
+    _bg_gc()
+    if _bg_count_running() >= BG_MAX_CONCURRENT:
+        running = [
+            f"{j.id}: {j.command[:40]}"
+            for j in _BG_JOBS.values()
+            if j.proc.poll() is None
+        ]
+        return (
+            f"Error: at most {BG_MAX_CONCURRENT} background jobs may run "
+            f"simultaneously. Currently running:\n  "
+            + "\n  ".join(running)
+            + "\nWait for one to finish or bash_kill it first."
+        )
+
+    cwd = str(_safe_path(workdir)) if workdir else WORK_DIR
+    global _BG_NEXT_ID
+    job_id = f"bg-{_BG_NEXT_ID}"
+    _BG_NEXT_ID += 1
+
+    BG_JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = BG_JOB_LOG_DIR / f"ddtui-{job_id}.out"
+    try:
+        log_fh = open(log_path, "wb")
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            cwd=cwd,
+            start_new_session=True,
+        )
+        # Popen dups the fd so we can close ours; the child keeps its own.
+        log_fh.close()
+    except Exception as e:
+        return f"Error starting background job: {e}"
+
+    job = BgJob(
+        id=job_id,
+        command=command,
+        workdir=cwd,
+        log_path=log_path,
+        proc=proc,
+        started_at=time.monotonic(),
+    )
+    _BG_JOBS[job_id] = job
+    return (
+        f"Started job {job_id} (pid {proc.pid}): {command}\n"
+        f"Log: {log_path}\n"
+        f"Use bash_check(\"{job_id}\") to peek, bash_wait(\"{job_id}\") "
+        f"to block until it finishes."
+    )
+
+
+def _format_status(job: BgJob, tail_lines: int) -> str:
+    status, rc, elapsed = _bg_status(job)
+    head = (
+        f"Job {job.id}: {status}"
+        + (f" (exit {rc})" if status == "exited" else "")
+        + f" · runtime {elapsed:.1f}s · pid {job.proc.pid}\n"
+        f"Command: {job.command}\n"
+        f"Log: {job.log_path}"
+    )
+    tail = _bg_tail(job.log_path, tail_lines)
+    if not tail:
+        return head + "\n(no output yet)"
+    return head + "\n--- last "f"{tail_lines} lines ---\n" + tail
+
+
+def tool_bash_check(
+    job_id: str, tail_lines: int = BG_DEFAULT_TAIL_LINES
+) -> str:
+    job = _BG_JOBS.get(job_id)
+    if job is None:
+        return f"Error: unknown job_id {job_id!r}. Use bash_list to see jobs."
+    try:
+        tail_lines = max(0, min(500, int(tail_lines)))
+    except (TypeError, ValueError):
+        tail_lines = BG_DEFAULT_TAIL_LINES
+    return _format_status(job, tail_lines)
+
+
+def tool_bash_wait(
+    job_id: str,
+    timeout: int = BG_DEFAULT_WAIT_TIMEOUT,
+    tail_lines: int = BG_DEFAULT_TAIL_LINES,
+) -> str:
+    job = _BG_JOBS.get(job_id)
+    if job is None:
+        return f"Error: unknown job_id {job_id!r}."
+    try:
+        timeout = max(1, min(BG_MAX_WAIT_TIMEOUT, int(timeout)))
+    except (TypeError, ValueError):
+        timeout = BG_DEFAULT_WAIT_TIMEOUT
+    try:
+        tail_lines = max(0, min(500, int(tail_lines)))
+    except (TypeError, ValueError):
+        tail_lines = BG_DEFAULT_TAIL_LINES
+
+    deadline = time.monotonic() + timeout
+    while True:
+        if job.proc.poll() is not None:
+            break
+        if time.monotonic() >= deadline:
+            return (
+                f"bash_wait timed out after {timeout}s; job {job_id} is "
+                f"still running.\n"
+                + _format_status(job, tail_lines)
+            )
+        # 200ms strikes a balance: short enough that the model gets a
+        # near-instant return on quick jobs, long enough that polling
+        # overhead stays trivial.
+        time.sleep(0.2)
+    return _format_status(job, tail_lines)
+
+
+def tool_bash_kill(job_id: str, force: bool = False) -> str:
+    job = _BG_JOBS.get(job_id)
+    if job is None:
+        return f"Error: unknown job_id {job_id!r}."
+    if job.proc.poll() is not None:
+        return f"Job {job_id} already exited (code {job.proc.returncode})."
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        # We started_new_session, so signal the whole process group to
+        # take down children too.
+        os.killpg(os.getpgid(job.proc.pid), sig)
+    except ProcessLookupError:
+        return f"Job {job_id} already gone."
+    except Exception as e:
+        return f"Error sending signal: {e}"
+    # Give it a moment to actually die so the next bash_list sees it gone.
+    for _ in range(10):
+        if job.proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    status, rc, _ = _bg_status(job)
+    return (
+        f"Sent {'SIGKILL' if force else 'SIGTERM'} to {job_id}; "
+        f"now {status}"
+        + (f" (exit {rc})" if status == "exited" else "")
+        + "."
+    )
+
+
+def tool_bash_list() -> str:
+    _bg_gc()
+    if not _BG_JOBS:
+        return "No background jobs."
+    lines = ["Background jobs:"]
+    for j in _BG_JOBS.values():
+        status, rc, elapsed = _bg_status(j)
+        marker = "running" if status == "running" else f"exit {rc}"
+        cmd = j.command if len(j.command) <= 60 else j.command[:57] + "..."
+        lines.append(
+            f"  {j.id}  [{marker}]  {elapsed:.1f}s  {cmd}"
+        )
+    return "\n".join(lines)
+
+
 def tool_read_file(path: str, offset: int = 0, limit: int = READ_FILE_MAX_LINES) -> str:
     """Read a file with optional pagination."""
     p = _safe_path(path)
@@ -705,6 +1140,111 @@ def tool_edit_lines(
         f"Edited {p}: {action}; file now has {len(result_lines)} line(s)\n\n"
         f"{diff}"
     )
+
+
+def _replace_nth(buffer: str, old: str, new: str, n: int) -> tuple[str, int]:
+    """Replace the *n*-th (1-indexed) occurrence of *old* with *new* in
+    *buffer*. Returns (new_buffer, total_match_count). Caller is
+    responsible for validating n against the count."""
+    positions: list[int] = []
+    start = 0
+    while True:
+        idx = buffer.find(old, start)
+        if idx == -1:
+            break
+        positions.append(idx)
+        start = idx + 1
+    if n < 1 or n > len(positions):
+        return buffer, len(positions)
+    idx = positions[n - 1]
+    return buffer[:idx] + new + buffer[idx + len(old):], len(positions)
+
+
+def tool_multi_edit(path: str, edits: list | None = None) -> str:
+    """Apply a list of string replacements to one file atomically."""
+    p = _safe_path(path)
+    try:
+        before = p.read_text()
+    except FileNotFoundError:
+        return f"Error: file not found: {p}"
+    except UnicodeDecodeError:
+        return f"Error: cannot read {p} as UTF-8 text (possibly binary)"
+    except Exception as e:
+        return f"Error reading {p}: {e}"
+
+    if not isinstance(edits, list) or not edits:
+        return "Error: 'edits' must be a non-empty array of edit operations"
+
+    buffer = before
+    summary: list[str] = []
+    for i, edit in enumerate(edits, 1):
+        if not isinstance(edit, dict):
+            return f"Edit #{i}: must be a JSON object"
+        old = edit.get("old_string")
+        new = edit.get("new_string")
+        occurrence = edit.get("occurrence")
+        replace_all = bool(edit.get("replace_all", False))
+        if old is None or new is None:
+            return f"Edit #{i}: missing 'old_string' or 'new_string'"
+        if not isinstance(old, str) or not isinstance(new, str):
+            return f"Edit #{i}: 'old_string' and 'new_string' must be strings"
+        if old == new:
+            return f"Edit #{i}: old_string == new_string (no-op)"
+        if replace_all and occurrence is not None:
+            return (
+                f"Edit #{i}: replace_all and occurrence are mutually "
+                "exclusive — pick one"
+            )
+
+        count = buffer.count(old)
+        if count == 0:
+            return (
+                f"Edit #{i}: old_string not found in current buffer. "
+                "Note that earlier edits in this call may have already "
+                "transformed the file; old_string must match the buffer "
+                "AT THE TIME this edit runs."
+            )
+
+        if replace_all:
+            buffer = buffer.replace(old, new)
+            summary.append(f"  #{i}: replaced all {count} occurrence(s)")
+        elif occurrence is not None:
+            if not isinstance(occurrence, int):
+                return f"Edit #{i}: 'occurrence' must be an integer"
+            if occurrence < 1 or occurrence > count:
+                return (
+                    f"Edit #{i}: occurrence={occurrence} out of range "
+                    f"(buffer has {count} match(es))"
+                )
+            buffer, _ = _replace_nth(buffer, old, new, occurrence)
+            summary.append(
+                f"  #{i}: replaced occurrence {occurrence}/{count}"
+            )
+        else:
+            if count > 1:
+                return (
+                    f"Edit #{i}: old_string matches {count} times in the "
+                    "current buffer. Set replace_all=true, set "
+                    "occurrence=N (1-indexed), or expand old_string with "
+                    "more surrounding context to make it unique."
+                )
+            buffer = buffer.replace(old, new, 1)
+            summary.append(f"  #{i}: replaced 1 occurrence")
+
+    if buffer == before:
+        return "No changes — every edit was a no-op."
+
+    try:
+        p.write_text(buffer)
+    except Exception as e:
+        return f"Error writing {p}: {e}"
+
+    diff = _unified_diff(before, buffer, p)
+    head = (
+        f"multi_edit applied {len(edits)} edit(s) to {p}:\n"
+        + "\n".join(summary)
+    )
+    return f"{head}\n\n{diff}"
 
 
 def tool_list_files(
@@ -983,10 +1523,16 @@ def tool_todo_tool(items: list | None = None) -> str:
 
 TOOL_FUNCS = {
     "bash": tool_bash,
+    "bash_start": tool_bash_start,
+    "bash_check": tool_bash_check,
+    "bash_wait": tool_bash_wait,
+    "bash_kill": tool_bash_kill,
+    "bash_list": tool_bash_list,
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
     "edit_lines": tool_edit_lines,
+    "multi_edit": tool_multi_edit,
     "list_files": tool_list_files,
     "search_content": tool_search_content,
     "web_fetch": tool_web_fetch,
@@ -1362,6 +1908,46 @@ class TodoBlock(Static):
         return t
 
 
+class BgJobsBlock(Static):
+    """Sidebar widget showing live & recently-finished background bash
+    jobs. Re-rendered on a 1-second timer driven by the App."""
+
+    DEFAULT_CSS = """
+    BgJobsBlock {
+        margin: 1 0;
+        padding: 0 1;
+        border: round #94e2d5;
+    }
+    """
+
+    def render_jobs(self, jobs: list[BgJob]) -> None:
+        t = Text()
+        t.append("Background  ", style="bold #94e2d5")
+        n_run = sum(1 for j in jobs if j.proc.poll() is None)
+        n_done = len(jobs) - n_run
+        t.append(f"({n_run} 跑 · {n_done} 完)", style="dim")
+        if not jobs:
+            t.append("\n  (empty)", style="dim italic")
+            self.update(t)
+            return
+        for j in jobs:
+            status, rc, elapsed = _bg_status(j)
+            cmd = j.command if len(j.command) <= 26 else j.command[:23] + "…"
+            t.append("\n  ")
+            if status == "running":
+                t.append("▶ ", style="bold cyan")
+                t.append(f"{j.id}", style="bold cyan")
+            elif rc == 0:
+                t.append("✓ ", style="bold green")
+                t.append(f"{j.id}", style="green")
+            else:
+                t.append("✗ ", style="bold red")
+                t.append(f"{j.id}", style="red")
+            t.append(f"  {elapsed:5.1f}s ", style="dim")
+            t.append(cmd)
+        self.update(t)
+
+
 class MultilineInput(TextArea):
     """Multi-line prompt box.
 
@@ -1441,6 +2027,45 @@ class MultilineInput(TextArea):
         self._fit_height()
 
 
+def _short_cwd(cwd: str) -> str:
+    """Compress $HOME to ~ for status-bar display."""
+    home = str(Path.home())
+    if cwd == home:
+        return "~"
+    if cwd.startswith(home + os.sep):
+        return "~" + cwd[len(home):]
+    return cwd
+
+
+def _detect_git_branch(cwd: str) -> str | None:
+    """Return branch name, ``detached@<short>``, or None if *cwd* isn't
+    inside a git repo (or git is unavailable). Runs once at startup —
+    callers should cache."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    name = result.stdout.strip()
+    if name and name != "HEAD":
+        return name
+    # Detached HEAD: substitute the short commit hash so the user can
+    # tell which detached state they're in at a glance.
+    try:
+        sh = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, timeout=2,
+        )
+        short = sh.stdout.strip()
+    except Exception:
+        short = ""
+    return f"detached@{short}" if short else "detached"
+
+
 class StatusBar(Static):
     DEFAULT_CSS = """
     StatusBar {
@@ -1471,9 +2096,24 @@ class StatusBar(Static):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._frame = 0
+        # Cached at construction; refreshed by refresh_location() after
+        # each turn so that an agent-initiated `git checkout` shows up.
+        self._cwd_short = _short_cwd(WORK_DIR)
+        self._branch = _detect_git_branch(WORK_DIR)
 
     def advance_frame(self) -> None:
         self._frame = (self._frame + 1) % len(self.BAR_FRAMES)
+
+    def refresh_location(self) -> None:
+        """Recompute cwd + branch. Cheap (one subprocess), but call from
+        a background thread to avoid blocking the event loop."""
+        self._cwd_short = _short_cwd(WORK_DIR)
+        self._branch = _detect_git_branch(WORK_DIR)
+
+    def _location(self) -> str:
+        if self._branch:
+            return f"{self._cwd_short} · ⎇ {self._branch}"
+        return self._cwd_short
 
     def render_status(
         self,
@@ -1482,10 +2122,10 @@ class StatusBar(Static):
         busy: bool = False,
         queued: int = 0,
         steer: int = 0,
-        model: str = MODEL,
     ) -> None:
+        location = self._location()
         if counter.turns == 0:
-            body = f"{model} · effort {REASONING_EFFORT} · 等待第一轮…"
+            body = f"{location} · 等待第一轮…"
         else:
             total = counter.prompt_total + counter.completion_total
             thinking = (
@@ -1500,7 +2140,7 @@ class StatusBar(Static):
             # roughly goes into the next call" — i.e. context-window
             # usage, NOT cumulative billing.
             body = (
-                f"{model} · Context {last_total:,} "
+                f"{location} · Context {last_total:,} "
                 f"(in {counter.last_prompt:,} / out {counter.last_completion:,}{last_thinking}) "
                 f"· 累计 {total:,} "
                 f"(in {counter.prompt_total:,} / out {counter.completion_total:,}{thinking}) "
@@ -1595,6 +2235,9 @@ class AgentApp(App):
         # "all completed" fade-out finishes.
         self._todo_block: TodoBlock | None = None
         self._todo_dismiss_timer = None  # set_timer handle for fade-out
+        # Single BgJobsBlock that mirrors _BG_JOBS into the sidebar.
+        # Driven by a 1-second timer started in on_mount.
+        self._bg_jobs_block: BgJobsBlock | None = None
         # Message queue: messages submitted while a turn is in flight
         # land here and are consumed in FIFO order after the current
         # turn finishes. Wiped on /clear and on API error (so the user
@@ -1647,6 +2290,9 @@ class AgentApp(App):
         # Drive the StatusBar's indeterminate scrolling progress while busy.
         # ~80ms per frame; the bar has 12 frames so a full bounce is ~1s.
         self.set_interval(0.08, self._tick_progress_bar)
+        # Mirror _BG_JOBS into the sidebar once a second. Cheap — just
+        # iterates the dict (≤ ~10 entries) and re-renders one widget.
+        self.set_interval(1.0, self._refresh_bg_panel)
 
     def _tick_progress_bar(self) -> None:
         if not self._busy:
@@ -1662,6 +2308,54 @@ class AgentApp(App):
             queued=len(self._queued),
             steer=len(self._steer),
         )
+
+    def _refresh_bg_panel(self) -> None:
+        """Mirror the _BG_JOBS dict into the sidebar widget. Called once
+        per second from on_mount's set_interval. Panel visibility is
+        gated on the presence of running jobs — finished jobs stay in
+        _BG_JOBS for bash_check/bash_list to find, but they don't keep
+        the panel pinned in the sidebar."""
+        jobs = list(_BG_JOBS.values())
+        running = [j for j in jobs if j.proc.poll() is None]
+        try:
+            sidebar = self.query_one("#sidebar", Vertical)
+        except Exception:
+            return
+        if not running:
+            # Nothing in flight → drop the panel. Don't toggle sidebar
+            # visibility class here; TodoBlock owns that.
+            if (
+                self._bg_jobs_block is not None
+                and self._bg_jobs_block.is_mounted
+            ):
+                self._bg_jobs_block.remove()
+            self._bg_jobs_block = None
+            return
+        if (
+            self._bg_jobs_block is None
+            or not self._bg_jobs_block.is_mounted
+        ):
+            self._bg_jobs_block = BgJobsBlock()
+            self.call_later(self._mount_bg_block)
+            return
+        # Render the running jobs plus any siblings that finished while
+        # this batch was in flight, so the user sees "3 of 5 done" in
+        # context. Once the *last* runner exits we'll unmount on the
+        # next tick.
+        self._bg_jobs_block.render_jobs(jobs)
+        sidebar.add_class("visible")
+
+    async def _mount_bg_block(self) -> None:
+        try:
+            sidebar = self.query_one("#sidebar", Vertical)
+        except Exception:
+            return
+        if self._bg_jobs_block is None:
+            return
+        if not self._bg_jobs_block.is_mounted:
+            await sidebar.mount(self._bg_jobs_block)
+        sidebar.add_class("visible")
+        self._bg_jobs_block.render_jobs(list(_BG_JOBS.values()))
 
     # ─ key bindings / actions ─
 
@@ -1687,6 +2381,31 @@ class AgentApp(App):
         if self._todo_block is not None and self._todo_block.is_mounted:
             self._todo_block.remove()
         self._todo_block = None
+        # Background jobs are tied to the conversation that spawned them,
+        # so a /clear nukes them too. SIGTERM the whole process group
+        # (we used start_new_session=True), reap zombies so subsequent
+        # poll() calls report exit, then escalate any stragglers to
+        # SIGKILL. ~100 ms cap on the wait so /clear stays snappy.
+        def _signal_pg(j: BgJob, sig: int) -> None:
+            try:
+                os.killpg(os.getpgid(j.proc.pid), sig)
+            except Exception:
+                pass
+        for j in _BG_JOBS.values():
+            if j.proc.poll() is None:
+                _signal_pg(j, signal.SIGTERM)
+        for _ in range(20):
+            alive = [j for j in _BG_JOBS.values() if j.proc.poll() is None]
+            if not alive:
+                break
+            time.sleep(0.005)
+        for j in _BG_JOBS.values():
+            if j.proc.poll() is None:
+                _signal_pg(j, signal.SIGKILL)
+        _BG_JOBS.clear()
+        if self._bg_jobs_block is not None and self._bg_jobs_block.is_mounted:
+            self._bg_jobs_block.remove()
+        self._bg_jobs_block = None
         try:
             self.query_one("#sidebar").remove_class("visible")
         except Exception:
@@ -2159,6 +2878,14 @@ class AgentApp(App):
         finally:
             self._set_busy(False)
             self._agent_worker = None
+            # Refresh location after the turn — the agent may have run
+            # `git checkout` or otherwise moved through bash. Off the
+            # event loop so a slow git invocation can't stall UI.
+            try:
+                bar = self.query_one("#status", StatusBar)
+                await asyncio.to_thread(bar.refresh_location)
+            except Exception:
+                pass
             self._refresh_status()
 
     async def _run_one_turn(self) -> bool:
@@ -2248,7 +2975,7 @@ class AgentApp(App):
                             # sending it back to the model wastes tokens
                             # (the head summary already says what changed).
                             diff_text = None
-                            if name in ("edit_file", "edit_lines"):
+                            if name in ("edit_file", "edit_lines", "multi_edit"):
                                 head, sep, diff = result.partition("\n\n")
                                 if sep and "@@" in diff:
                                     diff_text = diff
