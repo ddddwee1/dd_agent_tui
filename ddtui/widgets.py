@@ -23,7 +23,7 @@ from textual.message import Message
 from textual.widgets import Collapsible, Static, TextArea
 
 from .config import CTX_SAFE_LIMIT
-from .state import BgJob, SubagentStatus, TokenCounter, bg_job_status
+from .state import BgJob, SubagentSession, TokenCounter, bg_job_status
 
 
 # ───────── conversation bubbles ─────────
@@ -303,12 +303,12 @@ class TodoBlock(Static):
 
 
 class SubagentsBlock(Static):
-    """Sidebar widget showing in-flight `spawn_agent` calls.
+    """Sidebar widget showing live `SubagentSession`s.
 
-    Mirrors `AgentApp._subagent_statuses` once a second. Same lifecycle
-    as `BgJobsBlock`: panel exists iff at least one subagent is
-    currently running; all-done means immediate unmount (the parent's
-    ToolCallBlock keeps the historical record).
+    Mirrors `AgentApp._live_subagents` once a second. A session lives
+    until the parent calls `end_agent` or the idle reaper kicks it out,
+    so the panel is visible whenever at least one session exists —
+    including ones currently sitting at `idle` between rounds.
     """
 
     DEFAULT_CSS = """
@@ -320,33 +320,47 @@ class SubagentsBlock(Static):
     """
 
     # phase → (icon, style). Distinct hues so the eye can tell at a
-    # glance whether the subagent is currently spending tokens
-    # (thinking / answering) or burning wallclock on a tool.
+    # glance whether the subagent is spending tokens (thinking /
+    # answering), burning wallclock on a tool, has an answer waiting
+    # for await_agent (ready), or is between rounds (idle).
     _PHASE_GLYPH = {
         "thinking":  ("◐", "bold #cba6f7"),  # mauve
         "answering": ("▶", "bold cyan"),
         "tool":      ("⚙", "bold #fab387"),  # peach
+        "ready":     ("▣", "bold #a6e3a1"),  # green — answer waiting
+        "idle":      ("○", "bold #6c7086"),  # surface2 gray
         "done":      ("✓", "bold green"),
         "error":     ("✗", "bold red"),
     }
 
-    def render_statuses(self, statuses: list[SubagentStatus]) -> None:
+    def render_sessions(self, sessions: list[SubagentSession]) -> None:
         t = Text()
         t.append("Subagents  ", style="bold #f5c2e7")
-        n_run = sum(1 for s in statuses if s.finished_at is None)
-        t.append(f"({n_run} 跑)", style="dim")
-        if not statuses:
+        n_busy = sum(
+            1 for s in sessions
+            if s.phase in ("thinking", "answering", "tool")
+        )
+        n_ready = sum(1 for s in sessions if s.phase == "ready")
+        n_idle = sum(1 for s in sessions if s.phase == "idle")
+        t.append(f"({n_busy} 跑 · {n_ready} 待领 · {n_idle} 闲)", style="dim")
+        if not sessions:
             t.append("\n  (empty)", style="dim italic")
             self.update(t)
             return
-        for s in statuses:
-            elapsed = (s.finished_at or time.monotonic()) - s.started_at
+        now = time.monotonic()
+        for s in sessions:
             icon, style = self._PHASE_GLYPH.get(s.phase, ("·", "dim"))
             t.append("\n  ")
             t.append(f"{icon} ", style=style)
             t.append(f"{s.id}", style=style)
-            t.append(f"  轮 {s.turn}  {elapsed:5.1f}s", style="dim")
-            if s.last_tool:
+            t.append(f"  轮 {s.turn}", style="dim")
+            if s.phase == "idle":
+                idle_for = now - s.last_active_at
+                t.append(f"  闲 {idle_for:5.1f}s", style="dim")
+            else:
+                elapsed = now - s.started_at
+                t.append(f"  {elapsed:5.1f}s", style="dim")
+            if s.last_tool and s.phase != "idle":
                 t.append(f"  · {s.last_tool}", style="#fab387")
             if s.tokens_in or s.tokens_out:
                 t.append(

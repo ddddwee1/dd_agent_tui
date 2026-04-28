@@ -18,6 +18,7 @@ them here keeps `widgets` from having to reach into `tools`'s privates.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import signal
 import subprocess
@@ -106,25 +107,51 @@ class ToolContext:
 
 
 @dataclass
-class SubagentStatus:
-    """Live snapshot of one in-flight `spawn_agent` call.
+class SubagentSession:
+    """One persistent subagent — created by spawn_agent, fed by chat_agent,
+    released by end_agent (or the idle reaper).
 
-    AgentApp creates one when a subagent starts, mutates its fields as
-    the subagent advances (turn counter, phase, last tool, token totals),
-    and removes it from the registry when the subagent returns. The
-    `SubagentsBlock` sidebar widget renders the registry dict at 1 Hz.
+    Concurrency model: each round runs in its own `asyncio.Task` stored
+    on `task`. `spawn_agent` and `chat_agent` schedule the task and
+    return immediately so the parent can pursue other work; the parent
+    fetches the round's answer with `await_agent`, which blocks (with
+    timeout) on the task and consumes `last_result`. `task is None`
+    means the session is between rounds; `last_result is not None`
+    means a finished round's answer is sitting unread.
+
+    Holds both the runtime conversation state (messages, own
+    ToolContext, tool schemas) AND the UI-visible snapshot fields
+    (turn, phase, token totals). AgentApp keeps a `dict[str,
+    SubagentSession]`; presence in that dict is the liveness signal.
+
+    `messages` includes the subagent system prompt at index 0 and grows
+    every round. `reasoning_content` is preserved on assistant turns
+    because DeepSeek thinking-mode requires it on subsequent calls.
     """
 
-    id: str                 # "sub-1", "sub-2", …
-    prompt_preview: str     # first ~40 chars of the user prompt
+    id: str                  # "sub-1", "sub-2", …
+    prompt_preview: str      # first ~40 chars of the original spawn prompt
     started_at: float
-    turn: int = 0           # 1-indexed once the first stream starts
-    # phase ∈ {"thinking", "answering", "tool", "done", "error"}
+    last_active_at: float    # bumped on every chat_agent / end of round
+    messages: list[dict]     # full subagent conversation, system msg at [0]
+    ctx: "ToolContext"       # subagent's own tool context (its own bash_jobs)
+    sub_tools: list[dict]    # tool schemas the subagent sees (no meta tools)
+    turn: int = 0            # cumulative round count across all chat calls
+    # phase ∈ {"thinking","answering","tool","ready","idle","done","error"}
+    # ready  = round finished, result waiting in last_result
+    # idle   = result already consumed, awaiting next chat_agent
     phase: str = "thinking"
     last_tool: str | None = None
-    tokens_in: int = 0      # cumulative prompt tokens for this subagent
-    tokens_out: int = 0     # cumulative completion tokens
-    finished_at: float | None = None
+    tokens_in: int = 0       # cumulative prompt tokens for this subagent
+    tokens_out: int = 0      # cumulative completion tokens
+    # asyncio.Task running the current round; None between rounds.
+    # Set by spawn_agent / chat_agent, cleared in the task wrapper's
+    # `finally`. Cancelled by end_agent / action_clear_chat.
+    task: "asyncio.Task | None" = None
+    # The most recent round's final answer, waiting for await_agent to
+    # consume. None means "no result pending" (already consumed, or
+    # task still running with nothing to return yet).
+    last_result: str | None = None
 
 
 class TokenCounter:

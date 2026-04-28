@@ -534,19 +534,19 @@ TOOLS = [
         "function": {
             "name": "spawn_agent",
             "description": (
-                "Spawn an isolated subagent to handle a self-contained "
-                "subtask, then return its final answer as this tool's "
-                "result. Use spawn_agent for: (1) reducing context "
-                "noise — let a subagent grind through a search, build, "
-                "or codebase tour and only the conclusion comes back; "
-                "(2) parallel-style investigations you'll fold into "
-                "your main work. The subagent has its own conversation "
-                "history and bash job table; this conversation only "
-                "sees its final assistant message. The subagent CAN'T "
-                "spawn further subagents (depth is limited to 1) and "
-                "CAN'T read your scratch state — give it everything it "
-                "needs in `prompt`. Token usage is billed to this "
-                "conversation and shows up in the status bar."
+                "Create a persistent subagent session, send it the "
+                "first prompt, and IMMEDIATELY return — the subagent "
+                "runs in the background. Returns a session_id and a "
+                "status hint; the actual answer must be fetched with "
+                "await_agent(session_id). The session keeps full "
+                "memory (messages + reasoning) across rounds, so for "
+                "follow-ups use chat_agent, not another spawn_agent. "
+                "To run subagents in parallel, emit multiple "
+                "spawn_agent calls (in one tool-call batch is fine), "
+                "then await_agent each. Subagents have their own bash "
+                "job table and CANNOT nest subagents. Token usage is "
+                "billed here. Hit the live-session cap → end_agent an "
+                "old one first."
             ),
             "parameters": {
                 "type": "object",
@@ -554,11 +554,10 @@ TOOLS = [
                     "prompt": {
                         "type": "string",
                         "description": (
-                            "The subagent's user message. State the "
+                            "The subagent's first user message. State the "
                             "task, success criteria, and any context "
-                            "(file paths, prior findings) the subagent "
-                            "needs — it starts with no memory of this "
-                            "conversation."
+                            "(file paths, prior findings) — the subagent "
+                            "starts with no memory of this conversation."
                         ),
                     },
                     "system": {
@@ -568,11 +567,102 @@ TOOLS = [
                             "to the framework system prompt. Use to "
                             "narrow the subagent's role, e.g. 'You are "
                             "a read-only investigator: report findings, "
-                            "do not modify files.'"
+                            "do not modify files.' Persists for the "
+                            "lifetime of the session."
                         ),
                     },
                 },
                 "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "chat_agent",
+            "description": (
+                "Send another message to an existing subagent session "
+                "and IMMEDIATELY return — the round runs in the "
+                "background. Use await_agent(session_id) to fetch the "
+                "answer. The subagent sees its full prior history "
+                "including its own reasoning, so refer to earlier "
+                "findings naturally. Errors if the session is still "
+                "running an earlier round (await it first), if the "
+                "previous result hasn't been await_agent'd yet, or if "
+                "the session_id is unknown."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The id returned by spawn_agent (e.g. 'sub-1').",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Next user message to the subagent.",
+                    },
+                },
+                "required": ["session_id", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "await_agent",
+            "description": (
+                "Wait for a subagent's most recent round to finish and "
+                "return its answer. Blocks for up to `timeout` seconds; "
+                "if the subagent is still running when the timeout "
+                "expires, returns a 'still running' notice and you can "
+                "call await_agent again. Pass timeout=0 to poll without "
+                "blocking. Once consumed, the answer is gone — call "
+                "chat_agent to ask another question, then await_agent "
+                "again. Errors if the session has no pending result "
+                "(e.g. you await_agent'd twice in a row without a "
+                "chat_agent in between)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The id returned by spawn_agent.",
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": (
+                            "Max seconds to wait for the round to "
+                            "finish. Default 60, max 600, 0 = poll. "
+                            "If the round is fast, returns as soon as "
+                            "the answer is ready (well before timeout)."
+                        ),
+                    },
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "end_agent",
+            "description": (
+                "Release a subagent session: cancel any in-flight "
+                "round, kill its background bash jobs, drop its "
+                "conversation. Call this as soon as you no longer need "
+                "the session, to free a slot and stop the idle timer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The id returned by spawn_agent.",
+                    },
+                },
+                "required": ["session_id"],
             },
         },
     },

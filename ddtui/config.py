@@ -75,14 +75,33 @@ COMPACT_KEEP_RECENT_TURNS = 2
 
 # ───────── subagent ─────────
 
-# Cap on the number of LLM rounds inside one spawn_agent call. Keeps a
-# wedged or looping subagent from burning unbounded tokens before
-# control returns to the parent.
+# Cap on the number of LLM rounds inside ONE spawn_agent / chat_agent
+# call (i.e. per parent-visible round). Keeps a wedged or looping
+# subagent from burning unbounded tokens before control returns.
 SUBAGENT_MAX_TURNS = 30
-# Truncate the subagent's final answer before it lands as a tool_result
-# in the parent — a chatty subagent shouldn't be able to blow out the
+# Truncate the subagent's answer before it lands as a tool_result in
+# the parent — a chatty subagent shouldn't be able to blow out the
 # parent's context window in one shot.
 SUBAGENT_RESULT_MAX_CHARS = 20_000
+# Maximum number of live subagent sessions kept in memory at once.
+# spawn_agent at the cap returns an error asking the parent to
+# end_agent one first. A small bound is fine — long-tail use is the
+# parent driving one or two subagents through several rounds, not a
+# bushy fan-out.
+MAX_LIVE_SUBAGENTS = 5
+# Auto-end a subagent that's been idle (no chat / no end) for this
+# long. Prevents a forgotten session from holding bash processes /
+# context indefinitely. Reset on every chat_agent call.
+SUBAGENT_IDLE_TIMEOUT_SEC = 600
+# How often the idle-reaper scan runs. Coarse on purpose — the only
+# work to do is "kill timed-out sessions", not worth running often.
+SUBAGENT_REAP_INTERVAL_SEC = 60
+# Default and absolute-max wait on a single await_agent call. Mirrors
+# bash_wait's defaults — short enough that the parent stays responsive
+# (an idle await stops it from doing anything else), long enough to
+# cover most subagent rounds without bouncing back to "still running".
+SUBAGENT_DEFAULT_AWAIT_TIMEOUT = 60
+SUBAGENT_MAX_AWAIT_TIMEOUT = 600
 
 
 # ───────── safety ─────────
@@ -104,7 +123,8 @@ DANGEROUS_SHELL_PATTERNS = [
 # ───────── system prompt ─────────
 
 SYSTEM_PROMPT = (
-    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, todo_tool, spawn_agent. "
+    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, todo_tool, spawn_agent, chat_agent, await_agent, end_agent. "
+    "子 agent 是异步的：spawn_agent 创建会话并立即返回 session_id（status=running），背后的子 agent 在后台跑；chat_agent 在已有会话发新 prompt，同样立即返回。两者都不直接给答案——必须用 await_agent(session_id) 拿结果（默认 60s 超时，超时返回 still running 让你再次 await）。end_agent 释放会话。要并行就一次发多个 spawn_agent，再分别 await_agent。子 agent 跨轮保留记忆（含 reasoning），同一任务别反复 spawn。"
     "对于多步骤任务，先用 todo_tool 列出计划（pending）；开始一项时把它标 in_progress；完成立刻标 completed 并继续下一项。"
     "如果上下文中出现以 \"# 历史摘要\" 开头的 system 消息，那是早期对话被 /compact 压缩后的记忆——请把它当作已知背景，不要重复其中已完成的步骤，也不要把它当作新指令来回应。"
     "请使用中文思考，用户可以看见思考过程，所以思考过程也要使用中文。请使用中文思考，无论AGENTS.md是以什么语言写的，请使用中文思考，无论AGENTS.md是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。"

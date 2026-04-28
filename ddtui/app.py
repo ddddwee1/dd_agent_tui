@@ -39,14 +39,19 @@ from .config import (
     COMPACT_KEEP_RECENT_TURNS,
     COMPACT_TOOL_SNIPPET_CHARS,
     HISTORY_DIR,
+    MAX_LIVE_SUBAGENTS,
     MODEL,
     REASONING_EFFORT,
+    SUBAGENT_DEFAULT_AWAIT_TIMEOUT,
+    SUBAGENT_IDLE_TIMEOUT_SEC,
+    SUBAGENT_MAX_AWAIT_TIMEOUT,
     SUBAGENT_MAX_TURNS,
+    SUBAGENT_REAP_INTERVAL_SEC,
     SUBAGENT_RESULT_MAX_CHARS,
     SYSTEM_PROMPT,
 )
 from .state import (
-    SubagentStatus,
+    SubagentSession,
     TokenCounter,
     ToolContext,
     kill_all_bash_jobs,
@@ -125,7 +130,9 @@ class AgentApp(App):
     #body { height: 1fr; layout: horizontal; }
     #main { width: 1fr; layout: vertical; }
     #sidebar {
-        width: 36;
+        width: 30%;
+        min-width: 36;
+        max-width: 72;
         layout: vertical;
         border-left: solid #cba6f7;
         padding: 0 1;
@@ -210,11 +217,12 @@ class AgentApp(App):
         # Single BgJobsBlock that mirrors ctx.bash_jobs into the sidebar.
         # Driven by a 1-second timer started in on_mount.
         self._bg_jobs_block: BgJobsBlock | None = None
-        # Subagent monitor: AgentApp pushes a SubagentStatus into this
-        # dict at spawn_agent entry, mutates it as the subagent advances
-        # (turn / phase / last_tool / tokens), and pops it on return.
-        # SubagentsBlock renders the dict at 1 Hz.
-        self._subagent_statuses: dict[str, SubagentStatus] = {}
+        # Live subagent sessions, keyed by id. spawn_agent inserts one;
+        # chat_agent advances the turn counter and messages on the
+        # existing entry; end_agent (or the idle reaper) removes it.
+        # SubagentsBlock renders the dict at 1 Hz; presence in the dict
+        # is the liveness signal — there is no "finished" state.
+        self._live_subagents: dict[str, SubagentSession] = {}
         self._subagent_next_id = 1
         self._subagent_block: SubagentsBlock | None = None
         # Message queue: messages submitted while a turn is in flight
@@ -279,6 +287,13 @@ class AgentApp(App):
         # on millisecond scales but the user only needs a coarse "what's
         # it doing" pulse.
         self.set_interval(1.0, self._refresh_subagent_panel)
+        # Idle-reaper: end_agent any session that hasn't seen a
+        # chat_agent call in SUBAGENT_IDLE_TIMEOUT_SEC. Coarse interval
+        # — the only work to do is "kill timed-out sessions", not worth
+        # running often.
+        self.set_interval(
+            SUBAGENT_REAP_INTERVAL_SEC, self._reap_idle_subagents
+        )
 
     def _tick_progress_bar(self) -> None:
         if not self._busy:
@@ -344,20 +359,16 @@ class AgentApp(App):
         self._bg_jobs_block.render_jobs(list(self.ctx.bash_jobs.values()))
 
     def _refresh_subagent_panel(self) -> None:
-        """Mirror _subagent_statuses into the sidebar widget. Same
-        lifecycle rule as _refresh_bg_panel: panel exists iff at least
-        one subagent is in flight. Done subagents are removed from the
-        dict by _run_subagent's `finally`, so this method only ever
-        sees running ones — but render the whole dict regardless so a
-        future "leave done ones visible for N seconds" tweak is one
-        line away."""
-        statuses = list(self._subagent_statuses.values())
-        running = [s for s in statuses if s.finished_at is None]
+        """Mirror _live_subagents into the sidebar widget. Panel exists
+        iff at least one session is alive (running OR idle waiting for
+        the next chat_agent call). end_agent / the idle reaper remove
+        sessions from the dict, which is what unmounts the panel."""
+        sessions = list(self._live_subagents.values())
         try:
             sidebar = self.query_one("#sidebar", Vertical)
         except Exception:
             return
-        if not running:
+        if not sessions:
             if (
                 self._subagent_block is not None
                 and self._subagent_block.is_mounted
@@ -372,7 +383,7 @@ class AgentApp(App):
             self._subagent_block = SubagentsBlock()
             self.call_later(self._mount_subagent_block)
             return
-        self._subagent_block.render_statuses(statuses)
+        self._subagent_block.render_sessions(sessions)
         sidebar.add_class("visible")
 
     async def _mount_subagent_block(self) -> None:
@@ -385,9 +396,29 @@ class AgentApp(App):
         if not self._subagent_block.is_mounted:
             await sidebar.mount(self._subagent_block)
         sidebar.add_class("visible")
-        self._subagent_block.render_statuses(
-            list(self._subagent_statuses.values())
+        self._subagent_block.render_sessions(
+            list(self._live_subagents.values())
         )
+
+    def _reap_idle_subagents(self) -> None:
+        """Drop sessions that have been quiescent longer than
+        SUBAGENT_IDLE_TIMEOUT_SEC. Quiescent means phase ∈ {idle,
+        ready, error} (i.e. no task in flight) and last_active_at
+        hasn't been bumped recently. Reaping cancels any leftover
+        task and kills bash jobs so a forgotten subagent doesn't pin
+        background processes or context indefinitely. Sessions still
+        running (thinking/answering/tool) are never reaped — the user
+        can ESC×2 / end_agent if they really want to stop them."""
+        now = time.monotonic()
+        for sid, sess in list(self._live_subagents.items()):
+            if sess.phase not in ("idle", "ready", "error"):
+                continue
+            if now - sess.last_active_at < SUBAGENT_IDLE_TIMEOUT_SEC:
+                continue
+            if sess.task is not None and not sess.task.done():
+                sess.task.cancel()
+            kill_all_bash_jobs(sess.ctx.bash_jobs)
+            self._live_subagents.pop(sid, None)
 
     # ─ key bindings / actions ─
 
@@ -431,6 +462,21 @@ class AgentApp(App):
         if self._bg_jobs_block is not None and self._bg_jobs_block.is_mounted:
             self._bg_jobs_block.remove()
         self._bg_jobs_block = None
+        # Live subagent sessions: cancel any in-flight task, kill each
+        # one's bash jobs, drop them. Tied to the parent conversation,
+        # so /clear releases all.
+        for sess in list(self._live_subagents.values()):
+            if sess.task is not None and not sess.task.done():
+                sess.task.cancel()
+            kill_all_bash_jobs(sess.ctx.bash_jobs)
+        self._live_subagents.clear()
+        self._subagent_next_id = 1
+        if (
+            self._subagent_block is not None
+            and self._subagent_block.is_mounted
+        ):
+            self._subagent_block.remove()
+        self._subagent_block = None
         try:
             self.query_one("#sidebar").remove_class("visible")
         except Exception:
@@ -1217,12 +1263,20 @@ class AgentApp(App):
             "`bash` `bash_start/check/wait/kill/list` "
             "`read_file` `write_file` `edit_file` `edit_lines` `multi_edit` "
             "`list_files` `glob_files` `search_content` `web_fetch` "
-            "`todo_tool` `spawn_agent`\n"
+            "`todo_tool` `spawn_agent` `chat_agent` `await_agent` `end_agent`\n"
             "\n"
-            f"`spawn_agent` 让模型派一个隔离的子 agent 跑自包含子任务，"
-            f"主对话只看到子的最终回答（最多 {SUBAGENT_MAX_TURNS} 轮，"
-            f"返回截断到 {SUBAGENT_RESULT_MAX_CHARS:,} 字符）。"
-            "子 agent 不能再嵌套子 agent，但 token 计入主对话 status bar。\n"
+            f"子 agent 四件套（异步并发）：`spawn_agent` / `chat_agent` "
+            f"立即返回 `session_id`，子 agent 在后台跑；用 "
+            f"`await_agent(session_id, timeout?)` 拿结果（默认 "
+            f"{SUBAGENT_DEFAULT_AWAIT_TIMEOUT}s，最大 "
+            f"{SUBAGENT_MAX_AWAIT_TIMEOUT}s，0=非阻塞 poll）；`end_agent` "
+            f"释放。并发用法：一次发多个 `spawn_agent` → 自己继续做别的事 "
+            f"→ 用 `await_agent` 分别收。\n"
+            f"\n"
+            f"上限：单轮内部最多 {SUBAGENT_MAX_TURNS} 个 LLM 循环；返回截断 "
+            f"{SUBAGENT_RESULT_MAX_CHARS:,} 字符；同时存活会话上限 "
+            f"{MAX_LIVE_SUBAGENTS} 个；闲置 {SUBAGENT_IDLE_TIMEOUT_SEC // 60} "
+            f"分钟自动回收。子 agent 不能嵌套子 agent；token 计入主对话。\n"
         )
         await self._mount_widget(Static(Markdown(md)))
 
@@ -1373,43 +1427,59 @@ class AgentApp(App):
                             )
                             continue
 
-                        if name == "spawn_agent":
-                            # Subagent: needs LLM access, so it can't
-                            # go through `execute_tool` / asyncio.to_thread
-                            # like sync tools — run it inline on this
-                            # event loop. ESC×2 cancels the parent
-                            # worker; CancelledError propagates here
-                            # and aborts the subagent's await chain.
+                        if name in (
+                            "spawn_agent", "chat_agent",
+                            "await_agent", "end_agent",
+                        ):
+                            # Subagent meta-tools need LLM client / app
+                            # state, so they bypass the generic tool
+                            # dispatch. spawn_agent and chat_agent are
+                            # fire-and-forget — they schedule a task
+                            # and return immediately. await_agent is
+                            # the only one that blocks; it's cancellable
+                            # via parent ESC×2 and will NOT cancel the
+                            # underlying subagent task on its own
+                            # timeout (use end_agent for that).
                             block = ToolCallBlock(name, args)
                             await self._mount_widget(block)
-                            prompt = args.get("prompt") or ""
-                            sub_system = args.get("system") or ""
-                            if not prompt.strip():
-                                result = (
-                                    "Error: spawn_agent requires a "
-                                    "non-empty 'prompt' argument."
-                                )
-                                block.set_result(result, blocked=True)
-                            else:
-                                try:
-                                    result = await self._run_subagent(
+                            try:
+                                if name == "spawn_agent":
+                                    prompt = args.get("prompt") or ""
+                                    sub_system = args.get("system") or ""
+                                    result = self._spawn_subagent(
                                         prompt, sub_system
                                     )
-                                except asyncio.CancelledError:
-                                    result = "⛔ subagent cancelled (parent ESC×2)"
-                                    block.set_result(result, blocked=True)
-                                    self.messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": tc["id"],
-                                        "content": result,
-                                    })
-                                    raise
-                                if len(result) > SUBAGENT_RESULT_MAX_CHARS:
-                                    result = (
-                                        result[:SUBAGENT_RESULT_MAX_CHARS]
-                                        + f"\n…[+{len(result) - SUBAGENT_RESULT_MAX_CHARS} chars truncated]"
+                                elif name == "chat_agent":
+                                    sid = args.get("session_id") or ""
+                                    prompt = args.get("prompt") or ""
+                                    result = self._chat_subagent(
+                                        sid, prompt
                                     )
-                                block.set_result(result)
+                                elif name == "await_agent":
+                                    sid = args.get("session_id") or ""
+                                    timeout = args.get("timeout")
+                                    result = await self._await_subagent(
+                                        sid, timeout
+                                    )
+                                else:
+                                    sid = args.get("session_id") or ""
+                                    result = self._end_subagent(sid)
+                            except asyncio.CancelledError:
+                                result = f"⛔ {name} cancelled (parent ESC×2)"
+                                block.set_result(result, blocked=True)
+                                self.messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc["id"],
+                                    "content": result,
+                                })
+                                raise
+                            if len(result) > SUBAGENT_RESULT_MAX_CHARS:
+                                result = (
+                                    result[:SUBAGENT_RESULT_MAX_CHARS]
+                                    + f"\n…[+{len(result) - SUBAGENT_RESULT_MAX_CHARS} chars truncated]"
+                                )
+                            blocked = result.startswith("Error:")
+                            block.set_result(result, blocked=blocked)
                             self.messages.append({
                                 "role": "tool",
                                 "tool_call_id": tc["id"],
@@ -1539,68 +1609,36 @@ class AgentApp(App):
 
     # ─ subagent ─
 
-    async def _run_subagent(self, prompt: str, system: str) -> str:
-        """Run an isolated subagent and return its final assistant text.
+    async def _run_subagent_round(self, sess: SubagentSession) -> str:
+        """Pump the LLM tool-loop until the subagent emits a final
+        answer (assistant message with no tool_calls), and return that
+        text.
 
-        The subagent gets a fresh `ToolContext` (so its bash jobs don't
-        appear in the parent's sidebar and don't count against the
-        parent's BG_MAX_CONCURRENT) but inherits the parent's work_dir,
-        OpenAI client, and model / effort settings. Token usage rolls
-        up into the parent counter so the status-bar gradient reflects
-        the combined cost.
+        Caller is responsible for having appended the user message to
+        sess.messages before calling. SUBAGENT_MAX_TURNS bounds the
+        inner loop *per round* — a wedged or looping subagent can't
+        burn unbounded tokens before control returns to the parent.
 
-        The subagent's tool list excludes `spawn_agent` itself (no
-        nesting). All tool calls still walk through `self.tool_confirm`
-        so a user policy applies everywhere, not just to the parent.
+        Phase transitions: thinking → (answering | tool)* → idle on
+        success, error on stream failure or turn-cap. last_active_at
+        is bumped in `finally` so the idle reaper sees the right time
+        even on the cancelled / errored paths.
 
-        `reasoning_content` is preserved on the assistant message and
-        written back. DeepSeek's thinking-mode API rejects requests
-        that strip it from the prior assistant turn ("The
-        `reasoning_content` in the thinking mode must be passed back
-        to the API."), so this is mandatory, not optional.
+        `reasoning_content` is preserved on every assistant message —
+        DeepSeek thinking-mode 400s if it's missing on the next call.
         """
-        sub_ctx = ToolContext(work_dir=self.ctx.work_dir)
-        sub_messages: list = [
-            {"role": "system", "content": SYSTEM_PROMPT + sub_ctx.work_dir},
-        ]
-        if system.strip():
-            sub_messages.append({
-                "role": "system",
-                "content": f"# Subagent role / constraints\n\n{system.strip()}",
-            })
-        sub_messages.append({"role": "user", "content": prompt})
-
-        # Hide spawn_agent from the subagent so it can't recurse.
-        sub_tools = [
-            t for t in TOOLS if t["function"]["name"] != "spawn_agent"
-        ]
-
-        # Register a sidebar-visible status. The 1 Hz refresh in
-        # _refresh_subagent_panel reads this dict; we mutate `status`
-        # in place at every phase boundary below.
-        sub_id = f"sub-{self._subagent_next_id}"
-        self._subagent_next_id += 1
-        preview = prompt.strip().replace("\n", " ")
-        if len(preview) > 40:
-            preview = preview[:40] + "…"
-        status = SubagentStatus(
-            id=sub_id,
-            prompt_preview=preview,
-            started_at=time.monotonic(),
-        )
-        self._subagent_statuses[sub_id] = status
-
         last_content = ""
+        base_turn = sess.turn
         try:
-            for _turn in range(SUBAGENT_MAX_TURNS):
-                status.turn = _turn + 1
-                status.phase = "thinking"
-                status.last_tool = None
+            for inner in range(SUBAGENT_MAX_TURNS):
+                sess.turn = base_turn + inner + 1
+                sess.phase = "thinking"
+                sess.last_tool = None
                 try:
                     stream = await self.client.chat.completions.create(
                         model=self.model,
-                        messages=sub_messages,
-                        tools=sub_tools,
+                        messages=sess.messages,
+                        tools=sess.sub_tools,
                         tool_choice="auto",
                         stream=True,
                         stream_options={"include_usage": True},
@@ -1608,7 +1646,7 @@ class AgentApp(App):
                         extra_body={"thinking": {"type": "enabled"}},
                     )
                 except Exception as e:
-                    status.phase = "error"
+                    sess.phase = "error"
                     return f"❌ subagent stream failed: {e}"
 
                 content = ""
@@ -1627,9 +1665,7 @@ class AgentApp(App):
                     text = getattr(delta, "content", None)
                     if text:
                         content += text
-                        # First non-thinking chunk → flip the sidebar
-                        # phase. Idempotent past the first hit.
-                        status.phase = "answering"
+                        sess.phase = "answering"
                     for tc in getattr(delta, "tool_calls", None) or []:
                         idx = tc.index if tc.index is not None else 0
                         slot = tool_calls.setdefault(
@@ -1646,56 +1682,60 @@ class AgentApp(App):
                                 slot["function"]["name"] += tc.function.name
                             if tc.function.arguments:
                                 slot["function"]["arguments"] += tc.function.arguments
-                        status.phase = "answering"
+                        sess.phase = "answering"
 
                 # Roll subagent usage into parent counter so the status
                 # bar reflects combined spend; also accumulate per-
-                # subagent counts for the sidebar widget.
+                # session counts for the sidebar widget.
                 self.counter.add(final_usage)
                 if final_usage is not None:
-                    status.tokens_in += getattr(final_usage, "prompt_tokens", 0) or 0
-                    status.tokens_out += getattr(final_usage, "completion_tokens", 0) or 0
+                    sess.tokens_in += getattr(final_usage, "prompt_tokens", 0) or 0
+                    sess.tokens_out += getattr(final_usage, "completion_tokens", 0) or 0
                 self._refresh_status()
 
                 last_content = content
                 msg: dict = {"role": "assistant", "content": content}
                 if reasoning:
-                    # Mandatory: DeepSeek thinking mode 400s if the
-                    # prior assistant turn's reasoning_content is
-                    # missing on the next request.
+                    # Mandatory for DeepSeek thinking mode on the next
+                    # request — preserved verbatim.
                     msg["reasoning_content"] = reasoning
                 if tool_calls:
                     msg["tool_calls"] = [
                         tool_calls[i] for i in sorted(tool_calls)
                     ]
-                sub_messages.append(msg)
+                sess.messages.append(msg)
 
                 if not tool_calls:
-                    status.phase = "done"
+                    # Final answer for THIS round. Session stays alive
+                    # at "idle" — the parent can chat_agent again later.
+                    sess.phase = "idle"
                     return content or "(subagent returned no answer)"
 
                 for tc in msg["tool_calls"]:
                     name = tc["function"]["name"]
-                    status.phase = "tool"
-                    status.last_tool = name
+                    sess.phase = "tool"
+                    sess.last_tool = name
                     raw = tc["function"].get("arguments") or "{}"
                     try:
                         args = json.loads(raw)
                     except json.JSONDecodeError:
                         result = f"Error: bad JSON args: {raw}"
                     else:
-                        if name == "spawn_agent":
-                            # Defense in depth — the schema is hidden
-                            # but models occasionally still try anyway.
+                        if name in (
+                            "spawn_agent", "chat_agent",
+                            "await_agent", "end_agent",
+                        ):
+                            # Defense in depth — schemas are filtered
+                            # but models sometimes try anyway.
                             result = (
-                                "Error: subagents cannot spawn further "
-                                "subagents."
+                                f"Error: subagents cannot call {name} "
+                                "(no nested subagents)."
                             )
                         else:
                             allowed = await self.tool_confirm(name, args)
                             if allowed:
                                 result = await asyncio.to_thread(
-                                    execute_tool, sub_ctx, name, args
+                                    execute_tool, sess.ctx, name, args
                                 )
                                 # Strip the diff so a 1000-line patch
                                 # doesn't eat the subagent's context.
@@ -1707,31 +1747,231 @@ class AgentApp(App):
                                         result = head
                             else:
                                 result = "Tool execution blocked by user policy."
-                    sub_messages.append({
+                    sess.messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "content": result,
                     })
 
-            status.phase = "done"
+            sess.phase = "error"
             return (
-                f"⚠ subagent reached the {SUBAGENT_MAX_TURNS}-turn cap "
-                f"without a final answer. Last partial assistant text:"
-                f"\n\n{last_content}"
+                f"⚠ subagent reached the {SUBAGENT_MAX_TURNS}-turn "
+                f"per-round cap without a final answer. Last partial "
+                f"assistant text:\n\n{last_content}"
             )
         finally:
-            # Subagent is done (returned, raised, or cancelled).
-            # Stamp finished_at + retire from the live registry so the
-            # sidebar drops it on the next refresh; phase=error covers
-            # the cancel / unexpected-exit paths where no `done`
-            # was set above.
-            if status.finished_at is None:
-                status.finished_at = time.monotonic()
-            if status.phase not in ("done", "error"):
-                status.phase = "error"
-            self._subagent_statuses.pop(sub_id, None)
-            # Don't leak background bash jobs the subagent may have started.
-            kill_all_bash_jobs(sub_ctx.bash_jobs)
+            # Idle / error are terminal-for-this-round; anything else
+            # (cancelled, unexpected exit) becomes "error" so the panel
+            # signals the user that something went wrong.
+            if sess.phase not in ("idle", "error"):
+                sess.phase = "error"
+            sess.last_active_at = time.monotonic()
+
+    async def _run_subagent_task(self, sess: SubagentSession) -> None:
+        """Background driver for one subagent round.
+
+        Wraps `_run_subagent_round` so its return value is captured on
+        the session (`last_result`) instead of returned to a caller.
+        Cancellation, stream errors, and unexpected crashes all become
+        a `last_result` string + phase=error so await_agent has
+        something concrete to return. `task` is cleared in `finally`
+        so chat_agent / await_agent / the reaper can tell the round
+        has ended."""
+        try:
+            answer = await self._run_subagent_round(sess)
+        except asyncio.CancelledError:
+            sess.last_result = "⛔ subagent task cancelled."
+            sess.phase = "error"
+            sess.last_active_at = time.monotonic()
+            raise
+        except Exception as e:
+            sess.last_result = f"❌ subagent task crashed: {e}"
+            sess.phase = "error"
+            sess.last_active_at = time.monotonic()
+        else:
+            sess.last_result = answer
+            # _run_subagent_round leaves phase as "idle" on the happy
+            # path; promote to "ready" since we have an unread answer.
+            if sess.phase == "idle":
+                sess.phase = "ready"
+        finally:
+            sess.task = None
+
+    def _spawn_subagent(self, prompt: str, system: str) -> str:
+        """Create a fresh SubagentSession and schedule its first round
+        as a background task. Returns immediately with the assigned
+        session_id; the parent calls `await_agent` to fetch the answer.
+
+        Each session gets its own ToolContext (independent bash job
+        table) but inherits the parent's work_dir, OpenAI client, and
+        model / effort settings. Token usage rolls up into the parent
+        counter; the cap is MAX_LIVE_SUBAGENTS so a runaway parent
+        can't fork unbounded sessions.
+        """
+        if not prompt.strip():
+            return "Error: spawn_agent requires a non-empty 'prompt' argument."
+        if len(self._live_subagents) >= MAX_LIVE_SUBAGENTS:
+            return (
+                f"Error: too many live subagents "
+                f"({len(self._live_subagents)}/{MAX_LIVE_SUBAGENTS}). "
+                "Call end_agent on an existing session first."
+            )
+
+        sub_ctx = ToolContext(work_dir=self.ctx.work_dir)
+        sub_messages: list = [
+            {"role": "system", "content": SYSTEM_PROMPT + sub_ctx.work_dir},
+        ]
+        if system.strip():
+            sub_messages.append({
+                "role": "system",
+                "content": f"# Subagent role / constraints\n\n{system.strip()}",
+            })
+        sub_messages.append({"role": "user", "content": prompt})
+
+        # Hide every meta-tool so the subagent can't recurse.
+        sub_tools = [
+            t for t in TOOLS
+            if t["function"]["name"] not in (
+                "spawn_agent", "chat_agent", "await_agent", "end_agent"
+            )
+        ]
+
+        sub_id = f"sub-{self._subagent_next_id}"
+        self._subagent_next_id += 1
+        preview = prompt.strip().replace("\n", " ")
+        if len(preview) > 40:
+            preview = preview[:40] + "…"
+        now = time.monotonic()
+        sess = SubagentSession(
+            id=sub_id,
+            prompt_preview=preview,
+            started_at=now,
+            last_active_at=now,
+            messages=sub_messages,
+            ctx=sub_ctx,
+            sub_tools=sub_tools,
+        )
+        sess.task = asyncio.create_task(self._run_subagent_task(sess))
+        self._live_subagents[sub_id] = sess
+        return (
+            f"[session_id={sub_id}, status=running] subagent spawned. "
+            f"Call await_agent(session_id='{sub_id}') to fetch the answer."
+        )
+
+    def _chat_subagent(self, sid: str, prompt: str) -> str:
+        """Append `prompt` to an existing session and schedule the
+        next round as a background task. Returns immediately; the
+        parent calls `await_agent` to fetch the answer.
+
+        Errors if the session is busy (a previous round still running)
+        or if there's an unread result still waiting — the parent must
+        await_agent the previous round's answer before sending another.
+        """
+        if not sid or not prompt.strip():
+            return (
+                "Error: chat_agent requires non-empty 'session_id' "
+                "and 'prompt'."
+            )
+        sess = self._live_subagents.get(sid)
+        if sess is None:
+            return (
+                f"Error: unknown session_id '{sid}' (already ended or "
+                "idle-reaped). Use spawn_agent to start a new session."
+            )
+        if sess.task is not None and not sess.task.done():
+            return (
+                f"Error: session {sid} is still running an earlier "
+                "round. Call await_agent first."
+            )
+        if sess.last_result is not None:
+            return (
+                f"Error: session {sid} has an unread result. Call "
+                "await_agent first to consume it."
+            )
+        sess.messages.append({"role": "user", "content": prompt})
+        sess.last_active_at = time.monotonic()
+        sess.task = asyncio.create_task(self._run_subagent_task(sess))
+        return (
+            f"[session_id={sid}, status=running] chat sent. Call "
+            f"await_agent(session_id='{sid}') to fetch the answer."
+        )
+
+    async def _await_subagent(
+        self, sid: str, timeout: float | int | None
+    ) -> str:
+        """Wait for a session's pending round (up to `timeout`s) and
+        return its answer, consuming `last_result`. timeout=0 polls
+        without blocking. If the round is still running when the
+        timeout expires, returns a 'still running' notice WITHOUT
+        cancelling the task (the parent can await_agent again or
+        end_agent to give up).
+        """
+        if not sid:
+            return "Error: await_agent requires a 'session_id' argument."
+        sess = self._live_subagents.get(sid)
+        if sess is None:
+            return (
+                f"Error: unknown session_id '{sid}' (already ended or "
+                "idle-reaped)."
+            )
+        # Resolve timeout — clamp to [0, max].
+        if timeout is None:
+            wait_secs: float = float(SUBAGENT_DEFAULT_AWAIT_TIMEOUT)
+        else:
+            try:
+                wait_secs = float(timeout)
+            except (TypeError, ValueError):
+                wait_secs = float(SUBAGENT_DEFAULT_AWAIT_TIMEOUT)
+        if wait_secs < 0:
+            wait_secs = 0.0
+        if wait_secs > SUBAGENT_MAX_AWAIT_TIMEOUT:
+            wait_secs = float(SUBAGENT_MAX_AWAIT_TIMEOUT)
+
+        # Wait for the task to finish if one is in flight. asyncio.wait
+        # does NOT cancel pending tasks on timeout — exactly what we
+        # want: the subagent keeps running, the parent can poll again.
+        if sess.task is not None and not sess.task.done():
+            done, _pending = await asyncio.wait(
+                {sess.task}, timeout=wait_secs
+            )
+            if not done:
+                return (
+                    f"[session_id={sid}, status=running] still running "
+                    f"after {wait_secs:.0f}s ({sess.phase}, turn "
+                    f"{sess.turn}). Call await_agent again."
+                )
+
+        # Task is done (or there was none). Surface the pending result.
+        if sess.last_result is None:
+            return (
+                f"Error: session {sid} has no pending result. Send "
+                "chat_agent before await_agent."
+            )
+        result = sess.last_result
+        sess.last_result = None
+        if sess.phase == "ready":
+            sess.phase = "idle"
+        sess.last_active_at = time.monotonic()
+        return result
+
+    def _end_subagent(self, sid: str) -> str:
+        """Tear down a session: cancel any in-flight round, kill its
+        bash jobs, drop it from the live registry. Idempotent (returns
+        an Error string if the id is unknown — easier for the model to
+        spot than a silent no-op)."""
+        sess = self._live_subagents.pop(sid, None)
+        if sess is None:
+            return (
+                f"Error: unknown session_id '{sid}' (already ended or "
+                "idle-reaped)."
+            )
+        if sess.task is not None and not sess.task.done():
+            sess.task.cancel()
+        kill_all_bash_jobs(sess.ctx.bash_jobs)
+        return (
+            f"Session {sid} ended (turns={sess.turn}, "
+            f"in={sess.tokens_in:,}, out={sess.tokens_out:,})."
+        )
 
 
 # ───────── entry ─────────
