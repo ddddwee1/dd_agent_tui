@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -44,7 +45,12 @@ from .config import (
     SUBAGENT_RESULT_MAX_CHARS,
     SYSTEM_PROMPT,
 )
-from .state import TokenCounter, ToolContext, kill_all_bash_jobs
+from .state import (
+    SubagentStatus,
+    TokenCounter,
+    ToolContext,
+    kill_all_bash_jobs,
+)
 from .tools import TOOLS, execute_tool
 from .widgets import (
     AssistantMessage,
@@ -53,6 +59,7 @@ from .widgets import (
     MultilineInput,
     StatusBar,
     SteerBubble,
+    SubagentsBlock,
     ThinkingBlock,
     TodoBlock,
     ToolCallBlock,
@@ -203,6 +210,13 @@ class AgentApp(App):
         # Single BgJobsBlock that mirrors ctx.bash_jobs into the sidebar.
         # Driven by a 1-second timer started in on_mount.
         self._bg_jobs_block: BgJobsBlock | None = None
+        # Subagent monitor: AgentApp pushes a SubagentStatus into this
+        # dict at spawn_agent entry, mutates it as the subagent advances
+        # (turn / phase / last_tool / tokens), and pops it on return.
+        # SubagentsBlock renders the dict at 1 Hz.
+        self._subagent_statuses: dict[str, SubagentStatus] = {}
+        self._subagent_next_id = 1
+        self._subagent_block: SubagentsBlock | None = None
         # Message queue: messages submitted while a turn is in flight
         # land here and are consumed in FIFO order after the current
         # turn finishes. Wiped on /clear and on API error (so the user
@@ -261,6 +275,10 @@ class AgentApp(App):
         # just iterates the dict (≤ ~10 entries) and re-renders one
         # widget.
         self.set_interval(1.0, self._refresh_bg_panel)
+        # Same cadence for the subagent monitor — phase changes happen
+        # on millisecond scales but the user only needs a coarse "what's
+        # it doing" pulse.
+        self.set_interval(1.0, self._refresh_subagent_panel)
 
     def _tick_progress_bar(self) -> None:
         if not self._busy:
@@ -324,6 +342,52 @@ class AgentApp(App):
             await sidebar.mount(self._bg_jobs_block)
         sidebar.add_class("visible")
         self._bg_jobs_block.render_jobs(list(self.ctx.bash_jobs.values()))
+
+    def _refresh_subagent_panel(self) -> None:
+        """Mirror _subagent_statuses into the sidebar widget. Same
+        lifecycle rule as _refresh_bg_panel: panel exists iff at least
+        one subagent is in flight. Done subagents are removed from the
+        dict by _run_subagent's `finally`, so this method only ever
+        sees running ones — but render the whole dict regardless so a
+        future "leave done ones visible for N seconds" tweak is one
+        line away."""
+        statuses = list(self._subagent_statuses.values())
+        running = [s for s in statuses if s.finished_at is None]
+        try:
+            sidebar = self.query_one("#sidebar", Vertical)
+        except Exception:
+            return
+        if not running:
+            if (
+                self._subagent_block is not None
+                and self._subagent_block.is_mounted
+            ):
+                self._subagent_block.remove()
+            self._subagent_block = None
+            return
+        if (
+            self._subagent_block is None
+            or not self._subagent_block.is_mounted
+        ):
+            self._subagent_block = SubagentsBlock()
+            self.call_later(self._mount_subagent_block)
+            return
+        self._subagent_block.render_statuses(statuses)
+        sidebar.add_class("visible")
+
+    async def _mount_subagent_block(self) -> None:
+        try:
+            sidebar = self.query_one("#sidebar", Vertical)
+        except Exception:
+            return
+        if self._subagent_block is None:
+            return
+        if not self._subagent_block.is_mounted:
+            await sidebar.mount(self._subagent_block)
+        sidebar.add_class("visible")
+        self._subagent_block.render_statuses(
+            list(self._subagent_statuses.values())
+        )
 
     # ─ key bindings / actions ─
 
@@ -1511,9 +1575,27 @@ class AgentApp(App):
             t for t in TOOLS if t["function"]["name"] != "spawn_agent"
         ]
 
+        # Register a sidebar-visible status. The 1 Hz refresh in
+        # _refresh_subagent_panel reads this dict; we mutate `status`
+        # in place at every phase boundary below.
+        sub_id = f"sub-{self._subagent_next_id}"
+        self._subagent_next_id += 1
+        preview = prompt.strip().replace("\n", " ")
+        if len(preview) > 40:
+            preview = preview[:40] + "…"
+        status = SubagentStatus(
+            id=sub_id,
+            prompt_preview=preview,
+            started_at=time.monotonic(),
+        )
+        self._subagent_statuses[sub_id] = status
+
         last_content = ""
         try:
             for _turn in range(SUBAGENT_MAX_TURNS):
+                status.turn = _turn + 1
+                status.phase = "thinking"
+                status.last_tool = None
                 try:
                     stream = await self.client.chat.completions.create(
                         model=self.model,
@@ -1526,6 +1608,7 @@ class AgentApp(App):
                         extra_body={"thinking": {"type": "enabled"}},
                     )
                 except Exception as e:
+                    status.phase = "error"
                     return f"❌ subagent stream failed: {e}"
 
                 content = ""
@@ -1544,6 +1627,9 @@ class AgentApp(App):
                     text = getattr(delta, "content", None)
                     if text:
                         content += text
+                        # First non-thinking chunk → flip the sidebar
+                        # phase. Idempotent past the first hit.
+                        status.phase = "answering"
                     for tc in getattr(delta, "tool_calls", None) or []:
                         idx = tc.index if tc.index is not None else 0
                         slot = tool_calls.setdefault(
@@ -1560,10 +1646,15 @@ class AgentApp(App):
                                 slot["function"]["name"] += tc.function.name
                             if tc.function.arguments:
                                 slot["function"]["arguments"] += tc.function.arguments
+                        status.phase = "answering"
 
                 # Roll subagent usage into parent counter so the status
-                # bar reflects combined spend.
+                # bar reflects combined spend; also accumulate per-
+                # subagent counts for the sidebar widget.
                 self.counter.add(final_usage)
+                if final_usage is not None:
+                    status.tokens_in += getattr(final_usage, "prompt_tokens", 0) or 0
+                    status.tokens_out += getattr(final_usage, "completion_tokens", 0) or 0
                 self._refresh_status()
 
                 last_content = content
@@ -1580,10 +1671,13 @@ class AgentApp(App):
                 sub_messages.append(msg)
 
                 if not tool_calls:
+                    status.phase = "done"
                     return content or "(subagent returned no answer)"
 
                 for tc in msg["tool_calls"]:
                     name = tc["function"]["name"]
+                    status.phase = "tool"
+                    status.last_tool = name
                     raw = tc["function"].get("arguments") or "{}"
                     try:
                         args = json.loads(raw)
@@ -1619,14 +1713,24 @@ class AgentApp(App):
                         "content": result,
                     })
 
+            status.phase = "done"
             return (
                 f"⚠ subagent reached the {SUBAGENT_MAX_TURNS}-turn cap "
                 f"without a final answer. Last partial assistant text:"
                 f"\n\n{last_content}"
             )
         finally:
-            # Subagent is done (returned, raised, or cancelled). Don't
-            # leak background bash jobs it may have started.
+            # Subagent is done (returned, raised, or cancelled).
+            # Stamp finished_at + retire from the live registry so the
+            # sidebar drops it on the next refresh; phase=error covers
+            # the cancel / unexpected-exit paths where no `done`
+            # was set above.
+            if status.finished_at is None:
+                status.finished_at = time.monotonic()
+            if status.phase not in ("done", "error"):
+                status.phase = "error"
+            self._subagent_statuses.pop(sub_id, None)
+            # Don't leak background bash jobs the subagent may have started.
             kill_all_bash_jobs(sub_ctx.bash_jobs)
 
 

@@ -23,7 +23,7 @@ from textual.message import Message
 from textual.widgets import Collapsible, Static, TextArea
 
 from .config import CTX_SAFE_LIMIT
-from .state import BgJob, TokenCounter, bg_job_status
+from .state import BgJob, SubagentStatus, TokenCounter, bg_job_status
 
 
 # ───────── conversation bubbles ─────────
@@ -300,6 +300,62 @@ class TodoBlock(Static):
                 t.append("  [ ] ", style="dim")
                 t.append(content, style="dim")
         return t
+
+
+class SubagentsBlock(Static):
+    """Sidebar widget showing in-flight `spawn_agent` calls.
+
+    Mirrors `AgentApp._subagent_statuses` once a second. Same lifecycle
+    as `BgJobsBlock`: panel exists iff at least one subagent is
+    currently running; all-done means immediate unmount (the parent's
+    ToolCallBlock keeps the historical record).
+    """
+
+    DEFAULT_CSS = """
+    SubagentsBlock {
+        margin: 1 0;
+        padding: 0 1;
+        border: round #f5c2e7;
+    }
+    """
+
+    # phase → (icon, style). Distinct hues so the eye can tell at a
+    # glance whether the subagent is currently spending tokens
+    # (thinking / answering) or burning wallclock on a tool.
+    _PHASE_GLYPH = {
+        "thinking":  ("◐", "bold #cba6f7"),  # mauve
+        "answering": ("▶", "bold cyan"),
+        "tool":      ("⚙", "bold #fab387"),  # peach
+        "done":      ("✓", "bold green"),
+        "error":     ("✗", "bold red"),
+    }
+
+    def render_statuses(self, statuses: list[SubagentStatus]) -> None:
+        t = Text()
+        t.append("Subagents  ", style="bold #f5c2e7")
+        n_run = sum(1 for s in statuses if s.finished_at is None)
+        t.append(f"({n_run} 跑)", style="dim")
+        if not statuses:
+            t.append("\n  (empty)", style="dim italic")
+            self.update(t)
+            return
+        for s in statuses:
+            elapsed = (s.finished_at or time.monotonic()) - s.started_at
+            icon, style = self._PHASE_GLYPH.get(s.phase, ("·", "dim"))
+            t.append("\n  ")
+            t.append(f"{icon} ", style=style)
+            t.append(f"{s.id}", style=style)
+            t.append(f"  轮 {s.turn}  {elapsed:5.1f}s", style="dim")
+            if s.last_tool:
+                t.append(f"  · {s.last_tool}", style="#fab387")
+            if s.tokens_in or s.tokens_out:
+                t.append(
+                    f"\n    [{s.tokens_in:,}↓ / {s.tokens_out:,}↑]",
+                    style="dim",
+                )
+            if s.prompt_preview:
+                t.append(f'\n    "{s.prompt_preview}"', style="dim italic")
+        self.update(t)
 
 
 class BgJobsBlock(Static):

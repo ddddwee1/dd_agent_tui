@@ -105,6 +105,28 @@ class ToolContext:
         return f"bg-{i}"
 
 
+@dataclass
+class SubagentStatus:
+    """Live snapshot of one in-flight `spawn_agent` call.
+
+    AgentApp creates one when a subagent starts, mutates its fields as
+    the subagent advances (turn counter, phase, last tool, token totals),
+    and removes it from the registry when the subagent returns. The
+    `SubagentsBlock` sidebar widget renders the registry dict at 1 Hz.
+    """
+
+    id: str                 # "sub-1", "sub-2", …
+    prompt_preview: str     # first ~40 chars of the user prompt
+    started_at: float
+    turn: int = 0           # 1-indexed once the first stream starts
+    # phase ∈ {"thinking", "answering", "tool", "done", "error"}
+    phase: str = "thinking"
+    last_tool: str | None = None
+    tokens_in: int = 0      # cumulative prompt tokens for this subagent
+    tokens_out: int = 0     # cumulative completion tokens
+    finished_at: float | None = None
+
+
 class TokenCounter:
     """Cumulative + last-call token usage. AgentApp holds one and
     feeds every API response's `usage` into `add()`. StatusBar reads
