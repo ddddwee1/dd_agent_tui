@@ -21,12 +21,13 @@ setup(
     long_description_content_type=long_description_content_type,
     author="ddwe",
     url="https://github.com/ddwe/dd_agent_tui",
-    py_modules=["agent"],
+    packages=["ddtui"],
+    py_modules=["agent"],   # shim so `python agent.py` and `from agent import main` keep working
     install_requires=install_requires,
     python_requires=">=3.10",
     entry_points={
         "console_scripts": [
-            "ddtui=agent:main",
+            "ddtui=ddtui.app:main",
         ],
     },
     classifiers=[
