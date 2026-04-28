@@ -532,6 +532,53 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "spawn_agent",
+            "description": (
+                "Spawn an isolated subagent to handle a self-contained "
+                "subtask, then return its final answer as this tool's "
+                "result. Use spawn_agent for: (1) reducing context "
+                "noise — let a subagent grind through a search, build, "
+                "or codebase tour and only the conclusion comes back; "
+                "(2) parallel-style investigations you'll fold into "
+                "your main work. The subagent has its own conversation "
+                "history and bash job table; this conversation only "
+                "sees its final assistant message. The subagent CAN'T "
+                "spawn further subagents (depth is limited to 1) and "
+                "CAN'T read your scratch state — give it everything it "
+                "needs in `prompt`. Token usage is billed to this "
+                "conversation and shows up in the status bar."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The subagent's user message. State the "
+                            "task, success criteria, and any context "
+                            "(file paths, prior findings) the subagent "
+                            "needs — it starts with no memory of this "
+                            "conversation."
+                        ),
+                    },
+                    "system": {
+                        "type": "string",
+                        "description": (
+                            "Optional extra system instruction appended "
+                            "to the framework system prompt. Use to "
+                            "narrow the subagent's role, e.g. 'You are "
+                            "a read-only investigator: report findings, "
+                            "do not modify files.'"
+                        ),
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "todo_tool",
             "description": (
                 "Maintain a structured TODO list across the conversation. "

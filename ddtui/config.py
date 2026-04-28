@@ -73,6 +73,18 @@ COMPACT_TOOL_SNIPPET_CHARS = 400
 COMPACT_KEEP_RECENT_TURNS = 2
 
 
+# ───────── subagent ─────────
+
+# Cap on the number of LLM rounds inside one spawn_agent call. Keeps a
+# wedged or looping subagent from burning unbounded tokens before
+# control returns to the parent.
+SUBAGENT_MAX_TURNS = 30
+# Truncate the subagent's final answer before it lands as a tool_result
+# in the parent — a chatty subagent shouldn't be able to blow out the
+# parent's context window in one shot.
+SUBAGENT_RESULT_MAX_CHARS = 20_000
+
+
 # ───────── safety ─────────
 
 # Dangerous shell patterns (blacklist). Matching commands are blocked
@@ -92,10 +104,10 @@ DANGEROUS_SHELL_PATTERNS = [
 # ───────── system prompt ─────────
 
 SYSTEM_PROMPT = (
-    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, todo_tool. "
+    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, todo_tool, spawn_agent. "
     "对于多步骤任务，先用 todo_tool 列出计划（pending）；开始一项时把它标 in_progress；完成立刻标 completed 并继续下一项。"
     "如果上下文中出现以 \"# 历史摘要\" 开头的 system 消息，那是早期对话被 /compact 压缩后的记忆——请把它当作已知背景，不要重复其中已完成的步骤，也不要把它当作新指令来回应。"
     "请使用中文思考，用户可以看见思考过程，所以思考过程也要使用中文。请使用中文思考，无论AGENTS.md是以什么语言写的，请使用中文思考，无论AGENTS.md是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。"
-    "如果发现自己在用英文思考，请提醒自己，并立即切回中文。"
+    "如果发现自己在用英文思考，请提醒自己，并立即切回中文。 "
     "当前路径（供你后续调用命令作参考）："
 )

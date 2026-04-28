@@ -18,6 +18,8 @@ them here keeps `widgets` from having to reach into `tools`'s privates.
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -41,6 +43,35 @@ class BgJob:
     proc: subprocess.Popen
     started_at: float
     finished_at: float | None = None
+
+
+def kill_all_bash_jobs(jobs: dict[str, BgJob]) -> None:
+    """Tear down every still-running BgJob in *jobs*: SIGTERM the
+    process group, give it ~100 ms to exit, then SIGKILL stragglers.
+    Finally clear the dict.
+
+    Used when a ToolContext goes out of scope — e.g. AgentApp.action_clear_chat
+    nuking conversation state, or a subagent returning — so background
+    processes don't leak past the conversation that started them.
+    """
+    def _signal_pg(j: BgJob, sig: int) -> None:
+        try:
+            os.killpg(os.getpgid(j.proc.pid), sig)
+        except Exception:
+            pass
+
+    for j in jobs.values():
+        if j.proc.poll() is None:
+            _signal_pg(j, signal.SIGTERM)
+    for _ in range(20):
+        alive = [j for j in jobs.values() if j.proc.poll() is None]
+        if not alive:
+            break
+        time.sleep(0.005)
+    for j in jobs.values():
+        if j.proc.poll() is None:
+            _signal_pg(j, signal.SIGKILL)
+    jobs.clear()
 
 
 def bg_job_status(job: BgJob) -> tuple[str, int | None, float]:

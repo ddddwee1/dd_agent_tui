@@ -18,8 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import signal
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -42,9 +40,11 @@ from .config import (
     HISTORY_DIR,
     MODEL,
     REASONING_EFFORT,
+    SUBAGENT_MAX_TURNS,
+    SUBAGENT_RESULT_MAX_CHARS,
     SYSTEM_PROMPT,
 )
-from .state import BgJob, TokenCounter, ToolContext
+from .state import TokenCounter, ToolContext, kill_all_bash_jobs
 from .tools import TOOLS, execute_tool
 from .widgets import (
     AssistantMessage,
@@ -360,31 +360,10 @@ class AgentApp(App):
             self._todo_block.remove()
         self._todo_block = None
         # Background jobs are tied to the conversation that spawned
-        # them, so a /clear nukes them too. SIGTERM the whole process
-        # group (we used start_new_session=True), reap zombies so
-        # subsequent poll() calls report exit, then escalate any
-        # stragglers to SIGKILL. ~100 ms cap on the wait so /clear
-        # stays snappy.
-        def _signal_pg(j: BgJob, sig: int) -> None:
-            try:
-                os.killpg(os.getpgid(j.proc.pid), sig)
-            except Exception:
-                pass
-        for j in self.ctx.bash_jobs.values():
-            if j.proc.poll() is None:
-                _signal_pg(j, signal.SIGTERM)
-        for _ in range(20):
-            alive = [
-                j for j in self.ctx.bash_jobs.values()
-                if j.proc.poll() is None
-            ]
-            if not alive:
-                break
-            time.sleep(0.005)
-        for j in self.ctx.bash_jobs.values():
-            if j.proc.poll() is None:
-                _signal_pg(j, signal.SIGKILL)
-        self.ctx.bash_jobs.clear()
+        # them, so a /clear nukes them too. The helper SIGTERMs the
+        # whole process group, briefly waits, then SIGKILLs any
+        # stragglers — ~100 ms cap so /clear stays snappy.
+        kill_all_bash_jobs(self.ctx.bash_jobs)
         if self._bg_jobs_block is not None and self._bg_jobs_block.is_mounted:
             self._bg_jobs_block.remove()
         self._bg_jobs_block = None
@@ -1173,7 +1152,13 @@ class AgentApp(App):
             "### 工具(模型可调用)\n"
             "`bash` `bash_start/check/wait/kill/list` "
             "`read_file` `write_file` `edit_file` `edit_lines` `multi_edit` "
-            "`list_files` `glob_files` `search_content` `web_fetch` `todo_tool`\n"
+            "`list_files` `glob_files` `search_content` `web_fetch` "
+            "`todo_tool` `spawn_agent`\n"
+            "\n"
+            f"`spawn_agent` 让模型派一个隔离的子 agent 跑自包含子任务，"
+            f"主对话只看到子的最终回答（最多 {SUBAGENT_MAX_TURNS} 轮，"
+            f"返回截断到 {SUBAGENT_RESULT_MAX_CHARS:,} 字符）。"
+            "子 agent 不能再嵌套子 agent，但 token 计入主对话 status bar。\n"
         )
         await self._mount_widget(Static(Markdown(md)))
 
@@ -1324,6 +1309,50 @@ class AgentApp(App):
                             )
                             continue
 
+                        if name == "spawn_agent":
+                            # Subagent: needs LLM access, so it can't
+                            # go through `execute_tool` / asyncio.to_thread
+                            # like sync tools — run it inline on this
+                            # event loop. ESC×2 cancels the parent
+                            # worker; CancelledError propagates here
+                            # and aborts the subagent's await chain.
+                            block = ToolCallBlock(name, args)
+                            await self._mount_widget(block)
+                            prompt = args.get("prompt") or ""
+                            sub_system = args.get("system") or ""
+                            if not prompt.strip():
+                                result = (
+                                    "Error: spawn_agent requires a "
+                                    "non-empty 'prompt' argument."
+                                )
+                                block.set_result(result, blocked=True)
+                            else:
+                                try:
+                                    result = await self._run_subagent(
+                                        prompt, sub_system
+                                    )
+                                except asyncio.CancelledError:
+                                    result = "⛔ subagent cancelled (parent ESC×2)"
+                                    block.set_result(result, blocked=True)
+                                    self.messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": tc["id"],
+                                        "content": result,
+                                    })
+                                    raise
+                                if len(result) > SUBAGENT_RESULT_MAX_CHARS:
+                                    result = (
+                                        result[:SUBAGENT_RESULT_MAX_CHARS]
+                                        + f"\n…[+{len(result) - SUBAGENT_RESULT_MAX_CHARS} chars truncated]"
+                                    )
+                                block.set_result(result)
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result,
+                            })
+                            continue
+
                         block = ToolCallBlock(name, args)
                         await self._mount_widget(block)
                         allowed = await self.tool_confirm(name, args)
@@ -1443,6 +1472,151 @@ class AgentApp(App):
         if tool_calls:
             msg["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
         return msg
+
+    # ─ subagent ─
+
+    async def _run_subagent(self, prompt: str, system: str) -> str:
+        """Run an isolated subagent and return its final assistant text.
+
+        The subagent gets a fresh `ToolContext` (so its bash jobs don't
+        appear in the parent's sidebar and don't count against the
+        parent's BG_MAX_CONCURRENT) but inherits the parent's work_dir,
+        OpenAI client, and model / effort settings. Token usage rolls
+        up into the parent counter so the status-bar gradient reflects
+        the combined cost.
+
+        The subagent's tool list excludes `spawn_agent` itself (no
+        nesting). All tool calls still walk through `self.tool_confirm`
+        so a user policy applies everywhere, not just to the parent.
+
+        We deliberately DON'T write `reasoning_content` back into the
+        subagent's messages — DeepSeek won't replay it as context, so
+        keeping it would just inflate each subsequent prompt.
+        """
+        sub_ctx = ToolContext(work_dir=self.ctx.work_dir)
+        sub_messages: list = [
+            {"role": "system", "content": SYSTEM_PROMPT + sub_ctx.work_dir},
+        ]
+        if system.strip():
+            sub_messages.append({
+                "role": "system",
+                "content": f"# Subagent role / constraints\n\n{system.strip()}",
+            })
+        sub_messages.append({"role": "user", "content": prompt})
+
+        # Hide spawn_agent from the subagent so it can't recurse.
+        sub_tools = [
+            t for t in TOOLS if t["function"]["name"] != "spawn_agent"
+        ]
+
+        last_content = ""
+        try:
+            for _turn in range(SUBAGENT_MAX_TURNS):
+                try:
+                    stream = await self.client.chat.completions.create(
+                        model=self.model,
+                        messages=sub_messages,
+                        tools=sub_tools,
+                        tool_choice="auto",
+                        stream=True,
+                        stream_options={"include_usage": True},
+                        reasoning_effort=self.effort,
+                        extra_body={"thinking": {"type": "enabled"}},
+                    )
+                except Exception as e:
+                    return f"❌ subagent stream failed: {e}"
+
+                content = ""
+                tool_calls: dict[int, dict] = {}
+                final_usage = None
+                async for chunk in stream:
+                    if getattr(chunk, "usage", None):
+                        final_usage = chunk.usage
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    text = getattr(delta, "content", None)
+                    if text:
+                        content += text
+                    for tc in getattr(delta, "tool_calls", None) or []:
+                        idx = tc.index if tc.index is not None else 0
+                        slot = tool_calls.setdefault(
+                            idx,
+                            {"id": "", "type": "function",
+                             "function": {"name": "", "arguments": ""}},
+                        )
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.type:
+                            slot["type"] = tc.type
+                        if tc.function:
+                            if tc.function.name:
+                                slot["function"]["name"] += tc.function.name
+                            if tc.function.arguments:
+                                slot["function"]["arguments"] += tc.function.arguments
+
+                # Roll subagent usage into parent counter so the status
+                # bar reflects combined spend.
+                self.counter.add(final_usage)
+                self._refresh_status()
+
+                last_content = content
+                msg: dict = {"role": "assistant", "content": content}
+                if tool_calls:
+                    msg["tool_calls"] = [
+                        tool_calls[i] for i in sorted(tool_calls)
+                    ]
+                sub_messages.append(msg)
+
+                if not tool_calls:
+                    return content or "(subagent returned no answer)"
+
+                for tc in msg["tool_calls"]:
+                    name = tc["function"]["name"]
+                    raw = tc["function"].get("arguments") or "{}"
+                    try:
+                        args = json.loads(raw)
+                    except json.JSONDecodeError:
+                        result = f"Error: bad JSON args: {raw}"
+                    else:
+                        if name == "spawn_agent":
+                            # Defense in depth — the schema is hidden
+                            # but models occasionally still try anyway.
+                            result = (
+                                "Error: subagents cannot spawn further "
+                                "subagents."
+                            )
+                        else:
+                            allowed = await self.tool_confirm(name, args)
+                            if allowed:
+                                result = await asyncio.to_thread(
+                                    execute_tool, sub_ctx, name, args
+                                )
+                                # Strip the diff so a 1000-line patch
+                                # doesn't eat the subagent's context.
+                                if name in (
+                                    "edit_file", "edit_lines", "multi_edit"
+                                ):
+                                    head, sep, diff = result.partition("\n\n")
+                                    if sep and "@@" in diff:
+                                        result = head
+                            else:
+                                result = "Tool execution blocked by user policy."
+                    sub_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result,
+                    })
+
+            return (
+                f"⚠ subagent reached the {SUBAGENT_MAX_TURNS}-turn cap "
+                f"without a final answer. Last partial assistant text:"
+                f"\n\n{last_content}"
+            )
+        finally:
+            # Subagent is done (returned, raised, or cancelled). Don't
+            # leak background bash jobs it may have started.
+            kill_all_bash_jobs(sub_ctx.bash_jobs)
 
 
 # ───────── entry ─────────
