@@ -1882,6 +1882,16 @@ class AgentApp(App):
         sub_messages: list = [
             {"role": "system", "content": SYSTEM_PROMPT + sub_ctx.work_dir},
         ]
+        # Project-level guidance (AGENTS.md) applies to subagents too —
+        # they're working in the same repo as the parent and should
+        # follow the same conventions. Re-read here rather than copying
+        # from self.messages so it picks up edits made since startup.
+        sub_agents_md = load_agents_md(sub_ctx.work_dir)
+        if sub_agents_md:
+            sub_messages.append({
+                "role": "system",
+                "content": f"# Project guidelines (from AGENTS.md)\n\n{sub_agents_md}",
+            })
         if system.strip():
             sub_messages.append({
                 "role": "system",
