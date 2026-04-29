@@ -1262,7 +1262,7 @@ class AgentApp(App):
             "### 工具(模型可调用)\n"
             "`bash` `bash_start/check/wait/kill/list` "
             "`read_file` `write_file` `edit_file` `edit_lines` `multi_edit` "
-            "`list_files` `glob_files` `search_content` `web_fetch` "
+            "`list_files` `glob_files` `search_content` `web_fetch` `web_search` "
             "`todo_tool` `spawn_agent` `chat_agent` `await_agent` `end_agent`\n"
             "\n"
             f"子 agent 四件套（异步并发）：`spawn_agent` / `chat_agent` "

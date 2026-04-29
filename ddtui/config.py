@@ -35,6 +35,17 @@ WEB_FETCH_MAX_BYTES = 2_000_000   # cap raw download (~2 MB)
 WEB_FETCH_MAX_CHARS = 10_000      # cap returned text (matches bash output cap)
 WEB_FETCH_HARD_CHAR_CAP = 50_000  # absolute upper bound when caller overrides
 
+# Web search (Brave). Key file is one line, ASCII; missing → web_search
+# returns a clear error rather than crashing.
+WEB_SEARCH_API_KEY_PATH = os.environ.get(
+    "BRAVE_API_KEY_FILE", str(Path.home() / "brave_apikey.txt")
+)
+WEB_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+WEB_SEARCH_DEFAULT_COUNT = 5
+WEB_SEARCH_MAX_COUNT = 20         # Brave per-request cap
+WEB_SEARCH_TIMEOUT = 15
+WEB_SEARCH_SNIPPET_MAX_CHARS = 240  # truncate per-result description
+
 # Background bash jobs.
 BG_JOB_LOG_DIR = Path("/tmp")
 BG_MAX_CONCURRENT = 5             # cap on simultaneously-running jobs
@@ -123,7 +134,7 @@ DANGEROUS_SHELL_PATTERNS = [
 # ───────── system prompt ─────────
 
 SYSTEM_PROMPT = (
-    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, todo_tool, spawn_agent, chat_agent, await_agent, end_agent. "
+    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, web_search, todo_tool, spawn_agent, chat_agent, await_agent, end_agent. "
     "子 agent 是异步的：spawn_agent 创建会话并立即返回 session_id（status=running），背后的子 agent 在后台跑；chat_agent 在已有会话发新 prompt，同样立即返回。两者都不直接给答案——必须用 await_agent(session_id) 拿结果（默认 60s 超时，超时返回 still running 让你再次 await）。end_agent 释放会话。要并行就一次发多个 spawn_agent，再分别 await_agent。子 agent 跨轮保留记忆（含 reasoning），同一任务别反复 spawn。"
     "对于多步骤任务，先用 todo_tool 列出计划（pending）；开始一项时把它标 in_progress；完成立刻标 completed 并继续下一项。"
     "如果上下文中出现以 \"# 历史摘要\" 开头的 system 消息，那是早期对话被 /compact 压缩后的记忆——请把它当作已知背景，不要重复其中已完成的步骤，也不要把它当作新指令来回应。"

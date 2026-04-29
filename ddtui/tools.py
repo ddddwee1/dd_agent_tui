@@ -16,6 +16,7 @@ from __future__ import annotations
 import difflib
 import fnmatch
 import gzip
+import html
 import json
 import os
 import re
@@ -26,7 +27,7 @@ import zlib
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .config import (
@@ -44,6 +45,12 @@ from .config import (
     WEB_FETCH_MAX_BYTES,
     WEB_FETCH_MAX_CHARS,
     WEB_FETCH_TIMEOUT,
+    WEB_SEARCH_API_KEY_PATH,
+    WEB_SEARCH_DEFAULT_COUNT,
+    WEB_SEARCH_ENDPOINT,
+    WEB_SEARCH_MAX_COUNT,
+    WEB_SEARCH_SNIPPET_MAX_CHARS,
+    WEB_SEARCH_TIMEOUT,
 )
 from .state import BgJob, ToolContext, bg_job_status as _bg_status
 
@@ -526,6 +533,37 @@ TOOLS = [
                     },
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web via Brave Search and return a ranked "
+                "list of results (title / URL / snippet). Use this to "
+                "find authoritative URLs to feed into web_fetch, or "
+                "to get a quick survey of recent information not in "
+                "the model's training. Returns plain text, one block "
+                "per result. Default 5 results, max 20."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query — same syntax as a Brave search box.",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": (
+                            "Number of results to return. Default 5, "
+                            "max 20."
+                        ),
+                    },
+                },
+                "required": ["query"],
             },
         },
     },
@@ -1634,6 +1672,115 @@ def tool_web_fetch(
     return f"{header}\n\n{text}{suffix}"
 
 
+# ───────── web search ─────────
+
+# Lazy-loaded Brave Search API key.  None = not loaded yet, "" = file
+# missing or empty (cached so we don't re-stat on every search). The
+# path is config-defined and can't change without a process restart,
+# so module-level caching is fine.
+_BRAVE_API_KEY: str | None = None
+
+
+def _load_brave_api_key() -> str:
+    """Read the Brave Search API key from disk on first call; cache.
+    Returns empty string if the file is missing or empty so the caller
+    can surface a friendly error."""
+    global _BRAVE_API_KEY
+    if _BRAVE_API_KEY is not None:
+        return _BRAVE_API_KEY
+    try:
+        _BRAVE_API_KEY = Path(WEB_SEARCH_API_KEY_PATH).read_text().strip()
+    except (OSError, FileNotFoundError):
+        _BRAVE_API_KEY = ""
+    return _BRAVE_API_KEY
+
+
+def tool_web_search(
+    ctx: ToolContext, query: str, count: int | None = None
+) -> str:
+    """Run a Brave Search and return a ranked list of (title, url,
+    snippet) blocks. Errors are surfaced as plain text so the model can
+    react (rate limit, bad key, no results)."""
+    if not query or not query.strip():
+        return "Error: web_search requires a non-empty 'query'."
+    api_key = _load_brave_api_key()
+    if not api_key:
+        return (
+            f"Error: Brave Search API key not found at "
+            f"{WEB_SEARCH_API_KEY_PATH}. Put the key (one line) there, "
+            f"or set $BRAVE_API_KEY_FILE to a different path."
+        )
+
+    n = WEB_SEARCH_DEFAULT_COUNT
+    if count is not None:
+        try:
+            n = max(1, min(WEB_SEARCH_MAX_COUNT, int(count)))
+        except (TypeError, ValueError):
+            return f"Error: count must be an integer, got {count!r}"
+
+    url = f"{WEB_SEARCH_ENDPOINT}?{urlencode({'q': query, 'count': n})}"
+    req = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": api_key,
+            "User-Agent": "ddtui-agent/1.0",
+        },
+    )
+    try:
+        with urlopen(req, timeout=WEB_SEARCH_TIMEOUT) as resp:
+            encoding = (resp.headers.get("Content-Encoding") or "").lower().strip()
+            raw = resp.read()
+    except HTTPError as e:
+        # Brave returns 401/422/429 with a JSON body — surface a slice
+        # so the model knows whether it's a key, quota, or query issue.
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return f"HTTP error {e.code} {e.reason} from Brave Search: {body[:400]}"
+    except URLError as e:
+        return f"URL error: {e.reason}"
+    except TimeoutError:
+        return f"Error: Brave Search timed out after {WEB_SEARCH_TIMEOUT}s"
+    except Exception as e:
+        return f"Error calling Brave Search: {e}"
+
+    if encoding == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception as e:
+            return f"Error: failed to decompress gzip response: {e}"
+
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as e:
+        return f"Error: Brave Search returned non-JSON: {e}"
+
+    results = (data.get("web") or {}).get("results") or []
+    if not results:
+        return f"(no web results for {query!r})"
+
+    lines: list[str] = [f"web_search {query!r} → {len(results)} result(s)"]
+    for i, r in enumerate(results, 1):
+        title = html.unescape((r.get("title") or "").strip()) or "(untitled)"
+        link = (r.get("url") or "").strip()
+        snippet = (r.get("description") or "").strip()
+        # Brave wraps matched terms in <strong>…</strong>; strip HTML
+        # then unescape entities so &quot; / &amp; come out as " / &.
+        snippet = html.unescape(re.sub(r"<[^>]+>", "", snippet))
+        if len(snippet) > WEB_SEARCH_SNIPPET_MAX_CHARS:
+            snippet = snippet[:WEB_SEARCH_SNIPPET_MAX_CHARS] + "…"
+        block = [f"[{i}] {title}"]
+        if link:
+            block.append(f"    {link}")
+        if snippet:
+            block.append(f"    {snippet}")
+        lines.append("\n".join(block))
+    return "\n\n".join(lines)
+
+
 # ───────── todo ─────────
 
 def tool_todo_tool(ctx: ToolContext, items: list | None = None) -> str:
@@ -1673,6 +1820,7 @@ TOOL_FUNCS = {
     "glob_files": tool_glob_files,
     "search_content": tool_search_content,
     "web_fetch": tool_web_fetch,
+    "web_search": tool_web_search,
     "todo_tool": tool_todo_tool,
 }
 
