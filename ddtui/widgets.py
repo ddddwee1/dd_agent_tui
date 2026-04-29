@@ -29,7 +29,13 @@ from .state import BgJob, SubagentSession, TokenCounter, bg_job_status
 # ───────── conversation bubbles ─────────
 
 class UserBubble(Static):
-    DEFAULT_CSS = "UserBubble { margin: 1 0 0 0; }"
+    DEFAULT_CSS = """
+    UserBubble {
+        margin: 1 0 0 0;
+        padding: 0 1;
+        border-left: thick #89b4fa;
+    }
+    """
 
     def __init__(self, text: str) -> None:
         t = Text()
@@ -60,7 +66,13 @@ class SteerBubble(Static):
 
 
 class AssistantMessage(Static):
-    DEFAULT_CSS = "AssistantMessage { margin: 0 0 1 0; }"
+    DEFAULT_CSS = """
+    AssistantMessage {
+        margin: 0 0 1 0;
+        padding: 0 1;
+        border-left: thick #a6e3a1;
+    }
+    """
 
     def __init__(self) -> None:
         self._buffer = ""
@@ -99,7 +111,7 @@ class ThinkingBlock(Collapsible):
     DEFAULT_CSS = """
     ThinkingBlock { margin: 0 0 1 0; }
     ThinkingBlock > Contents { padding: 0 0 0 2; }
-    ThinkingBlock #thinking-body { color: $text-muted; }
+    ThinkingBlock #thinking-body { color: #585b70; }
     """
 
     def __init__(self) -> None:
