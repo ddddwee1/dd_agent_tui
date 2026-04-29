@@ -19,6 +19,7 @@ from rich.console import Group, RenderableType
 from rich.markdown import Markdown
 from rich.text import Text
 from textual.binding import Binding
+from textual.containers import VerticalScroll
 from textual.message import Message
 from textual.widgets import Collapsible, Static, TextArea
 
@@ -382,6 +383,103 @@ class SubagentsBlock(Static):
             if s.prompt_preview:
                 t.append(f'\n    "{s.prompt_preview}"', style="dim italic")
         self.update(t)
+
+
+class SubagentTabPane(VerticalScroll):
+    """Read-only transcript view for one SubagentSession.
+
+    Lives inside a TabPane in the top-level TabbedContent. Renders
+    `sess.messages` as the same widget vocabulary the main conversation
+    uses (UserBubble / ThinkingBlock / AssistantMessage / ToolCallBlock)
+    so the parent's "what did the subagent do?" view feels familiar.
+
+    Stateful: tracks how many messages have been rendered so a 1 Hz
+    refresh loop can `mount` only the new ones — re-rendering the
+    whole transcript every tick would flicker badly. `_tool_blocks`
+    maps tool_call_id → ToolCallBlock so a later `role=tool` message
+    can attach its result to the block that requested it.
+
+    No streaming: `sess.messages` only grows when a round commits an
+    assistant or tool message, so the view always lags the live stream
+    by one round-stage. Acceptable for a read-only "what did it say"
+    panel; the right-side SubagentsBlock shows the live phase.
+    """
+
+    DEFAULT_CSS = """
+    SubagentTabPane { padding: 0 1; }
+    """
+
+    def __init__(self, sess: SubagentSession) -> None:
+        super().__init__()
+        self.sess = sess
+        self._rendered_idx = 0
+        self._tool_blocks: dict[str, "ToolCallBlock"] = {}
+
+    def refresh_from_session(self) -> None:
+        """Append widgets for any messages that arrived since last call.
+        Cheap when nothing is new (early-out)."""
+        msgs = self.sess.messages
+        if self._rendered_idx >= len(msgs):
+            return
+        for m in msgs[self._rendered_idx:]:
+            self._render_one(m)
+        self._rendered_idx = len(msgs)
+        # Keep the view glued to the bottom while the subagent is
+        # actively producing output — same UX as the main conversation.
+        self.scroll_end(animate=False)
+
+    def _render_one(self, m: dict) -> None:
+        role = m.get("role")
+        if role == "system":
+            # The framework prompt + optional role spec — long, static,
+            # not interesting in a transcript view.
+            return
+        if role == "user":
+            self.mount(UserBubble(m.get("content") or ""))
+            return
+        if role == "assistant":
+            rc = m.get("reasoning_content")
+            if rc:
+                tb = ThinkingBlock()
+                tb.append_text(rc)
+                # Historical reasoning has no live token count; pass 0
+                # and let `finalize` produce a "完成" title without a
+                # number. Start collapsed so the transcript opens with
+                # the answer prominent, not a wall of thoughts.
+                tb.finalize(0)
+                tb.collapsed = True
+                self.mount(tb)
+            content = m.get("content") or ""
+            if content:
+                am = AssistantMessage()
+                am.append_text(content)
+                self.mount(am)
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                name = fn.get("name", "?")
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    args = {"_raw": raw_args}
+                blk = ToolCallBlock(name, args)
+                self.mount(blk)
+                tcid = tc.get("id") or ""
+                if tcid:
+                    self._tool_blocks[tcid] = blk
+            return
+        if role == "tool":
+            tcid = m.get("tool_call_id") or ""
+            content = m.get("content") or ""
+            blk = self._tool_blocks.get(tcid)
+            if blk is not None:
+                blk.set_result(content)
+            else:
+                # Shouldn't happen — every tool message follows an
+                # assistant tool_call with the same id. Render a
+                # standalone fallback rather than dropping the data.
+                self.mount(Static(Text(f"[orphan tool result] {content}")))
+            return
 
 
 class BgJobsBlock(Static):

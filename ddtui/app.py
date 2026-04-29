@@ -29,7 +29,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Header, Static
+from textual.widgets import Header, Static, TabbedContent, TabPane
 
 from .config import (
     AGENTS_MD_FILENAME,
@@ -65,6 +65,7 @@ from .widgets import (
     StatusBar,
     SteerBubble,
     SubagentsBlock,
+    SubagentTabPane,
     ThinkingBlock,
     TodoBlock,
     ToolCallBlock,
@@ -141,6 +142,11 @@ class AgentApp(App):
     }
     #sidebar.visible { display: block; }
     #conversation { height: 1fr; padding: 0 1; background: #300A24; }
+    /* TabbedContent host: take all remaining vertical space inside
+       #main, and let each TabPane occupy its full area without an
+       inner padding (the panes themselves set their own padding). */
+    #tabs { height: 1fr; }
+    #tabs TabPane { padding: 0; }
     #hint { height: 1; padding: 0 1; color: $text-muted; background: #300A24; }
     /* Pending tray: parks queued/steer bubbles above the input box
        until the turn consumes them. height: auto + max-height keeps
@@ -252,7 +258,15 @@ class AgentApp(App):
         yield Header(show_clock=False)
         with Horizontal(id="body"):
             with Vertical(id="main"):
-                yield VerticalScroll(id="conversation")
+                # Top-level tab bar: "main" is the parent conversation;
+                # each live SubagentSession adds a "sub-N" tab as a
+                # read-only transcript view, removed when the session
+                # ends or gets idle-reaped. Input box / status bar /
+                # sidebar are shared across tabs (always operate on
+                # the parent), so the sub tabs are pure observation.
+                with TabbedContent(initial="tab-main", id="tabs"):
+                    with TabPane("main", id="tab-main"):
+                        yield VerticalScroll(id="conversation")
                 yield Static(
                     "Enter 发送 · Option+Enter 换行 · Cmd+Enter steer · ESC×2 中断 · Ctrl+X 取消 · Ctrl+L 清空 · Ctrl+C 退出",
                     id="hint",
@@ -385,6 +399,14 @@ class AgentApp(App):
             return
         self._subagent_block.render_sessions(sessions)
         sidebar.add_class("visible")
+        # Same cadence: walk every mounted SubagentTabPane and append
+        # any new messages that landed since the last refresh. Cheap
+        # when nothing's new (early-out inside refresh_from_session).
+        for pane in self.query(SubagentTabPane):
+            try:
+                pane.refresh_from_session()
+            except Exception:
+                pass
 
     async def _mount_subagent_block(self) -> None:
         try:
@@ -399,6 +421,41 @@ class AgentApp(App):
         self._subagent_block.render_sessions(
             list(self._live_subagents.values())
         )
+
+    async def _add_sub_tab(self, sess: SubagentSession) -> None:
+        """Mount a TabPane(SubagentTabPane) for this session as a
+        top-level tab. Pane id mirrors the session id ('tab-sub-N')
+        so removal is straightforward. Idempotent: if a pane with
+        the same id already exists (shouldn't, but defensive), skip."""
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            return
+        pane_id = f"tab-{sess.id}"
+        try:
+            existing = tabs.query_one(f"#{pane_id}", TabPane)
+        except Exception:
+            existing = None
+        if existing is not None:
+            return
+        pane = TabPane(sess.id, SubagentTabPane(sess), id=pane_id)
+        await tabs.add_pane(pane)
+
+    async def _remove_sub_tab(self, sid: str) -> None:
+        """Remove the TabPane for `sid`. If the tab being removed is
+        the currently active one, TabbedContent will fall back to the
+        previous tab automatically."""
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            return
+        pane_id = f"tab-{sid}"
+        try:
+            await tabs.remove_pane(pane_id)
+        except Exception:
+            # Pane may have already been removed (e.g. /clear racing
+            # against end_agent) — silent no-op.
+            pass
 
     def _reap_idle_subagents(self) -> None:
         """Drop sessions that have been quiescent longer than
@@ -419,6 +476,7 @@ class AgentApp(App):
                 sess.task.cancel()
             kill_all_bash_jobs(sess.ctx.bash_jobs)
             self._live_subagents.pop(sid, None)
+            self.call_later(self._remove_sub_tab, sid)
 
     # ─ key bindings / actions ─
 
@@ -464,13 +522,16 @@ class AgentApp(App):
         self._bg_jobs_block = None
         # Live subagent sessions: cancel any in-flight task, kill each
         # one's bash jobs, drop them. Tied to the parent conversation,
-        # so /clear releases all.
+        # so /clear releases all. Tab removal scheduled for each id.
+        sub_ids_to_drop = list(self._live_subagents.keys())
         for sess in list(self._live_subagents.values()):
             if sess.task is not None and not sess.task.done():
                 sess.task.cancel()
             kill_all_bash_jobs(sess.ctx.bash_jobs)
         self._live_subagents.clear()
         self._subagent_next_id = 1
+        for sid in sub_ids_to_drop:
+            self.call_later(self._remove_sub_tab, sid)
         if (
             self._subagent_block is not None
             and self._subagent_block.is_mounted
@@ -1853,6 +1914,9 @@ class AgentApp(App):
         )
         sess.task = asyncio.create_task(self._run_subagent_task(sess))
         self._live_subagents[sub_id] = sess
+        # Top-level tab for the new session — read-only transcript;
+        # the parent's input box still routes to the main conversation.
+        self.call_later(self._add_sub_tab, sess)
         return (
             f"[session_id={sub_id}, status=running] subagent spawned. "
             f"Call await_agent(session_id='{sub_id}') to fetch the answer."
@@ -1968,6 +2032,7 @@ class AgentApp(App):
         if sess.task is not None and not sess.task.done():
             sess.task.cancel()
         kill_all_bash_jobs(sess.ctx.bash_jobs)
+        self.call_later(self._remove_sub_tab, sid)
         return (
             f"Session {sid} ended (turns={sess.turn}, "
             f"in={sess.tokens_in:,}, out={sess.tokens_out:,})."
