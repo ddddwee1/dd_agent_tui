@@ -19,8 +19,8 @@ setup(
     description="DeepSeek thinking-mode TUI agent built on Textual",
     long_description=long_description,
     long_description_content_type=long_description_content_type,
-    author="ddwe",
-    url="https://github.com/ddwe/dd_agent_tui",
+    author="ddddwee1",
+    url="https://github.com/ddddwee1/dd_agent_tui",
     packages=["ddtui"],
     py_modules=["agent"],   # shim so `python agent.py` and `from agent import main` keep working
     install_requires=install_requires,
