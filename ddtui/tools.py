@@ -65,7 +65,8 @@ TOOLS = [
             "description": (
                 "Run a bash command and return stdout/stderr/exit code. "
                 "The command runs in the project working directory by default. "
-                "Output is truncated at 10 000 chars. "
+                "Output is truncated at 10 000 chars by default (override "
+                "with max_output_chars). "
                 "Dangerous patterns (sudo, curl, wget, chmod 777, mkfs, dd, rm -rf /) are blocked."
             ),
             "parameters": {
@@ -80,6 +81,13 @@ TOOLS = [
                         "description": (
                             "Optional working directory for this command. "
                             "Defaults to the project directory."
+                        ),
+                    },
+                    "max_output_chars": {
+                        "type": "integer",
+                        "description": (
+                            "Override the default 10 000-char output cap. "
+                            "Hard upper bound is 100 000."
                         ),
                     },
                 },
@@ -139,6 +147,14 @@ TOOLS = [
                         "type": "integer",
                         "description": "How many trailing lines of log to return. Default 50.",
                     },
+                    "max_output_chars": {
+                        "type": "integer",
+                        "description": (
+                            "Override the default 10 000-char output cap "
+                            "for the returned log tail. Hard upper bound "
+                            "is 100 000."
+                        ),
+                    },
                 },
                 "required": ["job_id"],
             },
@@ -171,6 +187,14 @@ TOOLS = [
                     "tail_lines": {
                         "type": "integer",
                         "description": "Trailing log lines to return. Default 50.",
+                    },
+                    "max_output_chars": {
+                        "type": "integer",
+                        "description": (
+                            "Override the default 10 000-char output cap "
+                            "for the returned log tail. Hard upper bound "
+                            "is 100 000."
+                        ),
                     },
                 },
                 "required": ["job_id"],
@@ -749,6 +773,9 @@ TOOLS = [
 
 # ───────── helpers ─────────
 
+_BASH_HARD_CHAR_CAP = 100_000
+
+
 def _safe_path(work_dir: str, raw: str) -> Path:
     """Resolve a user-supplied path relative to *work_dir*.
 
@@ -769,6 +796,19 @@ def _check_dangerous(command: str) -> str | None:
     return None
 
 
+def _truncate_output(text: str, max_chars: int | None) -> str:
+    """Truncate *text* to *max_chars* if set, respecting the hard cap."""
+    if max_chars is None:
+        return text
+    try:
+        cap = max(1, min(_BASH_HARD_CHAR_CAP, int(max_chars)))
+    except (TypeError, ValueError):
+        return text
+    if len(text) <= cap:
+        return text
+    return text[:cap] + f"\n…[+{len(text) - cap} chars]"
+
+
 def _unified_diff(before: str, after: str, p: Path, context: int = 2) -> str:
     """Render a unified-diff between two file contents. Used in edit_* tool
     results so both the model and the UI can see exactly what changed."""
@@ -787,11 +827,23 @@ def _unified_diff(before: str, after: str, p: Path, context: int = 2) -> str:
 
 # ───────── bash ─────────
 
-def tool_bash(ctx: ToolContext, command: str, workdir: str | None = None) -> str:
+def tool_bash(
+    ctx: ToolContext,
+    command: str,
+    workdir: str | None = None,
+    max_output_chars: int | None = None,
+) -> str:
     """Run a shell command with safety checks, timeout, and output truncation."""
     err = _check_dangerous(command)
     if err:
         return f"Error: {err}"
+
+    cap = BASH_OUTPUT_MAX_CHARS
+    if max_output_chars is not None:
+        try:
+            cap = max(1, min(_BASH_HARD_CHAR_CAP, int(max_output_chars)))
+        except (TypeError, ValueError):
+            return f"Error: max_output_chars must be an integer, got {max_output_chars!r}"
 
     cwd = str(_safe_path(ctx.work_dir, workdir)) if workdir else ctx.work_dir
     try:
@@ -809,16 +861,16 @@ def tool_bash(ctx: ToolContext, command: str, workdir: str | None = None) -> str
     parts = []
     if result.stdout:
         out = result.stdout
-        if len(out) > BASH_OUTPUT_MAX_CHARS:
-            out = out[:BASH_OUTPUT_MAX_CHARS] + (
-                f"\n…[+{len(result.stdout) - BASH_OUTPUT_MAX_CHARS} chars]"
+        if len(out) > cap:
+            out = out[:cap] + (
+                f"\n…[+{len(result.stdout) - cap} chars]"
             )
         parts.append(f"STDOUT:\n{out}")
     if result.stderr:
         err_out = result.stderr
-        if len(err_out) > BASH_OUTPUT_MAX_CHARS:
-            err_out = err_out[:BASH_OUTPUT_MAX_CHARS] + (
-                f"\n…[+{len(result.stderr) - BASH_OUTPUT_MAX_CHARS} chars]"
+        if len(err_out) > cap:
+            err_out = err_out[:cap] + (
+                f"\n…[+{len(result.stderr) - cap} chars]"
             )
         parts.append(f"STDERR:\n{err_out}")
     parts.append(f"Exit code: {result.returncode}")
@@ -940,7 +992,10 @@ def _format_status(job: BgJob, tail_lines: int) -> str:
 
 
 def tool_bash_check(
-    ctx: ToolContext, job_id: str, tail_lines: int = BG_DEFAULT_TAIL_LINES
+    ctx: ToolContext,
+    job_id: str,
+    tail_lines: int = BG_DEFAULT_TAIL_LINES,
+    max_output_chars: int | None = None,
 ) -> str:
     job = ctx.bash_jobs.get(job_id)
     if job is None:
@@ -949,7 +1004,8 @@ def tool_bash_check(
         tail_lines = max(0, min(500, int(tail_lines)))
     except (TypeError, ValueError):
         tail_lines = BG_DEFAULT_TAIL_LINES
-    return _format_status(job, tail_lines)
+    output = _format_status(job, tail_lines)
+    return _truncate_output(output, max_output_chars)
 
 
 def tool_bash_wait(
@@ -957,6 +1013,7 @@ def tool_bash_wait(
     job_id: str,
     timeout: int = BG_DEFAULT_WAIT_TIMEOUT,
     tail_lines: int = BG_DEFAULT_TAIL_LINES,
+    max_output_chars: int | None = None,
 ) -> str:
     job = ctx.bash_jobs.get(job_id)
     if job is None:
@@ -975,16 +1032,18 @@ def tool_bash_wait(
         if job.proc.poll() is not None:
             break
         if time.monotonic() >= deadline:
+            output = _format_status(job, tail_lines)
             return (
                 f"bash_wait timed out after {timeout}s; job {job_id} is "
                 f"still running.\n"
-                + _format_status(job, tail_lines)
+                + _truncate_output(output, max_output_chars)
             )
         # 200ms strikes a balance: short enough that the model gets a
         # near-instant return on quick jobs, long enough that polling
         # overhead stays trivial.
         time.sleep(0.2)
-    return _format_status(job, tail_lines)
+    output = _format_status(job, tail_lines)
+    return _truncate_output(output, max_output_chars)
 
 
 def tool_bash_kill(ctx: ToolContext, job_id: str, force: bool = False) -> str:

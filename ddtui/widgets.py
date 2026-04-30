@@ -524,6 +524,72 @@ class BgJobsBlock(Static):
 
 # ───────── input ─────────
 
+class SlashPopup(Static):
+    """Auto-shown command hint above the input box.
+
+    Pure display: appears when the input starts with ``/`` and contains
+    no whitespace, listing every slash command whose name still matches
+    the current prefix. Vanishes the moment the user types a space (or
+    away from ``/...`` form), since at that point they've moved on to
+    arguments. There's no keyboard navigation — the user keeps typing
+    in the input and reads the popup as a hint.
+    """
+
+    DEFAULT_CSS = """
+    SlashPopup {
+        height: auto;
+        padding: 0 1;
+        border: round #94e2d5;
+        background: #300A24;
+        display: none;
+    }
+    """
+
+    # (display form, description). Display form may include an
+    # ``<arg>`` placeholder so the user sees the expected shape at a
+    # glance; the matcher only looks at the first whitespace-delimited
+    # token so the placeholder doesn't break prefix matching.
+    COMMANDS: tuple[tuple[str, str], ...] = (
+        ("/clear", "清空对话（保留 system prompt + AGENTS.md）"),
+        ("/compact", "压缩历史，保留最近两轮原文"),
+        ("/save <name>", "保存到 ~/.ddtui/history/<name>.json"),
+        ("/load <name>", "读回保存的对话"),
+        ("/list-history", "列出已保存对话"),
+        ("/model [<id>]", "查看 / 切换模型（下一轮请求生效）"),
+        ("/effort [<level>]", "查看 / 切换 reasoning effort"),
+        ("/rewind", "退回上一条用户消息（文本回填输入框）"),
+        ("/rethink", "删除最近一轮思考（含其后内容）"),
+        ("/help", "显示帮助"),
+        ("/exit", "退出"),
+    )
+
+    def update_for_text(self, text: str) -> None:
+        """Show/hide and filter based on current input text."""
+        if not text.startswith("/") or any(c.isspace() for c in text):
+            self.display = False
+            return
+        matches = [
+            (cmd, desc) for cmd, desc in self.COMMANDS
+            if cmd.split(" ", 1)[0].startswith(text)
+        ]
+        if not matches:
+            self.display = False
+            return
+        # Align descriptions on a single column so the list reads as a
+        # table rather than a ragged left edge.
+        width = max(len(cmd) for cmd, _ in matches)
+        t = Text()
+        t.append("Slash 命令", style="bold #94e2d5")
+        t.append("  (继续输入过滤 · Enter 发送)", style="dim")
+        for cmd, desc in matches:
+            t.append("\n  ")
+            t.append(cmd.ljust(width), style="bold cyan")
+            t.append("  ")
+            t.append(desc, style="dim")
+        self.update(t)
+        self.display = True
+
+
 class MultilineInput(TextArea):
     """Multi-line prompt box.
 

@@ -29,7 +29,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Header, Static, TabbedContent, TabPane
+from textual.widgets import Header, Static, TabbedContent, TabPane, TextArea
 
 from .config import (
     AGENTS_MD_FILENAME,
@@ -62,6 +62,7 @@ from .widgets import (
     BgJobsBlock,
     DiffBlock,
     MultilineInput,
+    SlashPopup,
     StatusBar,
     SteerBubble,
     SubagentsBlock,
@@ -272,6 +273,7 @@ class AgentApp(App):
                     id="hint",
                 )
                 yield Vertical(id="pending")
+                yield SlashPopup(id="slash-popup")
                 yield MultilineInput(id="user-input")
                 yield StatusBar(self.ctx.work_dir, id="status")
             yield Vertical(id="sidebar")
@@ -674,7 +676,43 @@ class AgentApp(App):
                 del self.messages[i:]
                 return
 
+    def _wipe_orphaned_turn_widgets(self) -> None:
+        """Drop the UI widgets for the in-flight turn — the trailing
+        UserBubble / SteerBubble plus everything mounted after it
+        (thinking, answer, tool blocks). Pairs with
+        `_rollback_last_user_turn` so the conversation view matches
+        `self.messages` after a cancel; without this the bubbles
+        linger as ghost content that's no longer in context."""
+        try:
+            view = self.query_one("#conversation", VerticalScroll)
+        except Exception:
+            return
+        children = list(view.children)
+        cut = -1
+        for i in range(len(children) - 1, -1, -1):
+            if isinstance(children[i], (UserBubble, SteerBubble)):
+                cut = i
+                break
+        if cut < 0:
+            return
+        for c in children[cut:]:
+            try:
+                c.remove()
+            except Exception:
+                pass
+
     # ─ input handler ─
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        # The slash-command popup mirrors the user input; ignore Changed
+        # events from any other TextArea that might exist in the tree.
+        if getattr(event.text_area, "id", None) != "user-input":
+            return
+        try:
+            popup = self.query_one("#slash-popup", SlashPopup)
+        except Exception:
+            return
+        popup.update_for_text(event.text_area.text)
 
     async def on_multiline_input_submitted(
         self, event: "MultilineInput.Submitted"
@@ -774,6 +812,26 @@ class AgentApp(App):
                     f"⚙ effort: {old} → {self.effort}（下一轮请求生效）",
                     style="bold cyan",
                 )))
+            return
+        if text == "/rewind":
+            inp.text = ""
+            if self._busy:
+                self.notify(
+                    "正在跑任务；先 ESC×2 中断或等结束再 /rewind",
+                    timeout=3,
+                )
+                return
+            await self._rewind_last_user()
+            return
+        if text == "/rethink":
+            inp.text = ""
+            if self._busy:
+                self.notify(
+                    "正在跑任务；先 ESC×2 中断或等结束再 /rethink",
+                    timeout=3,
+                )
+                return
+            await self._rethink_last()
             return
         if text == "/help":
             inp.text = ""
@@ -1308,6 +1366,8 @@ class AgentApp(App):
             "- `/list-history` 列出已保存对话\n"
             "- `/model [<id>]` 查看 / 切换模型（下一轮请求生效）\n"
             "- `/effort [<level>]` 查看 / 切换 reasoning effort\n"
+            "- `/rewind` 退回上一条用户消息（文本回填输入框）\n"
+            "- `/rethink` 删除最近一轮思考（含其后内容）\n"
             "- `/help` 显示这个帮助\n"
             "- `/exit` `/quit` 退出\n\n"
             "### 快捷键\n"
@@ -1340,6 +1400,68 @@ class AgentApp(App):
             f"分钟自动回收。子 agent 不能嵌套子 agent；token 计入主对话。\n"
         )
         await self._mount_widget(Static(Markdown(md)))
+
+    # ─ /rewind, /rethink ─
+
+    async def _rewind_last_user(self) -> None:
+        """Drop the most recent user message (and everything after it)
+        from history, then restore its text to the input box for
+        editing. Steer markers are stripped so the restored text is
+        clean — the user can re-steer with Cmd+Enter if they want."""
+        last_user_idx = -1
+        for i in range(len(self.messages) - 1, -1, -1):
+            if self.messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx < 0:
+            self.notify("没有可退回的用户消息", timeout=2.5)
+            return
+        raw_content = self.messages[last_user_idx].get("content") or ""
+        if raw_content.startswith("[实时插话] "):
+            raw_content = raw_content[len("[实时插话] "):]
+        del self.messages[last_user_idx:]
+        await self._rebuild_conversation_view()
+        inp = self.query_one("#user-input", MultilineInput)
+        inp.text = raw_content
+        inp.focus()
+        self.notify("已退回到上一条用户消息（已写回输入框）", timeout=2.5)
+
+    async def _rethink_last(self) -> None:
+        """Drop the most recent assistant message that produced any
+        reasoning, plus everything after it. Toast (no-op) if the most
+        recent user submission hasn't yielded a reasoning step yet."""
+        last_user_idx = -1
+        for i in range(len(self.messages) - 1, -1, -1):
+            if self.messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        last_thinking_idx = -1
+        for i in range(len(self.messages) - 1, -1, -1):
+            m = self.messages[i]
+            if m.get("role") == "assistant" and m.get("reasoning_content"):
+                last_thinking_idx = i
+                break
+        if last_thinking_idx <= last_user_idx:
+            self.notify("用户发送后还没有思考可以取消", timeout=2.5)
+            return
+        del self.messages[last_thinking_idx:]
+        await self._rebuild_conversation_view()
+        self.notify("已删除最近一轮思考", timeout=2.5)
+
+    async def _rebuild_conversation_view(self) -> None:
+        """Clear the main conversation view and replay it from
+        `self.messages` after a truncation. Leaves queued/steer
+        bubbles, bg jobs, and live subagents alone — they're
+        independent of message-history state."""
+        view = self.query_one("#conversation", VerticalScroll)
+        for child in list(view.children):
+            child.remove()
+        self._cancel_dismiss()
+        if self._todo_block is not None and self._todo_block.is_mounted:
+            self._todo_block.remove()
+        self._todo_block = None
+        await self._replay_messages_to_view()
+        self._refresh_status()
 
     # ─ agent loop ─
 
@@ -1378,17 +1500,16 @@ class AgentApp(App):
                 await self._mount_widget(UserBubble(pending))
                 self._refresh_status()
         except asyncio.CancelledError:
-            # ESC×2 cancellation: roll back the in-flight turn so retry
-            # doesn't see a dangling user/assistant/tool tail, then
-            # mark the spot in the conversation. Re-raise so the worker
-            # is marked CANCELLED rather than COMPLETED.
+            # ESC×2 cancellation: roll back the in-flight turn from
+            # history AND wipe its widgets from the view. Without the
+            # wipe, the UserBubble + half-streamed ThinkingBlock would
+            # linger on screen as ghost content that's no longer in
+            # `self.messages` — the next turn would be sent without
+            # that context, so the visual is misleading. The toast from
+            # `_interrupt_now` already tells the user it was cancelled.
+            # Re-raise so the worker is marked CANCELLED, not COMPLETED.
             self._rollback_last_user_turn()
-            try:
-                await self._mount_widget(
-                    Static(Text("⛔ 已中断", style="bold yellow"))
-                )
-            except Exception:
-                pass
+            self._wipe_orphaned_turn_widgets()
             raise
         finally:
             self._set_busy(False)
@@ -1579,13 +1700,15 @@ class AgentApp(App):
                         {"role": "tool", "tool_call_id": tc["id"], "content": result}
                     )
         except Exception as e:
+            # Roll back the in-flight turn from history AND wipe its
+            # widgets from the view, then surface the error in a fresh
+            # slot. Otherwise the UserBubble + half-streamed thinking
+            # would linger on screen as ghost content no longer in
+            # `self.messages` — confusing on retry.
+            self._rollback_last_user_turn()
+            self._wipe_orphaned_turn_widgets()
             err = Static(Text(f"API error: {e}", style="bold red"))
             await self._mount_widget(err)
-            # roll back the trailing user/tool turn so the user can retry
-            for i in range(len(self.messages) - 1, -1, -1):
-                if self.messages[i]["role"] == "user":
-                    del self.messages[i:]
-                    break
             return False
 
     async def _stream_one(self) -> dict:
@@ -1610,47 +1733,60 @@ class AgentApp(App):
         # on their own — so explicitly follow the bottom on every chunk.
         view = self.query_one("#conversation", VerticalScroll)
 
-        async for chunk in stream:
-            if getattr(chunk, "usage", None):
-                final_usage = chunk.usage
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
+        try:
+            async for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    final_usage = chunk.usage
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
 
-            rc = getattr(delta, "reasoning_content", None)
-            if rc:
-                if thinking is None:
-                    thinking = ThinkingBlock()
-                    await self._mount_widget(thinking)
-                thinking.append_text(rc)
-                if self._follow_bottom:
-                    view.scroll_end(animate=False)
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    if thinking is None:
+                        thinking = ThinkingBlock()
+                        await self._mount_widget(thinking)
+                    thinking.append_text(rc)
+                    if self._follow_bottom:
+                        view.scroll_end(animate=False)
 
-            text = getattr(delta, "content", None)
-            if text:
-                if answer is None:
-                    answer = AssistantMessage()
-                    await self._mount_widget(answer)
-                answer.append_text(text)
-                if self._follow_bottom:
-                    view.scroll_end(animate=False)
+                text = getattr(delta, "content", None)
+                if text:
+                    if answer is None:
+                        answer = AssistantMessage()
+                        await self._mount_widget(answer)
+                    answer.append_text(text)
+                    if self._follow_bottom:
+                        view.scroll_end(animate=False)
 
-            for tc in getattr(delta, "tool_calls", None) or []:
-                idx = tc.index if tc.index is not None else 0
-                slot = tool_calls.setdefault(
-                    idx,
-                    {"id": "", "type": "function",
-                     "function": {"name": "", "arguments": ""}},
-                )
-                if tc.id:
-                    slot["id"] = tc.id
-                if tc.type:
-                    slot["type"] = tc.type
-                if tc.function:
-                    if tc.function.name:
-                        slot["function"]["name"] += tc.function.name
-                    if tc.function.arguments:
-                        slot["function"]["arguments"] += tc.function.arguments
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    idx = tc.index if tc.index is not None else 0
+                    slot = tool_calls.setdefault(
+                        idx,
+                        {"id": "", "type": "function",
+                         "function": {"name": "", "arguments": ""}},
+                    )
+                    if tc.id:
+                        slot["id"] = tc.id
+                    if tc.type:
+                        slot["type"] = tc.type
+                    if tc.function:
+                        if tc.function.name:
+                            slot["function"]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            slot["function"]["arguments"] += tc.function.arguments
+        except BaseException:
+            # ESC×2 cancellation (CancelledError) or stream error: close
+            # out the in-flight ThinkingBlock so its title doesn't stay
+            # stuck on "流式中…". 0 ⇒ no token count, since usage may
+            # not have arrived yet. Re-raise so the outer turn handler
+            # still sees the original exception.
+            if thinking is not None:
+                try:
+                    thinking.finalize(0)
+                except Exception:
+                    pass
+            raise
 
         self.counter.add(final_usage)
         if thinking is not None:
