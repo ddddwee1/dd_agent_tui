@@ -558,7 +558,7 @@ class SlashPopup(Static):
         ("/model [<id>]", "查看 / 切换模型（下一轮请求生效）"),
         ("/effort [<level>]", "查看 / 切换 reasoning effort"),
         ("/rewind", "退回上一条用户消息（文本回填输入框）"),
-        ("/rethink", "删除最近一轮思考（含其后内容）"),
+        ("/rethink", "删除最近一轮助手回复，让模型重新思考"),
         ("/help", "显示帮助"),
         ("/exit", "退出"),
     )

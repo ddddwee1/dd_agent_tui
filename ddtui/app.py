@@ -1367,7 +1367,7 @@ class AgentApp(App):
             "- `/model [<id>]` 查看 / 切换模型（下一轮请求生效）\n"
             "- `/effort [<level>]` 查看 / 切换 reasoning effort\n"
             "- `/rewind` 退回上一条用户消息（文本回填输入框）\n"
-            "- `/rethink` 删除最近一轮思考（含其后内容）\n"
+            "- `/rethink` 删除最近一轮助手回复，让模型重新思考\n"
             "- `/help` 显示这个帮助\n"
             "- `/exit` `/quit` 退出\n\n"
             "### 快捷键\n"
@@ -1427,26 +1427,25 @@ class AgentApp(App):
         self.notify("已退回到上一条用户消息（已写回输入框）", timeout=2.5)
 
     async def _rethink_last(self) -> None:
-        """Drop the most recent assistant message that produced any
-        reasoning, plus everything after it. Toast (no-op) if the most
-        recent user submission hasn't yielded a reasoning step yet."""
-        last_user_idx = -1
+        """Drop everything after the last non-assistant message —
+        i.e. the entire trailing assistant turn — so the model
+        rethinks from a clean role boundary. ESC×2 drops half-streamed
+        thinking before it lands in `self.messages`, so the cut sits
+        on the boundary whether or not the last turn was interrupted."""
+        cut = len(self.messages)
         for i in range(len(self.messages) - 1, -1, -1):
-            if self.messages[i].get("role") == "user":
-                last_user_idx = i
+            if self.messages[i].get("role") != "assistant":
+                cut = i + 1
                 break
-        last_thinking_idx = -1
-        for i in range(len(self.messages) - 1, -1, -1):
-            m = self.messages[i]
-            if m.get("role") == "assistant" and m.get("reasoning_content"):
-                last_thinking_idx = i
-                break
-        if last_thinking_idx <= last_user_idx:
-            self.notify("用户发送后还没有思考可以取消", timeout=2.5)
+        if cut >= len(self.messages):
+            self.notify(
+                "最近一条已经是用户消息或工具结果，无需 rethink",
+                timeout=2.5,
+            )
             return
-        del self.messages[last_thinking_idx:]
+        del self.messages[cut:]
         await self._rebuild_conversation_view()
-        self.notify("已删除最近一轮思考", timeout=2.5)
+        self.notify("已删除最近一轮助手回复", timeout=2.5)
 
     async def _rebuild_conversation_view(self) -> None:
         """Clear the main conversation view and replay it from
@@ -1500,16 +1499,15 @@ class AgentApp(App):
                 await self._mount_widget(UserBubble(pending))
                 self._refresh_status()
         except asyncio.CancelledError:
-            # ESC×2 cancellation: roll back the in-flight turn from
-            # history AND wipe its widgets from the view. Without the
-            # wipe, the UserBubble + half-streamed ThinkingBlock would
-            # linger on screen as ghost content that's no longer in
-            # `self.messages` — the next turn would be sent without
-            # that context, so the visual is misleading. The toast from
-            # `_interrupt_now` already tells the user it was cancelled.
-            # Re-raise so the worker is marked CANCELLED, not COMPLETED.
-            self._rollback_last_user_turn()
-            self._wipe_orphaned_turn_widgets()
+            # ESC×2 cancellation: leave `self.messages` and the user's
+            # bubble alone. The half-streamed thinking is already gone
+            # (`_stream_one` removed its widget and never appended the
+            # assistant turn to history), and the user's prompt — plus
+            # any [实时插话] drained earlier this turn — should stay so
+            # the next submission picks up with full context. The toast
+            # from `_interrupt_now` already tells the user it was
+            # cancelled. Re-raise so the worker is marked CANCELLED,
+            # not COMPLETED.
             raise
         finally:
             self._set_busy(False)
@@ -1776,14 +1774,20 @@ class AgentApp(App):
                         if tc.function.arguments:
                             slot["function"]["arguments"] += tc.function.arguments
         except BaseException:
-            # ESC×2 cancellation (CancelledError) or stream error: close
-            # out the in-flight ThinkingBlock so its title doesn't stay
-            # stuck on "流式中…". 0 ⇒ no token count, since usage may
-            # not have arrived yet. Re-raise so the outer turn handler
+            # ESC×2 cancellation or stream error: drop the half-streamed
+            # ThinkingBlock / AssistantMessage from the view. Neither is
+            # in `self.messages` yet (the append happens after the stream
+            # finishes), so removing the widgets keeps the view in sync —
+            # no ghost bubbles linger. Re-raise so the outer turn handler
             # still sees the original exception.
             if thinking is not None:
                 try:
-                    thinking.finalize(0)
+                    thinking.remove()
+                except Exception:
+                    pass
+            if answer is not None:
+                try:
+                    answer.remove()
                 except Exception:
                     pass
             raise
