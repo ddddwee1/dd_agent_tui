@@ -33,6 +33,9 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 CODEX_AUTH_PATH = Path(
     os.environ.get("CODEX_AUTH_FILE", str(CODEX_HOME / "auth.json"))
 )
+CODEX_MODELS_CACHE_PATH = Path(
+    os.environ.get("CODEX_MODELS_CACHE_FILE", str(CODEX_HOME / "models_cache.json"))
+)
 CODEX_BASE_URL = os.environ.get(
     "CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"
 ).rstrip("/")
@@ -88,12 +91,11 @@ HISTORY_DIR = Path.home() / ".ddtui" / "history"
 
 # ───────── status-bar gradient ─────────
 
-# Status-bar context-usage gradient: dark green → dark amber → dark red,
-# scaled against this "safe" last-call (prompt + completion) total.
-# DeepSeek's true upper bound is higher; this is the visual baseline at
-# which the bar should already be saturated red so the user feels
-# pressure to /compact well before an actual context overflow.
+# Status-bar context-usage gradient fallback: dark green → dark amber →
+# dark red. DeepSeek keeps the original fixed baseline; Codex providers
+# override this with the server-returned model catalog window when present.
 CTX_SAFE_LIMIT = 512_000
+DEEPSEEK_CONTEXT_LIMIT = CTX_SAFE_LIMIT
 
 
 # ───────── /compact ─────────

@@ -19,9 +19,11 @@ from .codex_auth import CodexAuth
 from .config import (
     CODEX_BASE_URL,
     CODEX_MODEL,
+    CODEX_MODELS_CACHE_PATH,
     CODEX_REASONING_EFFORT,
     DEEPSEEK_API_KEY_PATH,
     DEEPSEEK_BASE_URL,
+    DEEPSEEK_CONTEXT_LIMIT,
     DEEPSEEK_MODEL,
     DEEPSEEK_REASONING_EFFORT,
 )
@@ -74,6 +76,14 @@ class LLMProvider:
     label: str
     default_model: str
     default_effort: str
+    default_context_limit: int | None = None
+
+    def context_limit_for_model(self, model: str) -> int | None:
+        """Return the effective context window used for status-bar
+        pressure display. Providers may override this with model-specific
+        metadata; None means "unknown, let caller use its fallback".
+        """
+        return self.default_context_limit
 
     async def complete_text(
         self, messages: list[dict], model: str, effort: str
@@ -96,6 +106,7 @@ class DeepSeekProvider(LLMProvider):
     label = "DeepSeek"
     default_model = DEEPSEEK_MODEL
     default_effort = DEEPSEEK_REASONING_EFFORT
+    default_context_limit = DEEPSEEK_CONTEXT_LIMIT
 
     def __init__(self) -> None:
         self.client = AsyncOpenAI(
@@ -170,6 +181,18 @@ class CodexResponsesProvider(LLMProvider):
     def __init__(self) -> None:
         self.auth = CodexAuth()
         self.base_url = CODEX_BASE_URL
+
+    def context_limit_for_model(self, model: str) -> int | None:
+        # Codex should reflect the model catalog returned by the Codex
+        # service, cached by the CLI/app in ~/.codex/models_cache.json.
+        # Do not honor local model_context_window overrides here: those
+        # can change client display, but they do not raise the service
+        # limit for the ChatGPT/Codex OAuth endpoint.
+        try:
+            data = json.loads(CODEX_MODELS_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return _find_model_context_limit(data, model)
 
     async def complete_text(
         self, messages: list[dict], model: str, effort: str
@@ -458,6 +481,70 @@ class CodexResponsesProvider(LLMProvider):
         if normalized == "minimal":
             return "low"
         return normalized
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _find_model_context_limit(data: Any, model: str) -> int | None:
+    """Best-effort search through Codex model-catalog JSON shapes.
+
+    The Codex CLI/app cache shape can change, so accept common server
+    catalog keys and recurse through dict/list structures looking for an
+    entry whose id/name/model/slug matches.
+    """
+    wanted = model.strip().lower()
+    if not wanted:
+        return None
+
+    def _entry_name(entry: dict[str, Any]) -> str | None:
+        for key in ("id", "name", "model", "slug"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+        return None
+
+    def _entry_limit(entry: dict[str, Any]) -> int | None:
+        for key in (
+            "context_window",
+            "contextWindow",
+            "max_context_window",
+            "maxContextWindow",
+            "context_length",
+            "contextLength",
+            "max_context_tokens",
+            "maxContextTokens",
+            "model_context_window",
+        ):
+            limit = _positive_int(entry.get(key))
+            if limit is not None:
+                return limit
+        return None
+
+    def _walk(value: Any) -> int | None:
+        if isinstance(value, dict):
+            name = _entry_name(value)
+            if name == wanted:
+                limit = _entry_limit(value)
+                if limit is not None:
+                    return limit
+            for child in value.values():
+                found = _walk(child)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = _walk(child)
+                if found is not None:
+                    return found
+        return None
+
+    return _walk(data)
 
 
 def load_deepseek_api_key() -> str:

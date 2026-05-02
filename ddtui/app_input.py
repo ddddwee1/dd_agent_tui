@@ -116,9 +116,14 @@ class AppInputMixin:
             self.model = new_provider.default_model
             self.effort = new_provider.default_effort
             self._update_subtitle()
+            limit_note = ""
+            limit = self._context_limit()
+            if limit:
+                limit_note = f", ctx={limit:,}"
+            self._refresh_status()
             await self._mount_widget(Static(Text(
                 f"⚙ provider: {old} → {self.provider_name}; "
-                f"model={self.model}, effort={self.effort}",
+                f"model={self.model}, effort={self.effort}{limit_note}",
                 style="bold cyan",
             )))
             return
@@ -135,8 +140,13 @@ class AppInputMixin:
                 old = self.model
                 self.model = arg
                 self._update_subtitle()
+                self._refresh_status()
+                limit_note = ""
+                limit = self._context_limit()
+                if limit:
+                    limit_note = f"；ctx={limit:,}"
                 await self._mount_widget(Static(Text(
-                    f"⚙ model: {old} → {self.model}（下一轮请求生效）",
+                    f"⚙ model: {old} → {self.model}（下一轮请求生效{limit_note}）",
                     style="bold cyan",
                 )))
             return

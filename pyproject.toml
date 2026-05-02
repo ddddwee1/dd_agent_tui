@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ddtui"
+version = "0.1.0"
+description = "DeepSeek thinking-mode TUI agent built on Textual"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "ddddwee1" },
+]
+dependencies = [
+    "openai>=1.40",
+    "httpx>=0.27",
+    "textual>=0.80",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/ddddwee1/dd_agent_tui"
+Repository = "https://github.com/ddddwee1/dd_agent_tui"
+
+[project.scripts]
+ddtui = "ddtui.app:main"
+
+[tool.setuptools]
+py-modules = ["agent"]
+
+[tool.setuptools.packages.find]
+include = ["ddtui*"]

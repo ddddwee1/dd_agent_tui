@@ -23,7 +23,6 @@ from textual.containers import VerticalScroll
 from textual.message import Message
 from textual.widgets import Collapsible, Static, TextArea
 
-from .config import CTX_SAFE_LIMIT
 from .state import BgJob, SubagentSession, TokenCounter, bg_job_status
 
 
@@ -724,9 +723,9 @@ def _interp_rgb(
 def _ctx_bg_color(ratio: float) -> str:
     """Pick a status-bar background hex from a green→amber→red gradient.
 
-    *ratio* is last-call (prompt+completion) / CTX_SAFE_LIMIT; values
-    above 1.0 saturate at the dark-red end. Colors are dark / desaturated
-    so the foreground text (light $text) stays legible.
+    *ratio* is last-call (prompt+completion) / the active provider/model
+    context window; values above 1.0 saturate at the dark-red end. Colors
+    are dark / desaturated so the foreground text stays legible.
     """
     GREEN = (30, 48, 36)   # 接近 catppuccin green, 调到 ~18% 亮度
     AMBER = (58, 51, 37)   # 暗琥珀
@@ -834,6 +833,7 @@ class StatusBar(Static):
         self,
         counter: TokenCounter,
         *,
+        context_limit: int | None = None,
         busy: bool = False,
         queued: int = 0,
         steer: int = 0,
@@ -843,7 +843,8 @@ class StatusBar(Static):
         # matters is whether the *next* call still fits), not cumulative
         # billing. Pre-first-turn we sit at the green baseline.
         last_total = counter.last_prompt + counter.last_completion
-        ratio = last_total / CTX_SAFE_LIMIT if counter.turns > 0 else 0.0
+        limit = context_limit if context_limit and context_limit > 0 else None
+        ratio = (last_total / limit) if (counter.turns > 0 and limit) else 0.0
         self.styles.background = _ctx_bg_color(ratio)
 
         if counter.turns == 0:
@@ -858,8 +859,12 @@ class StatusBar(Static):
             # `(NN%)` suffix anchors the visual gradient to a number so
             # the user can tell at a glance how alarming the color is.
             pct = ratio * 100
+            if limit:
+                context_text = f"Context {last_total:,}/{limit:,} ({pct:.0f}%)"
+            else:
+                context_text = f"Context {last_total:,}"
             body = (
-                f"{location} · Context {last_total:,} ({pct:.0f}%) "
+                f"{location} · {context_text} "
                 f"· 累计 {total:,} "
                 f"(in {counter.prompt_total:,} / out {counter.completion_total:,}{thinking}) "
                 f"· {counter.turns} 轮"

@@ -92,6 +92,7 @@ class AppUiMixin:
         bar.advance_frame()
         bar.render_status(
             self.counter,
+            context_limit=self._context_limit(),
             busy=True,
             queued=len(self._queued),
             steer=len(self._steer),
@@ -512,6 +513,7 @@ class AppUiMixin:
             return
         bar.render_status(
             self.counter,
+            context_limit=self._context_limit(),
             busy=self._busy,
             queued=len(self._queued),
             steer=len(self._steer),
@@ -521,8 +523,18 @@ class AppUiMixin:
         self._busy = busy
         self._refresh_status()
 
+    def _context_limit(self) -> int | None:
+        try:
+            limit = self.provider.context_limit_for_model(self.model)
+        except Exception:
+            return None
+        return limit if limit and limit > 0 else None
+
     def _update_subtitle(self) -> None:
         sub = f"{self.provider.label} · {self.model} · effort={self.effort}"
+        limit = self._context_limit()
+        if limit:
+            sub += f" · ctx={limit:,}"
         if self._agents_md_loaded:
             sub += " · AGENTS.md ✓"
         self.sub_title = sub
