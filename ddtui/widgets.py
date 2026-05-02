@@ -555,6 +555,7 @@ class SlashPopup(Static):
         ("/save <name>", "保存到 ~/.ddtui/history/<name>.json"),
         ("/load <name>", "读回保存的对话"),
         ("/list-history", "列出已保存对话"),
+        ("/provider [deepseek|codex]", "查看 / 切换 provider"),
         ("/model [<id>]", "查看 / 切换模型（下一轮请求生效）"),
         ("/effort [<level>]", "查看 / 切换 reasoning effort"),
         ("/rewind", "退回上一条用户消息（文本回填输入框）"),

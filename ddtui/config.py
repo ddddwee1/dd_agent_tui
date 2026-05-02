@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 
-# ───────── API / model ─────────
+# ───────── API / model providers ─────────
 
 API_KEY_PATH = os.environ.get(
     "DEEPSEEK_API_KEY_FILE", str(Path.home() / "deepseek_apikey.txt")
@@ -21,6 +21,29 @@ API_KEY_PATH = os.environ.get(
 BASE_URL = "https://api.deepseek.com"
 MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
 REASONING_EFFORT = os.environ.get("DEEPSEEK_REASONING_EFFORT", "max")
+
+DEFAULT_PROVIDER = os.environ.get("DDTUI_PROVIDER", "deepseek").strip().lower()
+
+DEEPSEEK_API_KEY_PATH = Path(API_KEY_PATH)
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", BASE_URL)
+DEEPSEEK_MODEL = MODEL
+DEEPSEEK_REASONING_EFFORT = REASONING_EFFORT
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+CODEX_AUTH_PATH = Path(
+    os.environ.get("CODEX_AUTH_FILE", str(CODEX_HOME / "auth.json"))
+)
+CODEX_BASE_URL = os.environ.get(
+    "CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"
+).rstrip("/")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5")
+CODEX_REASONING_EFFORT = os.environ.get("CODEX_REASONING_EFFORT", "xhigh")
+CODEX_REFRESH_TOKEN_URL = os.environ.get(
+    "CODEX_REFRESH_TOKEN_URL", "https://auth.openai.com/oauth/token"
+)
+CODEX_OAUTH_CLIENT_ID = os.environ.get(
+    "CODEX_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann"
+)
 
 
 # ───────── tool tunables ─────────
@@ -118,7 +141,8 @@ SUBAGENT_MAX_AWAIT_TIMEOUT = 600
 # ───────── safety ─────────
 
 # Dangerous shell patterns (blacklist). Matching commands are blocked
-# in tool_bash / tool_bash_start.
+# in tool_bash / tool_bash_start. This is defense-in-depth; the tool
+# layer also keeps shell workdirs inside the project by default.
 DANGEROUS_SHELL_PATTERNS = [
     r"\bsudo\b",
     r"\bcurl\b",
@@ -129,6 +153,21 @@ DANGEROUS_SHELL_PATTERNS = [
     r"\b>:/\w",
     r"\brm\s+-rf\s+/",
 ]
+
+# Tool sandbox. By default, file-writing tools and bash workdirs must
+# stay under ToolContext.work_dir. Read/search/web tools keep their old
+# behavior (read arbitrary paths) so the user can inspect files outside
+# the repo when needed; writes and shell execution are the dangerous
+# operations. Set DDTUI_ALLOW_UNSANDBOXED_WRITES=1 or
+# DDTUI_ALLOW_UNSANDBOXED_BASH=1 to opt out.
+ALLOW_UNSANDBOXED_WRITES = (
+    os.environ.get("DDTUI_ALLOW_UNSANDBOXED_WRITES", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+ALLOW_UNSANDBOXED_BASH = (
+    os.environ.get("DDTUI_ALLOW_UNSANDBOXED_BASH", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 
 
 # ───────── system prompt ─────────

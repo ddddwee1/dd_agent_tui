@@ -31,6 +31,8 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .config import (
+    ALLOW_UNSANDBOXED_BASH,
+    ALLOW_UNSANDBOXED_WRITES,
     BASH_OUTPUT_MAX_CHARS,
     BASH_TIMEOUT,
     BG_DEFAULT_TAIL_LINES,
@@ -779,13 +781,28 @@ _BASH_HARD_CHAR_CAP = 100_000
 def _safe_path(work_dir: str, raw: str) -> Path:
     """Resolve a user-supplied path relative to *work_dir*.
 
-    Returns an absolute Path. Does NOT enforce a sandbox (the user may
-    navigate anywhere) — use with caution.
+    Returns an absolute Path. Does NOT enforce a sandbox by itself —
+    callers that execute or mutate should use _sandbox_error().
     """
     p = Path(raw)
     if p.is_absolute():
-        return p
+        return p.resolve()
     return Path(work_dir, p).resolve()
+
+
+def _sandbox_error(work_dir: str, p: Path, *, kind: str) -> str | None:
+    """Return an error if *p* is outside work_dir for dangerous actions."""
+    root = Path(work_dir).resolve()
+    try:
+        p.resolve().relative_to(root)
+    except ValueError:
+        return (
+            f"Error: refusing to {kind} outside the project work_dir. "
+            f"Path: {p.resolve()} · work_dir: {root}. "
+            f"Set DDTUI_ALLOW_UNSANDBOXED_WRITES=1 for write/edit tools "
+            f"or DDTUI_ALLOW_UNSANDBOXED_BASH=1 for bash workdirs to opt out."
+        )
+    return None
 
 
 def _check_dangerous(command: str) -> str | None:
@@ -825,6 +842,60 @@ def _unified_diff(before: str, after: str, p: Path, context: int = 2) -> str:
     return "\n".join(diff_lines) if diff_lines else "(no changes)"
 
 
+DEFAULT_IGNORED_DIRS = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "venv",
+    "env",
+    "ENV",
+    "build",
+    "dist",
+    ".eggs",
+    "node_modules",
+})
+DEFAULT_IGNORED_FILE_PATTERNS = (
+    "*.pyc",
+    "*.pyo",
+    "*.egg-info",
+    ".DS_Store",
+    "Thumbs.db",
+)
+
+
+def _is_ignored_path(path: Path) -> bool:
+    """Return True for common VCS/cache/build artifacts.
+
+    The tools default to a compact, source-focused view so the model
+    doesn't waste context on `.git`, bytecode caches, egg metadata, or
+    build outputs. This is intentionally a small built-in ignore list;
+    it is not a security boundary.
+    """
+    for part in path.parts:
+        if part in DEFAULT_IGNORED_DIRS:
+            return True
+        if part.endswith(".egg-info"):
+            return True
+    name = path.name
+    return any(fnmatch.fnmatch(name, pat) for pat in DEFAULT_IGNORED_FILE_PATTERNS)
+
+
+def _prune_ignored_dirs(root: str, dirs: list[str]) -> None:
+    root_path = Path(root)
+    dirs[:] = [d for d in dirs if not _is_ignored_path(root_path / d)]
+
+
+def _matches_glob(path: str, pattern: str) -> bool:
+    """Match a POSIX-style relative path against a user glob pattern."""
+    return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(Path(path).name, pattern)
+
+
 # ───────── bash ─────────
 
 def tool_bash(
@@ -845,7 +916,12 @@ def tool_bash(
         except (TypeError, ValueError):
             return f"Error: max_output_chars must be an integer, got {max_output_chars!r}"
 
-    cwd = str(_safe_path(ctx.work_dir, workdir)) if workdir else ctx.work_dir
+    cwd_path = _safe_path(ctx.work_dir, workdir) if workdir else Path(ctx.work_dir).resolve()
+    if not ALLOW_UNSANDBOXED_BASH:
+        err = _sandbox_error(ctx.work_dir, cwd_path, kind="run bash in a workdir")
+        if err:
+            return err
+    cwd = str(cwd_path)
     try:
         result = subprocess.run(
             command,
@@ -939,7 +1015,12 @@ def tool_bash_start(ctx: ToolContext, command: str, workdir: str | None = None) 
             + "\nWait for one to finish or bash_kill it first."
         )
 
-    cwd = str(_safe_path(ctx.work_dir, workdir)) if workdir else ctx.work_dir
+    cwd_path = _safe_path(ctx.work_dir, workdir) if workdir else Path(ctx.work_dir).resolve()
+    if not ALLOW_UNSANDBOXED_BASH:
+        err = _sandbox_error(ctx.work_dir, cwd_path, kind="start bash in a workdir")
+        if err:
+            return err
+    cwd = str(cwd_path)
     job_id = ctx.alloc_bash_id()
 
     BG_JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1128,6 +1209,10 @@ def tool_write_file(
 ) -> str:
     """Create or overwrite a file."""
     p = _safe_path(ctx.work_dir, path)
+    if not ALLOW_UNSANDBOXED_WRITES:
+        err = _sandbox_error(ctx.work_dir, p, kind="write file")
+        if err:
+            return err
     if not force and p.exists():
         return (
             f"Error: {p} already exists. "
@@ -1154,7 +1239,16 @@ def tool_edit_file(
     return contextual information about every match so the caller can
     refine the request.
     """
+    if not isinstance(old_string, str) or not isinstance(new_string, str):
+        return "Error: old_string and new_string must be strings"
+    if old_string == "":
+        return "Error: old_string must be non-empty"
+
     p = _safe_path(ctx.work_dir, path)
+    if not ALLOW_UNSANDBOXED_WRITES:
+        err = _sandbox_error(ctx.work_dir, p, kind="edit file")
+        if err:
+            return err
     try:
         text = p.read_text()
     except FileNotFoundError:
@@ -1241,6 +1335,10 @@ def tool_edit_lines(
     mode == "delete":  remove lines [start_line..end_line]; content ignored
     """
     p = _safe_path(ctx.work_dir, path)
+    if not ALLOW_UNSANDBOXED_WRITES:
+        err = _sandbox_error(ctx.work_dir, p, kind="edit file")
+        if err:
+            return err
     try:
         text = p.read_text()
     except FileNotFoundError:
@@ -1334,6 +1432,10 @@ def _replace_nth(buffer: str, old: str, new: str, n: int) -> tuple[str, int]:
 def tool_multi_edit(ctx: ToolContext, path: str, edits: list | None = None) -> str:
     """Apply a list of string replacements to one file atomically."""
     p = _safe_path(ctx.work_dir, path)
+    if not ALLOW_UNSANDBOXED_WRITES:
+        err = _sandbox_error(ctx.work_dir, p, kind="edit file")
+        if err:
+            return err
     try:
         before = p.read_text()
     except FileNotFoundError:
@@ -1359,6 +1461,8 @@ def tool_multi_edit(ctx: ToolContext, path: str, edits: list | None = None) -> s
             return f"Edit #{i}: missing 'old_string' or 'new_string'"
         if not isinstance(old, str) or not isinstance(new, str):
             return f"Edit #{i}: 'old_string' and 'new_string' must be strings"
+        if old == "":
+            return f"Edit #{i}: old_string must be non-empty"
         if old == new:
             return f"Edit #{i}: old_string == new_string (no-op)"
         if replace_all and occurrence is not None:
@@ -1446,12 +1550,19 @@ def tool_list_files(
             dirs[:] = []  # prune deeper dirs
             continue
 
+        _prune_ignored_dirs(root, dirs)
+
         for d in sorted(dirs):
-            entries.append(os.path.join(rel, d) + "/")
+            entry = os.path.join(rel, d) + "/"
+            entries.append(entry if rel != "." else f"{d}/")
         for f in sorted(files):
-            if file_filter and not fnmatch.fnmatch(f, file_filter):
+            fpath = Path(root, f)
+            if _is_ignored_path(fpath):
                 continue
-            entries.append(os.path.join(rel, f))
+            entry = os.path.join(rel, f) if rel != "." else f
+            if file_filter and not _matches_glob(entry, file_filter):
+                continue
+            entries.append(entry)
 
     if not entries:
         return f"{p} (empty or no files matching filter)"
@@ -1483,10 +1594,15 @@ def tool_search_content(
         files_to_search = [p]
     else:
         files_to_search = []
-        for root, _dirs, files in os.walk(p):
+        for root, dirs, files in os.walk(p):
+            _prune_ignored_dirs(root, dirs)
             for f in files:
-                if fnmatch.fnmatch(f, file_filter):
-                    files_to_search.append(Path(root, f))
+                fpath = Path(root, f)
+                if _is_ignored_path(fpath):
+                    continue
+                rel = fpath.relative_to(p).as_posix()
+                if _matches_glob(rel, file_filter):
+                    files_to_search.append(fpath)
             if len(files_to_search) > 2000:
                 break  # don't scan massive trees
 
@@ -1509,9 +1625,10 @@ def tool_search_content(
 def tool_glob_files(ctx: ToolContext, pattern: str, path: str = ".") -> str:
     """Recursive glob: returns file paths matching *pattern* under *path*.
 
-    Path.glob already skips entries starting with '.' for `*` / `**`, so
-    `.git`, `node_modules` (when hidden) etc. don't pollute results.
-    Sorted by mtime descending so recently-touched files come first.
+    Common VCS/cache/build artifacts are skipped by default so patterns
+    like `**/*.py` stay source-focused instead of returning `.git`,
+    `__pycache__`, or egg-info contents. Sorted by mtime descending so
+    recently-touched files come first.
     """
     p = _safe_path(ctx.work_dir, path)
     if not p.exists():
@@ -1522,11 +1639,19 @@ def tool_glob_files(ctx: ToolContext, pattern: str, path: str = ".") -> str:
     MAX_RESULTS = 1000
     matches: list[Path] = []
     try:
-        for match in p.glob(pattern):
-            if not match.is_file():
-                continue
-            matches.append(match)
-            # Hard cap on scan to avoid pathological patterns blowing memory.
+        for root, dirs, files in os.walk(p):
+            _prune_ignored_dirs(root, dirs)
+            for f in files:
+                match = Path(root, f)
+                if _is_ignored_path(match):
+                    continue
+                rel = match.relative_to(p).as_posix()
+                if not _matches_glob(rel, pattern):
+                    continue
+                matches.append(match)
+                # Hard cap on scan to avoid pathological patterns blowing memory.
+                if len(matches) >= MAX_RESULTS * 5:
+                    break
             if len(matches) >= MAX_RESULTS * 5:
                 break
     except Exception as e:

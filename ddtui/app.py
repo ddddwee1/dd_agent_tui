@@ -19,29 +19,35 @@ import asyncio
 import json
 import os
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from openai import AsyncOpenAI
 from rich.markdown import Markdown
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Header, Static, TabbedContent, TabPane, TextArea
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    Collapsible,
+    Header,
+    Static,
+    TabbedContent,
+    TabPane,
+    TextArea,
+)
 
 from .config import (
     AGENTS_MD_FILENAME,
     AGENTS_MD_MAX_CHARS,
-    API_KEY_PATH,
-    BASE_URL,
     COMPACT_KEEP_RECENT_TURNS,
     COMPACT_TOOL_SNIPPET_CHARS,
+    DEFAULT_PROVIDER,
     HISTORY_DIR,
     MAX_LIVE_SUBAGENTS,
-    MODEL,
-    REASONING_EFFORT,
     SUBAGENT_DEFAULT_AWAIT_TIMEOUT,
     SUBAGENT_IDLE_TIMEOUT_SEC,
     SUBAGENT_MAX_AWAIT_TIMEOUT,
@@ -49,6 +55,12 @@ from .config import (
     SUBAGENT_REAP_INTERVAL_SEC,
     SUBAGENT_RESULT_MAX_CHARS,
     SYSTEM_PROMPT,
+)
+from .providers import (
+    ProviderConfigError,
+    ToolCallDelta,
+    build_provider,
+    provider_names,
 )
 from .state import (
     SubagentSession,
@@ -107,9 +119,172 @@ def _render_history_for_summary(messages: list) -> str:
     return "\n\n".join(lines)
 
 
+# ───────── error formatting ─────────
+
+def _one_line(text: str, limit: int = 180) -> str:
+    """Collapse whitespace and truncate for widget titles."""
+    text = " ".join(text.strip().split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _exception_extra(exc: BaseException) -> list[str]:
+    """Best-effort extraction of provider / HTTP error fields.
+
+    OpenAI/httpx exceptions often carry useful data on attributes rather
+    than in ``str(exc)``. Pull those into the visible error body so the
+    TUI doesn't show a bare ``API error:`` when the exception message is
+    empty or too terse.
+    """
+    lines: list[str] = []
+    for attr in ("status_code", "code", "request_id"):
+        value = getattr(exc, attr, None)
+        if value not in (None, ""):
+            lines.append(f"{attr}: {value}")
+
+    request = getattr(exc, "request", None)
+    if request is not None:
+        method = getattr(request, "method", "") or ""
+        url = getattr(request, "url", "") or ""
+        if method or url:
+            lines.append(f"request: {method} {url}".strip())
+
+    body = getattr(exc, "body", None)
+    if body not in (None, ""):
+        try:
+            body_text = json.dumps(body, ensure_ascii=False, indent=2)
+        except Exception:
+            body_text = str(body)
+        lines.append("body:\n" + body_text[:4000])
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        if status is not None and not any(l.startswith("status_code:") for l in lines):
+            lines.append(f"status_code: {status}")
+        text = getattr(response, "text", None)
+        if text:
+            lines.append("response text:\n" + str(text)[:4000])
+
+    return lines
+
+
+def _format_exception_for_ui(exc: BaseException) -> tuple[str, str]:
+    exc_type = type(exc).__name__
+    message = str(exc).strip()
+    summary = _one_line(f"{exc_type}: {message or repr(exc)}")
+
+    tb = "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    ).strip()
+    detail_parts = [
+        "本轮已回滚，下面是原始异常信息。",
+        "这不一定是 API 本身失败，也可能是工具、provider 转换或 UI 处理异常。",
+    ]
+    extra = _exception_extra(exc)
+    if extra:
+        detail_parts.extend(["", "附加信息:", *extra])
+    detail_parts.extend(["", "Traceback:", tb or f"{exc_type}: {message or repr(exc)}"])
+    return summary, "\n".join(detail_parts)
+
+
+def _exception_block(title: str, exc: BaseException) -> Collapsible:
+    summary, detail = _format_exception_for_ui(exc)
+    return Collapsible(
+        Static(Text(detail, style="red"), markup=False),
+        title=f"❌ {title} · {summary}",
+        collapsed=False,
+    )
+
+
 # ───────── tool-confirm hook ─────────
 
 ToolConfirmHook = Callable[[str, dict], Awaitable[bool]]
+
+WRITE_CONFIRM_TOOLS = frozenset({"write_file", "edit_file", "edit_lines", "multi_edit"})
+
+
+class ToolConfirmDialog(ModalScreen[bool]):
+    """Modal confirmation for write/edit tool calls."""
+
+    CSS = """
+    ToolConfirmDialog {
+        align: center middle;
+    }
+    ToolConfirmDialog > #confirm-box {
+        width: 72;
+        max-width: 90%;
+        height: auto;
+        max-height: 85%;
+        padding: 1 2;
+        border: round #f9e2af;
+        background: #1e1e2e;
+    }
+    ToolConfirmDialog #confirm-title {
+        margin: 0 0 1 0;
+        color: #f9e2af;
+        text-style: bold;
+    }
+    ToolConfirmDialog #confirm-body {
+        height: auto;
+        max-height: 18;
+        margin: 0 0 1 0;
+    }
+    ToolConfirmDialog #confirm-buttons {
+        height: auto;
+        align-horizontal: right;
+    }
+    ToolConfirmDialog Button {
+        margin-left: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "取消", show=False),
+        Binding("y", "allow", "允许", show=False),
+        Binding("n", "cancel", "拒绝", show=False),
+    ]
+
+    def __init__(self, name: str, args: dict) -> None:
+        super().__init__()
+        self.name = name
+        self.args = args
+
+    def compose(self) -> ComposeResult:
+        with Container(id="confirm-box"):
+            yield Static(f"确认执行写操作：{self.name}", id="confirm-title")
+            yield Static(Text(self._body_text(), style="white"), id="confirm-body", markup=False)
+            with Horizontal(id="confirm-buttons"):
+                yield Button("拒绝 (N/Esc)", id="deny", variant="error")
+                yield Button("允许 (Y)", id="allow", variant="success")
+
+    def _body_text(self) -> str:
+        path = self.args.get("path") if isinstance(self.args, dict) else None
+        preview_args = self.args
+        try:
+            raw = json.dumps(preview_args, ensure_ascii=False, indent=2)
+        except Exception:
+            raw = str(preview_args)
+        if len(raw) > 3000:
+            raw = raw[:3000] + f"\n…[+{len(raw) - 3000} chars]"
+        lines = [
+            "模型请求执行会修改文件的工具调用。",
+            "请确认这是你期望的改动；拒绝后模型会收到工具被拦截的结果。",
+        ]
+        if path:
+            lines.append(f"目标路径: {path}")
+        lines.extend(["", "参数:", raw])
+        return "\n".join(lines)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "allow")
+
+    def action_allow(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 async def always_allow(name: str, args: dict) -> bool:
@@ -121,6 +296,27 @@ async def always_allow(name: str, args: dict) -> bool:
     the function — the model sees this and can adapt.
     """
     return True
+
+
+def _merge_tool_call_delta(
+    tool_calls: dict[int, dict], delta: ToolCallDelta
+) -> None:
+    slot = tool_calls.setdefault(
+        delta.index,
+        {
+            "id": "",
+            "type": "function",
+            "function": {"name": "", "arguments": ""},
+        },
+    )
+    if delta.id:
+        slot["id"] = delta.id
+    if delta.type:
+        slot["type"] = delta.type
+    if delta.name:
+        slot["function"]["name"] += delta.name
+    if delta.arguments:
+        slot["function"]["arguments"] += delta.arguments
 
 
 # ───────── app ─────────
@@ -179,14 +375,34 @@ class AgentApp(App):
     # long enough to be comfortably double-tappable.
     ESC_DOUBLE_WINDOW = 0.6
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, provider_name: str = DEFAULT_PROVIDER) -> None:
         super().__init__()
-        self.client = AsyncOpenAI(api_key=api_key, base_url=BASE_URL)
+        try:
+            self.provider = build_provider(provider_name)
+        except ProviderConfigError as first_error:
+            fallback = None if provider_name.strip().lower() == "codex" else "codex"
+            if fallback is not None:
+                try:
+                    self.provider = build_provider(fallback)
+                except ProviderConfigError as fallback_error:
+                    raise ProviderConfigError(
+                        f"启动 provider {provider_name!r} 不可用：{first_error}; "
+                        f"fallback {fallback!r} 也不可用：{fallback_error}"
+                    ) from fallback_error
+                self._startup_provider_error = (
+                    f"启动 provider {provider_name!r} 不可用：{first_error}\n"
+                    f"已回退到 {fallback}。"
+                )
+            else:
+                raise
+        else:
+            self._startup_provider_error = None
+        self.provider_name = self.provider.key
         # Mutable copies of the module-level defaults — `/model` and
         # `/effort` slash commands rebind these mid-session so the user
         # can switch without restarting.
-        self.model = MODEL
-        self.effort = REASONING_EFFORT
+        self.model = self.provider.default_model
+        self.effort = self.provider.default_effort
         # Per-conversation runtime state: work_dir + bash job table +
         # id allocator. Threaded explicitly through every execute_tool
         # call so a future subagent can be handed its own ctx.
@@ -210,7 +426,9 @@ class AgentApp(App):
         self._agents_md_loaded = agents_md is not None
         self.counter = TokenCounter()
         # Hook: replace this attribute (or override) to gate tools.
-        self.tool_confirm: ToolConfirmHook = always_allow
+        # By default, write/edit tools require a modal confirmation;
+        # read-only tools continue without interruption.
+        self.tool_confirm: ToolConfirmHook = self._confirm_tool_call
         self._busy = False
         # Follow-bottom state: when True, every mount/chunk-update
         # auto-scrolls the conversation to the end. Toggled by
@@ -234,8 +452,8 @@ class AgentApp(App):
         self._subagent_block: SubagentsBlock | None = None
         # Message queue: messages submitted while a turn is in flight
         # land here and are consumed in FIFO order after the current
-        # turn finishes. Wiped on /clear and on API error (so the user
-        # can decide what to do next instead of being railroaded).
+        # turn finishes. Wiped on /clear and on turn-level runtime error
+        # (so the user can decide what to do next instead of being railroaded).
         # Each entry pairs the text with its bubble widget parked in
         # the #pending tray, so consumption / cancel can remove it.
         self._queued: list[tuple[str, "UserBubble"]] = []
@@ -283,6 +501,8 @@ class AgentApp(App):
         self._update_subtitle()
         self._refresh_status()
         self.query_one("#user-input", MultilineInput).focus()
+        if self._startup_provider_error:
+            self.call_later(self._show_startup_provider_error)
         # Watch the conversation's scroll position: scrolling up
         # disables auto-follow; scrolling back to the bottom re-enables
         # it. The watcher fires on every scroll_y change, including
@@ -310,6 +530,29 @@ class AgentApp(App):
         self.set_interval(
             SUBAGENT_REAP_INTERVAL_SEC, self._reap_idle_subagents
         )
+
+    async def _show_startup_provider_error(self) -> None:
+        await self._mount_widget(Static(Text(
+            f"⚠ {self._startup_provider_error}",
+            style="bold yellow",
+        )))
+
+    async def _confirm_tool_call(self, name: str, args: dict) -> bool:
+        """Default tool gate: confirm file-writing tools, allow the rest.
+
+        This is intentionally UI-level policy, separate from the tool
+        sandbox. The sandbox rejects paths outside the project; the
+        modal asks whether an in-project write/edit should proceed at
+        all. Users embedding AgentApp can still replace tool_confirm
+        with their own hook.
+        """
+        if name not in WRITE_CONFIRM_TOOLS:
+            return True
+        try:
+            return bool(await self.push_screen_wait(ToolConfirmDialog(name, args)))
+        except Exception as e:
+            self.notify(f"写操作确认弹窗失败，已拒绝工具调用：{e}", severity="error", timeout=4)
+            return False
 
     def _tick_progress_bar(self) -> None:
         if not self._busy:
@@ -777,6 +1020,44 @@ class AgentApp(App):
             inp.text = ""
             await self._list_history()
             return
+        if text == "/provider" or text.startswith("/provider "):
+            inp.text = ""
+            arg = text[len("/provider"):].strip().lower()
+            if not arg:
+                await self._mount_widget(Static(Text(
+                    f"当前 provider: {self.provider_name}\n"
+                    f"可用 provider: {', '.join(provider_names())}\n"
+                    "用法：/provider <deepseek|codex>  （切换后下一轮请求生效）",
+                    style="dim",
+                )))
+                return
+            if self._busy:
+                self.notify(
+                    "正在跑任务；先 ESC×2 中断或等结束再 /provider",
+                    timeout=3,
+                )
+                return
+            try:
+                new_provider = build_provider(arg)
+            except ProviderConfigError as e:
+                await self._mount_widget(Static(Text(
+                    f"❌ provider 切换失败：{e}\n"
+                    f"当前仍使用 {self.provider_name} · {self.model}。",
+                    style="bold red",
+                )))
+                return
+            old = self.provider_name
+            self.provider = new_provider
+            self.provider_name = new_provider.key
+            self.model = new_provider.default_model
+            self.effort = new_provider.default_effort
+            self._update_subtitle()
+            await self._mount_widget(Static(Text(
+                f"⚙ provider: {old} → {self.provider_name}; "
+                f"model={self.model}, effort={self.effort}",
+                style="bold cyan",
+            )))
+            return
         if text == "/model" or text.startswith("/model "):
             inp.text = ""
             arg = text[len("/model"):].strip()
@@ -931,7 +1212,7 @@ class AgentApp(App):
         self._refresh_status()
 
     def _update_subtitle(self) -> None:
-        sub = f"{self.model} · effort={self.effort}"
+        sub = f"{self.provider.label} · {self.model} · effort={self.effort}"
         if self._agents_md_loaded:
             sub += " · AGENTS.md ✓"
         self.sub_title = sub
@@ -984,9 +1265,8 @@ class AgentApp(App):
 
             rendered = _render_history_for_summary(to_compact)
             try:
-                resp = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
+                summary = await self.provider.complete_text(
+                    [
                         {
                             "role": "system",
                             "content": (
@@ -1011,9 +1291,9 @@ class AgentApp(App):
                             ),
                         },
                     ],
-                    stream=False,
+                    self.model,
+                    self.effort,
                 )
-                summary = (resp.choices[0].message.content or "").strip()
                 if not summary:
                     raise RuntimeError("摘要返回为空")
             except Exception as e:
@@ -1364,6 +1644,7 @@ class AgentApp(App):
             "- `/save <name>` 保存到 `~/.ddtui/history/<name>.json`\n"
             "- `/load <name>` 读回保存的对话\n"
             "- `/list-history` 列出已保存对话\n"
+            "- `/provider [deepseek|codex]` 查看 / 切换 provider\n"
             "- `/model [<id>]` 查看 / 切换模型（下一轮请求生效）\n"
             "- `/effort [<level>]` 查看 / 切换 reasoning effort\n"
             "- `/rewind` 退回上一条用户消息（文本回填输入框）\n"
@@ -1478,7 +1759,7 @@ class AgentApp(App):
                 self.messages.append({"role": "user", "content": pending})
                 ok = await self._run_one_turn()
                 if not ok:
-                    # API error already surfaced + rolled back.
+                    # Turn-level runtime error already surfaced + rolled back.
                     # Wipe the queue: don't railroad the user into
                     # more failing turns; let them re-submit if they want.
                     self._drop_queue()
@@ -1692,7 +1973,7 @@ class AgentApp(App):
                                     DiffBlock(args.get("path", "?"), diff_text)
                                 )
                         else:
-                            result = "Tool execution blocked by user policy."
+                            result = "Tool execution blocked by user policy / confirmation dialog."
                             block.set_result(result, blocked=True)
                     self.messages.append(
                         {"role": "tool", "tool_call_id": tc["id"], "content": result}
@@ -1705,8 +1986,9 @@ class AgentApp(App):
             # `self.messages` — confusing on retry.
             self._rollback_last_user_turn()
             self._wipe_orphaned_turn_widgets()
-            err = Static(Text(f"API error: {e}", style="bold red"))
-            await self._mount_widget(err)
+            await self._mount_widget(
+                _exception_block("本轮运行失败（已回滚）", e)
+            )
             return False
 
     async def _stream_one(self) -> dict:
@@ -1715,64 +1997,39 @@ class AgentApp(App):
         tool_calls: dict[int, dict] = {}
         final_usage = None
 
-        stream = await self.client.chat.completions.create(
-            model=self.model,
-            messages=self.messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            stream=True,
-            stream_options={"include_usage": True},
-            reasoning_effort=self.effort,
-            extra_body={"thinking": {"type": "enabled"}},
-        )
-
         # `_mount_widget` scrolls to the end on mount, but widgets that
         # grow via `update()` (the streaming case) don't trigger scroll
         # on their own — so explicitly follow the bottom on every chunk.
         view = self.query_one("#conversation", VerticalScroll)
 
         try:
-            async for chunk in stream:
-                if getattr(chunk, "usage", None):
-                    final_usage = chunk.usage
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
+            async for event in self.provider.stream(
+                self.messages,
+                TOOLS,
+                self.model,
+                self.effort,
+            ):
+                if event.usage is not None:
+                    final_usage = event.usage
 
-                rc = getattr(delta, "reasoning_content", None)
-                if rc:
+                if event.reasoning:
                     if thinking is None:
                         thinking = ThinkingBlock()
                         await self._mount_widget(thinking)
-                    thinking.append_text(rc)
+                    thinking.append_text(event.reasoning)
                     if self._follow_bottom:
                         view.scroll_end(animate=False)
 
-                text = getattr(delta, "content", None)
-                if text:
+                if event.content:
                     if answer is None:
                         answer = AssistantMessage()
                         await self._mount_widget(answer)
-                    answer.append_text(text)
+                    answer.append_text(event.content)
                     if self._follow_bottom:
                         view.scroll_end(animate=False)
 
-                for tc in getattr(delta, "tool_calls", None) or []:
-                    idx = tc.index if tc.index is not None else 0
-                    slot = tool_calls.setdefault(
-                        idx,
-                        {"id": "", "type": "function",
-                         "function": {"name": "", "arguments": ""}},
-                    )
-                    if tc.id:
-                        slot["id"] = tc.id
-                    if tc.type:
-                        slot["type"] = tc.type
-                    if tc.function:
-                        if tc.function.name:
-                            slot["function"]["name"] += tc.function.name
-                        if tc.function.arguments:
-                            slot["function"]["arguments"] += tc.function.arguments
+                if event.tool_call is not None:
+                    _merge_tool_call_delta(tool_calls, event.tool_call)
         except BaseException:
             # ESC×2 cancellation or stream error: drop the half-streamed
             # ThinkingBlock / AssistantMessage from the view. Neither is
@@ -1835,55 +2092,30 @@ class AgentApp(App):
                 sess.turn = base_turn + inner + 1
                 sess.phase = "thinking"
                 sess.last_tool = None
-                try:
-                    stream = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=sess.messages,
-                        tools=sess.sub_tools,
-                        tool_choice="auto",
-                        stream=True,
-                        stream_options={"include_usage": True},
-                        reasoning_effort=self.effort,
-                        extra_body={"thinking": {"type": "enabled"}},
-                    )
-                except Exception as e:
-                    sess.phase = "error"
-                    return f"❌ subagent stream failed: {e}"
-
                 content = ""
                 reasoning = ""
                 tool_calls: dict[int, dict] = {}
                 final_usage = None
-                async for chunk in stream:
-                    if getattr(chunk, "usage", None):
-                        final_usage = chunk.usage
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-                    rc = getattr(delta, "reasoning_content", None)
-                    if rc:
-                        reasoning += rc
-                    text = getattr(delta, "content", None)
-                    if text:
-                        content += text
-                        sess.phase = "answering"
-                    for tc in getattr(delta, "tool_calls", None) or []:
-                        idx = tc.index if tc.index is not None else 0
-                        slot = tool_calls.setdefault(
-                            idx,
-                            {"id": "", "type": "function",
-                             "function": {"name": "", "arguments": ""}},
-                        )
-                        if tc.id:
-                            slot["id"] = tc.id
-                        if tc.type:
-                            slot["type"] = tc.type
-                        if tc.function:
-                            if tc.function.name:
-                                slot["function"]["name"] += tc.function.name
-                            if tc.function.arguments:
-                                slot["function"]["arguments"] += tc.function.arguments
-                        sess.phase = "answering"
+                try:
+                    async for event in self.provider.stream(
+                        sess.messages,
+                        sess.sub_tools,
+                        self.model,
+                        self.effort,
+                    ):
+                        if event.usage is not None:
+                            final_usage = event.usage
+                        if event.reasoning:
+                            reasoning += event.reasoning
+                        if event.content:
+                            content += event.content
+                            sess.phase = "answering"
+                        if event.tool_call is not None:
+                            _merge_tool_call_delta(tool_calls, event.tool_call)
+                            sess.phase = "answering"
+                except Exception as e:
+                    sess.phase = "error"
+                    return f"❌ subagent stream failed: {e}"
 
                 # Roll subagent usage into parent counter so the status
                 # bar reflects combined spend; also accumulate per-
@@ -1947,7 +2179,7 @@ class AgentApp(App):
                                     if sep and "@@" in diff:
                                         result = head
                             else:
-                                result = "Tool execution blocked by user policy."
+                                result = "Tool execution blocked by user policy / confirmation dialog."
                     sess.messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -2189,30 +2421,6 @@ class AgentApp(App):
         )
 
 
-# ───────── entry ─────────
-
-def load_api_key() -> str:
-    """Resolve the DeepSeek API key.
-
-    Lookup order:
-      1. $DEEPSEEK_API_KEY env var (preferred — works without a file).
-      2. The file at $DEEPSEEK_API_KEY_FILE, or ~/deepseek_apikey.txt.
-    """
-    env_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
-    if env_key:
-        return env_key
-    try:
-        key = Path(API_KEY_PATH).read_text().strip()
-    except Exception as e:
-        raise SystemExit(
-            f"No DEEPSEEK_API_KEY env var, and cannot read API key from "
-            f"{API_KEY_PATH}: {e}"
-        )
-    if not key:
-        raise SystemExit(f"API key file is empty: {API_KEY_PATH}")
-    return key
-
-
 def load_agents_md(cwd: str) -> str | None:
     """Read `<cwd>/AGENTS.md` and return its content (or None if absent).
 
@@ -2242,7 +2450,16 @@ def load_agents_md(cwd: str) -> str | None:
 
 
 def main() -> None:
-    AgentApp(api_key=load_api_key()).run()
+    try:
+        app = AgentApp(provider_name=DEFAULT_PROVIDER)
+    except ProviderConfigError as e:
+        raise SystemExit(
+            "Provider configuration error: "
+            f"{e}\n"
+            "请设置 DEEPSEEK_API_KEY / DEEPSEEK_API_KEY_FILE，"
+            "或先运行 `codex login` 后用 DDTUI_PROVIDER=codex。"
+        ) from e
+    app.run()
 
 
 if __name__ == "__main__":
