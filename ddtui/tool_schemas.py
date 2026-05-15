@@ -197,7 +197,10 @@ TOOLS = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative path to the file.",
+                        "description": (
+                            "Absolute or relative path to the file. "
+                            "Parameter name is 'path' (not 'file_path')."
+                        ),
                     },
                     "offset": {
                         "type": "integer",
@@ -217,15 +220,21 @@ TOOLS = [
         "function": {
             "name": "write_file",
             "description": (
-                "Create or overwrite a file with the given content. "
-                "If force=False and the file already exists, the operation is refused."
+                "Create a new file or intentionally overwrite a whole file. "
+                "For small or localized changes to an existing file, prefer "
+                "apply_patch, edit_file, edit_lines, or multi_edit so the edit "
+                "is incremental and reviewable. If force=False and the file "
+                "already exists, the operation is refused."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative path to the file.",
+                        "description": (
+                            "Absolute or relative path to the file. "
+                            "Parameter name is 'path' (not 'file_path')."
+                        ),
                     },
                     "content": {
                         "type": "string",
@@ -245,19 +254,24 @@ TOOLS = [
         "function": {
             "name": "edit_file",
             "description": (
-                "Replace ONE occurrence of old_string with new_string in a file. "
-                "old_string must match exactly. If there are multiple matches, "
-                "either provide a larger string with more surrounding context to "
-                "make it unique, or specify the occurrence number (1-indexed). "
-                "When multiple matches are found and no occurrence is given, "
-                "the tool returns line numbers and surrounding context for each match."
+                "Preferred tool for a small change in an existing file. Replace "
+                "ONE occurrence of old_string with new_string and return a diff. "
+                "Read or search the file first, then include enough surrounding "
+                "context in old_string for an exact unique match, including "
+                "whitespace and newlines. If there are multiple matches, either "
+                "provide more context or specify occurrence (1-indexed). When "
+                "multiple matches are found and no occurrence is given, the tool "
+                "returns line numbers and surrounding context for each match."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative path to the file.",
+                        "description": (
+                            "Absolute or relative path to the file. "
+                            "Parameter name is 'path' (not 'file_path')."
+                        ),
                     },
                     "old_string": {
                         "type": "string",
@@ -282,10 +296,90 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "apply_patch",
+            "description": (
+                "Codex-friendly alias for incremental file edits. This is the "
+                "same editing capability as edit_file/multi_edit, not a unified "
+                "diff parser. Use path + old_string + new_string for one exact "
+                "replacement, or path + edits for multiple ordered replacements "
+                "in one file. Prefer this over write_file when modifying an "
+                "existing file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute or relative path to the file. "
+                            "Parameter name is 'path' (not 'file_path')."
+                        ),
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace for a single edit.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text for a single edit.",
+                    },
+                    "occurrence": {
+                        "type": "integer",
+                        "description": (
+                            "Which occurrence to replace (1-indexed). "
+                            "Only needed when old_string appears more than once."
+                        ),
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": (
+                            "Optional ordered list of edit operations, using the "
+                            "same shape as multi_edit. Use this for several "
+                            "changes in the same file."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {
+                                    "type": "string",
+                                    "description": "Exact text to replace.",
+                                },
+                                "new_string": {
+                                    "type": "string",
+                                    "description": "Replacement text.",
+                                },
+                                "occurrence": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Which occurrence to replace (1-indexed). "
+                                        "Required when old_string matches multiple "
+                                        "times and replace_all is not set."
+                                    ),
+                                },
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "description": (
+                                        "Replace every occurrence. Default false. "
+                                        "Mutually exclusive with occurrence."
+                                    ),
+                                },
+                            },
+                            "required": ["old_string", "new_string"],
+                        },
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "edit_lines",
             "description": (
-                "Edit a file by line numbers (1-indexed). Use this for precise "
-                "line-level edits when you know which lines to change. "
+                "Edit an existing file by line numbers (1-indexed) and return a "
+                "diff. Use this for precise line-level edits when you already "
+                "know which lines to change. "
                 "mode='replace' replaces lines [start_line..end_line] inclusive with content. "
                 "mode='insert' inserts content BEFORE start_line; end_line is ignored. "
                 "mode='delete' removes lines [start_line..end_line]; content is ignored. "
@@ -297,7 +391,10 @@ TOOLS = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative path to the file.",
+                        "description": (
+                            "Absolute or relative path to the file. "
+                            "Parameter name is 'path' (not 'file_path')."
+                        ),
                     },
                     "mode": {
                         "type": "string",
@@ -326,7 +423,9 @@ TOOLS = [
         "function": {
             "name": "multi_edit",
             "description": (
-                "Apply multiple string replacements to ONE file in a single call. "
+                "Preferred tool for several related changes in the same existing "
+                "file. Apply multiple string replacements to ONE file in a "
+                "single call and return one diff. "
                 "Edits are applied in order; each one operates on the result of "
                 "the previous, so a later edit can reference text introduced by "
                 "an earlier one. All edits must succeed atomically — if any one "
@@ -342,7 +441,10 @@ TOOLS = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative path to the file.",
+                        "description": (
+                            "Absolute or relative path to the file. "
+                            "Parameter name is 'path' (not 'file_path')."
+                        ),
                     },
                     "edits": {
                         "type": "array",
@@ -396,7 +498,10 @@ TOOLS = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Directory path to list. Default '.'.",
+                        "description": (
+                            "Directory path to list. Default '.'. "
+                            "Parameter name is 'path' (not 'file_path' or 'directory')."
+                        ),
                     },
                     "depth": {
                         "type": "integer",
@@ -430,7 +535,10 @@ TOOLS = [
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory or file to search in. Default '.'.",
+                        "description": (
+                            "Directory or file to search in. Default '.'. "
+                            "Parameter name is 'path' (not 'file_path' or 'directory')."
+                        ),
                     },
                     "file_filter": {
                         "type": "string",
@@ -469,7 +577,10 @@ TOOLS = [
                     },
                     "path": {
                         "type": "string",
-                        "description": "Root directory. Default '.'.",
+                        "description": (
+                            "Root directory. Default '.'. "
+                            "Parameter name is 'path' (not 'file_path' or 'directory')."
+                        ),
                     },
                 },
                 "required": ["pattern"],

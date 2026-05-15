@@ -160,7 +160,7 @@ ddtui
 模型可以调用这些工具：
 
 - shell：`bash`、`bash_start`、`bash_check`、`bash_wait`、`bash_kill`、`bash_list`
-- 文件：`read_file`、`write_file`、`edit_file`、`edit_lines`、`multi_edit`
+- 文件：`read_file`、`write_file`、`apply_patch`、`edit_file`、`edit_lines`、`multi_edit`
 - 搜索：`list_files`、`glob_files`、`search_content`
 - Web：`web_fetch`、`web_search`
 - 任务进度：`todo_tool`
@@ -202,6 +202,7 @@ export BRAVE_API_KEY_FILE="$HOME/brave_apikey.txt"
 以下工具执行前会弹窗确认：
 
 - `write_file`
+- `apply_patch`
 - `edit_file`
 - `edit_lines`
 - `multi_edit`

@@ -22,6 +22,7 @@ from .tools_bash import (
     tool_bash_wait,
 )
 from .tools_files import (
+    tool_apply_patch,
     tool_edit_file,
     tool_edit_lines,
     tool_multi_edit,
@@ -45,6 +46,7 @@ TOOL_FUNCS = {
     "bash_list": tool_bash_list,
     "read_file": tool_read_file,
     "write_file": tool_write_file,
+    "apply_patch": tool_apply_patch,
     "edit_file": tool_edit_file,
     "edit_lines": tool_edit_lines,
     "multi_edit": tool_multi_edit,
@@ -57,12 +59,41 @@ TOOL_FUNCS = {
 }
 
 
+# Parameter aliases so the LLM can use common synonyms without
+# crashing the call.  Added because models sometimes confuse
+# `path` / `file_path` / `directory` / `dir_path` etc.
+_PARAM_ALIASES: dict[str, str] = {
+    "file_path": "path",
+    "dir_path": "path",
+    "directory": "path",
+    "file": "path",
+    "folder": "path",
+}
+
+
+def _normalize_args(args: dict) -> dict:
+    """Canonicalise common parameter-name variations in-place.
+
+    - If the canonical key is missing but an alias is present, the alias
+      value is moved to the canonical key.
+    - If both the canonical key and an alias are present, the alias is
+      simply dropped (canonical wins).
+    """
+    for alias, canonical in _PARAM_ALIASES.items():
+        if alias in args:
+            if canonical not in args:
+                args[canonical] = args.pop(alias)
+            else:
+                args.pop(alias)  # canonical already set; drop the alias
+    return args
+
+
 def execute_tool(ctx: ToolContext, name: str, args: dict) -> str:
     fn = TOOL_FUNCS.get(name)
     if not fn:
         return f"Unknown tool: {name}"
     try:
-        return fn(ctx, **args)
+        return fn(ctx, **_normalize_args(args))
     except TypeError as e:
         return f"Bad arguments for {name}: {e}"
     except Exception as e:

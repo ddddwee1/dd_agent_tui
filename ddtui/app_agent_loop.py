@@ -241,7 +241,12 @@ class AppAgentLoopMixin:
                             # tokens (the head summary already says
                             # what changed).
                             diff_text = None
-                            if name in ("edit_file", "edit_lines", "multi_edit"):
+                            if name in (
+                                "apply_patch",
+                                "edit_file",
+                                "edit_lines",
+                                "multi_edit",
+                            ):
                                 head, sep, diff = result.partition("\n\n")
                                 if sep and "@@" in diff:
                                     diff_text = diff

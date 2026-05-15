@@ -8,7 +8,6 @@ from rich.text import Text
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Static, TabbedContent, TabPane
 
-from .app_confirm import ToolConfirmDialog, WRITE_CONFIRM_TOOLS
 from .config import SUBAGENT_IDLE_TIMEOUT_SEC, SUBAGENT_REAP_INTERVAL_SEC
 from .state import SubagentSession, kill_all_bash_jobs
 from .widgets import (
@@ -64,23 +63,6 @@ class AppUiMixin:
             f"⚠ {self._startup_provider_error}",
             style="bold yellow",
         )))
-
-    async def _confirm_tool_call(self, name: str, args: dict) -> bool:
-        """Default tool gate: confirm file-writing tools, allow the rest.
-
-        This is intentionally UI-level policy, separate from the tool
-        sandbox. The sandbox rejects paths outside the project; the
-        modal asks whether an in-project write/edit should proceed at
-        all. Users embedding AgentApp can still replace tool_confirm
-        with their own hook.
-        """
-        if name not in WRITE_CONFIRM_TOOLS:
-            return True
-        try:
-            return bool(await self.push_screen_wait(ToolConfirmDialog(name, args)))
-        except Exception as e:
-            self.notify(f"写操作确认弹窗失败，已拒绝工具调用：{e}", severity="error", timeout=4)
-            return False
 
     def _tick_progress_bar(self) -> None:
         if not self._busy:

@@ -9,6 +9,7 @@ import time
 from .app_support import _merge_tool_call_delta, load_agents_md
 from .config import (
     MAX_LIVE_SUBAGENTS,
+    POST_SYSTEM_PROMPT,
     SUBAGENT_DEFAULT_AWAIT_TIMEOUT,
     SUBAGENT_MAX_AWAIT_TIMEOUT,
     SUBAGENT_MAX_TURNS,
@@ -125,7 +126,10 @@ class AppSubagentMixin:
                                 # Strip the diff so a 1000-line patch
                                 # doesn't eat the subagent's context.
                                 if name in (
-                                    "edit_file", "edit_lines", "multi_edit"
+                                    "apply_patch",
+                                    "edit_file",
+                                    "edit_lines",
+                                    "multi_edit",
                                 ):
                                     head, sep, diff = result.partition("\n\n")
                                     if sep and "@@" in diff:
@@ -215,6 +219,11 @@ class AppSubagentMixin:
             sub_messages.append({
                 "role": "system",
                 "content": f"# Project guidelines (from AGENTS.md)\n\n{sub_agents_md}",
+            })
+        if POST_SYSTEM_PROMPT:
+            sub_messages.append({
+                "role": "system",
+                "content": POST_SYSTEM_PROMPT,
             })
         if system.strip():
             sub_messages.append({

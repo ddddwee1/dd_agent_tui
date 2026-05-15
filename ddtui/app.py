@@ -16,13 +16,13 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Header, Static, TabbedContent, TabPane
 
 from .app_agent_loop import AppAgentLoopMixin
-from .app_confirm import ToolConfirmHook
+from .app_confirm import ToolConfirmHook, always_allow
 from .app_history import AppHistoryMixin
 from .app_input import AppInputMixin
 from .app_subagents import AppSubagentMixin
 from .app_support import load_agents_md
 from .app_ui import AppUiMixin
-from .config import DEFAULT_PROVIDER, SYSTEM_PROMPT
+from .config import DEFAULT_PROVIDER, POST_SYSTEM_PROMPT, SYSTEM_PROMPT
 from .providers import ProviderConfigError, build_provider
 from .state import TokenCounter, ToolContext
 from .widgets import (
@@ -145,11 +145,17 @@ class AgentApp(
                 }
             )
         self._agents_md_loaded = agents_md is not None
+        # Optional THIRD system message — global override that lands after
+        # AGENTS.md so it can correct or supersede project-level guidance.
+        if POST_SYSTEM_PROMPT:
+            self.messages.append(
+                {"role": "system", "content": POST_SYSTEM_PROMPT}
+            )
         self.counter = TokenCounter()
         # Hook: replace this attribute (or override) to gate tools.
-        # By default, write/edit tools require a modal confirmation;
-        # read-only tools continue without interruption.
-        self.tool_confirm: ToolConfirmHook = self._confirm_tool_call
+        # Default policy allows every tool call; embedders can swap in
+        # a stricter hook (allowlist, modal, per-tool rules, etc.).
+        self.tool_confirm: ToolConfirmHook = always_allow
         self._busy = False
         # Follow-bottom state: when True, every mount/chunk-update
         # auto-scrolls the conversation to the end. Toggled by

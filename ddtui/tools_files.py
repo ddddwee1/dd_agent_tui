@@ -50,7 +50,7 @@ def tool_write_file(
     if not force and p.exists():
         return (
             f"Error: {p} already exists. "
-            "Set force=True to overwrite, or use edit_file to modify it."
+            "Set force=True to overwrite, or use apply_patch/edit_file to modify it."
         )
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -152,6 +152,45 @@ def tool_edit_file(
         f"Edited {p} (replaced occurrence {occurrence or 1} of {len(positions)})\n\n"
         f"{diff}"
     )
+
+
+def tool_apply_patch(
+    ctx: ToolContext,
+    path: str,
+    old_string: str | None = None,
+    new_string: str | None = None,
+    occurrence: int | None = None,
+    edits: list | None = None,
+    patch: str | None = None,
+) -> str:
+    """Codex-friendly alias for exact text replacement edits.
+
+    This intentionally reuses edit_file/multi_edit semantics. It is not
+    a unified-diff parser; the schema steers models to pass structured
+    exact replacements instead.
+    """
+    if patch is not None:
+        return (
+            "Error: this apply_patch alias does not parse unified diff text. "
+            "Call it with path + old_string + new_string, or path + edits."
+        )
+
+    if edits is not None:
+        if old_string is not None or new_string is not None or occurrence is not None:
+            return (
+                "Error: apply_patch accepts either 'edits' or "
+                "'old_string'/'new_string', not both"
+            )
+        return tool_multi_edit(ctx, path, edits)
+
+    if old_string is None or new_string is None:
+        return (
+            "Error: apply_patch requires either 'edits' or both "
+            "'old_string' and 'new_string'. This alias does not parse "
+            "unified diff text."
+        )
+
+    return tool_edit_file(ctx, path, old_string, new_string, occurrence)
 
 
 def tool_edit_lines(

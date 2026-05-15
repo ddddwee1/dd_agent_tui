@@ -437,7 +437,12 @@ class AppHistoryMixin:
                 if result is None:
                     continue
                 diff_text = None
-                if name in ("edit_file", "edit_lines", "multi_edit"):
+                if name in (
+                    "apply_patch",
+                    "edit_file",
+                    "edit_lines",
+                    "multi_edit",
+                ):
                     head, sep, diff = result.partition("\n\n")
                     if sep and "@@" in diff:
                         diff_text = diff
@@ -475,7 +480,7 @@ class AppHistoryMixin:
             "- `Ctrl+C` 退出\n\n"
             "### 工具(模型可调用)\n"
             "`bash` `bash_start/check/wait/kill/list` "
-            "`read_file` `write_file` `edit_file` `edit_lines` `multi_edit` "
+            "`read_file` `write_file` `apply_patch` `edit_file` `edit_lines` `multi_edit` "
             "`list_files` `glob_files` `search_content` `web_fetch` `web_search` "
             "`todo_tool` `spawn_agent` `chat_agent` `await_agent` `end_agent`\n"
             "\n"
