@@ -19,7 +19,6 @@ from .config import (
     SUBAGENT_DEFAULT_AWAIT_TIMEOUT,
     SUBAGENT_IDLE_TIMEOUT_SEC,
     SUBAGENT_MAX_AWAIT_TIMEOUT,
-    SUBAGENT_MAX_TURNS,
     SUBAGENT_RESULT_MAX_CHARS,
 )
 from .state import TokenCounter
@@ -35,6 +34,111 @@ from .widgets import (
 
 
 class AppHistoryMixin:
+    async def _compact_messages(
+        self, messages: list[dict]
+    ) -> tuple[list[dict], dict]:
+        """Run /compact-style summarization on a list of messages and
+        return (new_messages, stats).
+
+        Leading system messages are kept verbatim; the last
+        COMPACT_KEEP_RECENT_TURNS user→assistant turns are kept verbatim;
+        everything in between is replaced by one summary system message
+        produced by a single `provider.complete_text` call.
+
+        Raises ValueError if there's nothing worth compacting (caller
+        should leave the source untouched and tell the user). Raises
+        any other exception from the summarizer (likewise — caller
+        leaves the source untouched).
+
+        Reused by the main /compact slash command and by the
+        subagent-only `compact_self` tool, so it must not touch UI or
+        `self.messages` directly.
+        """
+        prefix_end = 0
+        for i, m in enumerate(messages):
+            if m.get("role") == "system":
+                prefix_end = i + 1
+            else:
+                break
+        user_idxs = [
+            i for i, m in enumerate(messages)
+            if m.get("role") == "user"
+        ]
+        if len(user_idxs) <= COMPACT_KEEP_RECENT_TURNS:
+            raise ValueError(
+                f"对话还不够长，无需压缩（user 消息数 ≤ "
+                f"{COMPACT_KEEP_RECENT_TURNS}）。"
+            )
+        cut_at = user_idxs[-COMPACT_KEEP_RECENT_TURNS]
+        to_compact = messages[prefix_end:cut_at]
+        keep_recent = messages[cut_at:]
+        if not to_compact:
+            raise ValueError("没有可压缩的历史段。")
+
+        rendered = _render_history_for_summary(to_compact)
+        summary = await self.provider.complete_text(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个对话历史摘要助手。直接输出中文摘要，"
+                        "不要执行任何工具调用，不要回答用户问题，"
+                        "不要假装继续对话。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "下面是一段 agent 与用户的对话历史，需要被压缩成简明摘要，"
+                        "供后续轮次作为上下文使用。请按以下结构输出（用 markdown 标题）：\n"
+                        "## 用户目标\n"
+                        "## 已完成的工作\n"
+                        "## 阅读过的文档及其路径\n"
+                        "## 改动过的文件 / 关键决定\n"
+                        "## 悬而未决的问题或下一步\n\n"
+                        "要求：保留具体函数名、文件路径、行号等可定位的事实；"
+                        "不要复述完整代码、完整命令输出；"
+                        "不要遗漏待办事项。\n\n"
+                        f"---\n{rendered}\n---"
+                    ),
+                },
+            ],
+            self.model,
+            self.effort,
+        )
+        if not summary:
+            raise RuntimeError("摘要返回为空")
+
+        before_n = len(messages)
+        before_chars = sum(
+            len(m.get("content") or "") for m in messages
+        )
+        new_messages = (
+            messages[:prefix_end]
+            + [
+                {
+                    "role": "system",
+                    "content": (
+                        "# 历史摘要（来自 /compact，覆盖此前若干轮对话）\n\n"
+                        f"{summary}"
+                    ),
+                }
+            ]
+            + keep_recent
+        )
+        after_n = len(new_messages)
+        after_chars = sum(
+            len(m.get("content") or "") for m in new_messages
+        )
+        stats = {
+            "before_n": before_n,
+            "after_n": after_n,
+            "before_chars": before_chars,
+            "after_chars": after_chars,
+            "saved": max(0, before_chars - after_chars),
+        }
+        return new_messages, stats
+
     async def _compact_worker(self) -> None:
         """Replace the early portion of message history with a single
         summary message, leaving COMPACT_KEEP_RECENT_TURNS user→assistant
@@ -45,19 +149,13 @@ class AppHistoryMixin:
         """
         self._set_busy(True)
         try:
-            # Find the leading run of system messages — those are kept verbatim.
-            prefix_end = 0
-            for i, m in enumerate(self.messages):
-                if m.get("role") == "system":
-                    prefix_end = i + 1
-                else:
-                    break
-            user_idxs = [
-                i
-                for i, m in enumerate(self.messages)
-                if m.get("role") == "user"
-            ]
-            if len(user_idxs) <= COMPACT_KEEP_RECENT_TURNS:
+            # Cheap pre-check so we don't flash "compacting…" when
+            # there's nothing to do — the helper would raise
+            # ValueError but the spinner UX would be misleading.
+            user_count = sum(
+                1 for m in self.messages if m.get("role") == "user"
+            )
+            if user_count <= COMPACT_KEEP_RECENT_TURNS:
                 await self._mount_widget(
                     Static(Text(
                         f"对话还不够长，无需压缩（user 消息数 ≤ "
@@ -66,52 +164,20 @@ class AppHistoryMixin:
                     ))
                 )
                 return
-            cut_at = user_idxs[-COMPACT_KEEP_RECENT_TURNS]
-            to_compact = self.messages[prefix_end:cut_at]
-            keep_recent = self.messages[cut_at:]
-            if not to_compact:
-                await self._mount_widget(
-                    Static(Text("没有可压缩的历史段。", style="dim"))
-                )
-                return
 
             await self._mount_widget(
                 Static(Text("📦 正在压缩历史…", style="bold cyan"))
             )
 
-            rendered = _render_history_for_summary(to_compact)
             try:
-                summary = await self.provider.complete_text(
-                    [
-                        {
-                            "role": "system",
-                            "content": (
-                                "你是一个对话历史摘要助手。直接输出中文摘要，"
-                                "不要执行任何工具调用，不要回答用户问题，"
-                                "不要假装继续对话。"
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "下面是一段 agent 与用户的对话历史，需要被压缩成简明摘要，"
-                                "供后续轮次作为上下文使用。请按以下结构输出（用 markdown 标题）：\n"
-                                "## 用户目标\n"
-                                "## 已完成的工作\n"
-                                "## 改动过的文件 / 关键决定\n"
-                                "## 悬而未决的问题或下一步\n\n"
-                                "要求：保留具体函数名、文件路径、行号等可定位的事实；"
-                                "不要复述完整代码、完整命令输出；"
-                                "不要遗漏待办事项。\n\n"
-                                f"---\n{rendered}\n---"
-                            ),
-                        },
-                    ],
-                    self.model,
-                    self.effort,
+                new_messages, stats = await self._compact_messages(
+                    self.messages
                 )
-                if not summary:
-                    raise RuntimeError("摘要返回为空")
+            except ValueError as e:
+                await self._mount_widget(
+                    Static(Text(str(e), style="dim"))
+                )
+                return
             except Exception as e:
                 await self._mount_widget(
                     Static(Text(
@@ -121,32 +187,11 @@ class AppHistoryMixin:
                 )
                 return
 
-            before_n = len(self.messages)
-            before_chars = sum(
-                len(m.get("content") or "") for m in self.messages
-            )
-            self.messages = (
-                self.messages[:prefix_end]
-                + [
-                    {
-                        "role": "system",
-                        "content": (
-                            "# 历史摘要（来自 /compact，覆盖此前若干轮对话）\n\n"
-                            f"{summary}"
-                        ),
-                    }
-                ]
-                + keep_recent
-            )
-            after_n = len(self.messages)
-            after_chars = sum(
-                len(m.get("content") or "") for m in self.messages
-            )
-            saved = max(0, before_chars - after_chars)
+            self.messages = new_messages
             await self._mount_widget(
                 Static(Text(
-                    f"📦 已压缩：{before_n} → {after_n} 条消息，"
-                    f"约 -{saved:,} 字符（保留最近 "
+                    f"📦 已压缩：{stats['before_n']} → {stats['after_n']} 条消息，"
+                    f"约 -{stats['saved']:,} 字符（保留最近 "
                     f"{COMPACT_KEEP_RECENT_TURNS} 轮原文）",
                     style="bold cyan",
                 ))
@@ -326,6 +371,11 @@ class AppHistoryMixin:
         view = self.query_one("#conversation", VerticalScroll)
         for child in list(view.children):
             child.remove()
+        # /load wipes the view, so any marker we had on the prior
+        # conversation is gone — drop the bookkeeping or the next fold
+        # would try to extend a stale, removed marker.
+        self._collapsed_widgets.clear()
+        self._history_marker = None
         try:
             tray = self.query_one("#pending", Vertical)
             for child in list(tray.children):
@@ -474,7 +524,9 @@ class AppHistoryMixin:
             "- `Cmd+Enter` 实时插话 steer（需 iTerm2 把 ⌘Return 转义为 CSI u；"
             "macOS 自带 Terminal.app 不支持，先 Option+Enter 换行后再 Enter 也可）\n"
             "- `ESC × 2` 中断当前任务\n"
-            "- `Ctrl+X` 取消队列 / steer\n"
+            "- `Ctrl+X` 取消所有队列 / steer\n"
+            "- 鼠标点击输入框上方的排队/steer 气泡 → 编辑或删除该条"
+            "（Ctrl+S 保存 · Ctrl+D 删除 · Esc 取消）\n"
             "- `Ctrl+T` 展开 / 折叠所有思考块\n"
             "- `Ctrl+L` 清空对话\n"
             "- `Ctrl+C` 退出\n\n"
@@ -492,9 +544,8 @@ class AppHistoryMixin:
             f"释放。并发用法：一次发多个 `spawn_agent` → 自己继续做别的事 "
             f"→ 用 `await_agent` 分别收。\n"
             f"\n"
-            f"上限：单轮内部最多 {SUBAGENT_MAX_TURNS} 个 LLM 循环；返回截断 "
-            f"{SUBAGENT_RESULT_MAX_CHARS:,} 字符；同时存活会话上限 "
-            f"{MAX_LIVE_SUBAGENTS} 个；闲置 {SUBAGENT_IDLE_TIMEOUT_SEC // 60} "
+            f"上限：返回截断 {SUBAGENT_RESULT_MAX_CHARS:,} 字符；同时存活会话 "
+            f"上限 {MAX_LIVE_SUBAGENTS} 个；闲置 {SUBAGENT_IDLE_TIMEOUT_SEC // 60} "
             f"分钟自动回收。子 agent 不能嵌套子 agent；token 计入主对话。\n"
         )
         await self._mount_widget(Static(Markdown(md)))

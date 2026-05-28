@@ -8,15 +8,16 @@ import time
 
 from .app_support import _merge_tool_call_delta, load_agents_md
 from .config import (
+    COMPACT_KEEP_RECENT_TURNS,
     MAX_LIVE_SUBAGENTS,
     POST_SYSTEM_PROMPT,
     SUBAGENT_DEFAULT_AWAIT_TIMEOUT,
     SUBAGENT_MAX_AWAIT_TIMEOUT,
-    SUBAGENT_MAX_TURNS,
     SYSTEM_PROMPT,
 )
 from .state import SubagentSession, ToolContext, kill_all_bash_jobs
 from .tools import TOOLS, execute_tool
+from .widgets import SubagentTabPane
 
 
 class AppSubagentMixin:
@@ -26,29 +27,48 @@ class AppSubagentMixin:
         text.
 
         Caller is responsible for having appended the user message to
-        sess.messages before calling. SUBAGENT_MAX_TURNS bounds the
-        inner loop *per round* — a wedged or looping subagent can't
-        burn unbounded tokens before control returns to the parent.
+        sess.messages before calling. No internal turn cap — a wedged
+        or looping subagent will keep burning tokens until the user
+        cancels via end_agent / /clear (or ESC×2 on the parent if the
+        parent is currently awaiting). The idle reaper, MAX_LIVE_SUB-
+        AGENTS, and SUBAGENT_RESULT_MAX_CHARS still apply as soft
+        guards.
 
         Phase transitions: thinking → (answering | tool)* → idle on
-        success, error on stream failure or turn-cap. last_active_at
-        is bumped in `finally` so the idle reaper sees the right time
-        even on the cancelled / errored paths.
+        success, error on stream failure. last_active_at is bumped in
+        `finally` so the idle reaper sees the right time even on the
+        cancelled / errored paths.
 
+        Streams reasoning/content tokens into `sess.pane` as they
+        arrive (mirroring the main `_stream_one` UX), and mounts the
+        ToolCallBlock for each tool call live so the user sees
+        execution start without waiting for the 1 Hz fallback refresh.
         `reasoning_content` is preserved on every assistant message —
         DeepSeek thinking-mode 400s if it's missing on the next call.
         """
-        last_content = ""
-        base_turn = sess.turn
+        pane = sess.pane
         try:
-            for inner in range(SUBAGENT_MAX_TURNS):
-                sess.turn = base_turn + inner + 1
+            while True:
+                sess.turn += 1
                 sess.phase = "thinking"
                 sess.last_tool = None
                 content = ""
                 reasoning = ""
                 tool_calls: dict[int, dict] = {}
                 final_usage = None
+                thinking_started = False
+                answer_started = False
+
+                # Render any newly-appended user message (spawn prompt
+                # or chat_agent follow-up) BEFORE live thinking mounts,
+                # so DOM order in the pane stays user → thinking →
+                # answer → tools.
+                if pane is not None:
+                    try:
+                        pane.refresh_from_session()
+                    except Exception:
+                        pass
+
                 try:
                     async for event in self.provider.stream(
                         sess.messages,
@@ -60,14 +80,32 @@ class AppSubagentMixin:
                             final_usage = event.usage
                         if event.reasoning:
                             reasoning += event.reasoning
+                            if pane is not None:
+                                if not thinking_started:
+                                    pane.start_thinking()
+                                    thinking_started = True
+                                pane.append_thinking(event.reasoning)
                         if event.content:
                             content += event.content
                             sess.phase = "answering"
+                            if pane is not None:
+                                if not answer_started:
+                                    pane.start_answer()
+                                    answer_started = True
+                                pane.append_answer(event.content)
                         if event.tool_call is not None:
                             _merge_tool_call_delta(tool_calls, event.tool_call)
                             sess.phase = "answering"
                 except Exception as e:
                     sess.phase = "error"
+                    if pane is not None:
+                        try:
+                            pane.remove_live_blocks()
+                            pane.mount_exception_notice(
+                                f"⛔ stream failed: {type(e).__name__}: {e}"
+                            )
+                        except Exception:
+                            pass
                     return f"❌ subagent stream failed: {e}"
 
                 # Roll subagent usage into parent counter so the status
@@ -77,9 +115,24 @@ class AppSubagentMixin:
                 if final_usage is not None:
                     sess.tokens_in += getattr(final_usage, "prompt_tokens", 0) or 0
                     sess.tokens_out += getattr(final_usage, "completion_tokens", 0) or 0
+                    # Track THIS call's prompt tokens (not cumulative) so
+                    # the sidebar + await_agent gauge reflects how full
+                    # the next request would be.
+                    sess.last_prompt_tokens = (
+                        getattr(final_usage, "prompt_tokens", 0) or 0
+                    )
                 self._refresh_status()
 
-                last_content = content
+                # Finalize the live widgets — counter.last_reasoning was
+                # just bumped by counter.add(final_usage) above, so it
+                # carries THIS round's reasoning token count.
+                if pane is not None:
+                    try:
+                        pane.finalize_thinking(self.counter.last_reasoning)
+                        pane.finalize_answer()
+                    except Exception:
+                        pass
+
                 msg: dict = {"role": "assistant", "content": content}
                 if reasoning:
                     # Mandatory for DeepSeek thinking mode on the next
@@ -90,6 +143,8 @@ class AppSubagentMixin:
                         tool_calls[i] for i in sorted(tool_calls)
                     ]
                 sess.messages.append(msg)
+                if pane is not None:
+                    pane.mark_round_committed()
 
                 if not tool_calls:
                     # Final answer for THIS round. Session stays alive
@@ -105,8 +160,27 @@ class AppSubagentMixin:
                     try:
                         args = json.loads(raw)
                     except json.JSONDecodeError:
+                        if pane is not None:
+                            try:
+                                pane.add_tool_block(
+                                    tc["id"], name, {"_raw": raw}
+                                )
+                            except Exception:
+                                pass
                         result = f"Error: bad JSON args: {raw}"
+                        if pane is not None:
+                            try:
+                                pane.set_tool_result(
+                                    tc["id"], result, blocked=True
+                                )
+                            except Exception:
+                                pass
                     else:
+                        if pane is not None:
+                            try:
+                                pane.add_tool_block(tc["id"], name, args)
+                            except Exception:
+                                pass
                         if name in (
                             "spawn_agent", "chat_agent",
                             "await_agent", "end_agent",
@@ -117,6 +191,51 @@ class AppSubagentMixin:
                                 f"Error: subagents cannot call {name} "
                                 "(no nested subagents)."
                             )
+                            if pane is not None:
+                                try:
+                                    pane.set_tool_result(
+                                        tc["id"], result, blocked=True
+                                    )
+                                except Exception:
+                                    pass
+                        elif name == "compact_self":
+                            # Subagent-only meta-tool: rewrite the
+                            # session's own messages with a summary.
+                            # Reuses _compact_messages from
+                            # AppHistoryMixin so /compact and
+                            # compact_self share the exact same prompt
+                            # / cut policy. No tool_confirm — this only
+                            # mutates in-process memory, no files /
+                            # shell side effects.
+                            try:
+                                new_messages, stats = (
+                                    await self._compact_messages(
+                                        sess.messages
+                                    )
+                                )
+                            except ValueError as e:
+                                result = f"Error: {e}"
+                            except Exception as e:
+                                result = (
+                                    f"Error: compact_self failed: "
+                                    f"{type(e).__name__}: {e}"
+                                )
+                            else:
+                                sess.messages = new_messages
+                                result = (
+                                    f"已压缩：{stats['before_n']} → "
+                                    f"{stats['after_n']} 条消息，约 "
+                                    f"-{stats['saved']:,} 字符（保留最近 "
+                                    f"{COMPACT_KEEP_RECENT_TURNS} 轮原文）。"
+                                )
+                            if pane is not None:
+                                try:
+                                    pane.set_tool_result(
+                                        tc["id"], result,
+                                        blocked=result.startswith("Error"),
+                                    )
+                                except Exception:
+                                    pass
                         else:
                             allowed = await self.tool_confirm(name, args)
                             if allowed:
@@ -134,20 +253,37 @@ class AppSubagentMixin:
                                     head, sep, diff = result.partition("\n\n")
                                     if sep and "@@" in diff:
                                         result = head
+                                if pane is not None:
+                                    try:
+                                        pane.set_tool_result(tc["id"], result)
+                                    except Exception:
+                                        pass
                             else:
                                 result = "Tool execution blocked by user policy / confirmation dialog."
+                                if pane is not None:
+                                    try:
+                                        pane.set_tool_result(
+                                            tc["id"], result, blocked=True
+                                        )
+                                    except Exception:
+                                        pass
                     sess.messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "content": result,
                     })
-
-            sess.phase = "error"
-            return (
-                f"⚠ subagent reached the {SUBAGENT_MAX_TURNS}-turn "
-                f"per-round cap without a final answer. Last partial "
-                f"assistant text:\n\n{last_content}"
-            )
+                    if pane is not None:
+                        pane.mark_round_committed()
+        except asyncio.CancelledError:
+            # Pane is usually being torn down (/clear, end_agent), but
+            # clean up live widgets defensively so a survivor pane
+            # doesn't show a forever-streaming ThinkingBlock.
+            if pane is not None:
+                try:
+                    pane.remove_live_blocks()
+                except Exception:
+                    pass
+            raise
         finally:
             # Idle / error are terminal-for-this-round; anything else
             # (cancelled, unexpected exit) becomes "error" so the panel
@@ -255,6 +391,21 @@ class AppSubagentMixin:
             ctx=sub_ctx,
             sub_tools=sub_tools,
         )
+        # Resolve the model's context window once so the sidebar +
+        # await_agent return can render a ctx% gauge. None if the
+        # provider doesn't know (we just skip the gauge in that case).
+        try:
+            sess.context_limit = self.provider.context_limit_for_model(
+                self.model
+            )
+        except Exception:
+            sess.context_limit = None
+        # Construct the pane synchronously so the round task can push
+        # live widgets into it via sess.pane the moment the first
+        # stream chunk arrives — before _add_sub_tab finishes mounting
+        # the TabPane into TabbedContent (the pane buffers via
+        # _pending_mounts until on_mount flushes them).
+        sess.pane = SubagentTabPane(sess)
         sess.task = asyncio.create_task(self._run_subagent_task(sess))
         self._live_subagents[sub_id] = sess
         # Top-level tab for the new session — read-only transcript;
@@ -359,6 +510,17 @@ class AppSubagentMixin:
         if sess.phase == "ready":
             sess.phase = "idle"
         sess.last_active_at = time.monotonic()
+        # Prefix the result with a context-usage hint so the parent
+        # can decide whether to chat_agent the subagent into a
+        # compact_self call before the next round. Skipped when the
+        # provider doesn't expose a context_limit.
+        if sess.context_limit and sess.last_prompt_tokens:
+            pct = sess.last_prompt_tokens * 100.0 / sess.context_limit
+            header = (
+                f"[session_id={sid}, ctx={pct:.0f}% "
+                f"({sess.last_prompt_tokens:,}/{sess.context_limit:,})]\n"
+            )
+            return header + result
         return result
 
     def _end_subagent(self, sid: str) -> str:

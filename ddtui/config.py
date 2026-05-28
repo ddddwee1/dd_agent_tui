@@ -111,10 +111,6 @@ COMPACT_KEEP_RECENT_TURNS = 2
 
 # ───────── subagent ─────────
 
-# Cap on the number of LLM rounds inside ONE spawn_agent / chat_agent
-# call (i.e. per parent-visible round). Keeps a wedged or looping
-# subagent from burning unbounded tokens before control returns.
-SUBAGENT_MAX_TURNS = 30
 # Truncate the subagent's answer before it lands as a tool_result in
 # the parent — a chatty subagent shouldn't be able to blow out the
 # parent's context window in one shot.
@@ -138,6 +134,19 @@ SUBAGENT_REAP_INTERVAL_SEC = 60
 # cover most subagent rounds without bouncing back to "still running".
 SUBAGENT_DEFAULT_AWAIT_TIMEOUT = 60
 SUBAGENT_MAX_AWAIT_TIMEOUT = 600
+
+
+# ───────── conversation view ─────────
+
+# Long conversations pile up widgets in #conversation; Textual lays out
+# every visible child each refresh, so >100 mounted bubbles/tool-blocks
+# noticeably slow scroll + streaming. After each turn finishes we hide
+# (display=False) the oldest widgets until only COLLAPSED_HISTORY_KEEP
+# remain visible, mounting a single CollapsedHistoryMarker the user can
+# click to restore everything at once. Underlying message history
+# (self.messages) is untouched — only the rendered widget tree shrinks.
+MAX_VISIBLE_HISTORY = 80
+COLLAPSED_HISTORY_KEEP = 40
 
 
 # ───────── safety ─────────
@@ -187,4 +196,7 @@ SYSTEM_PROMPT = (
 # AGENTS.md. Use it for global guidance that should win over project-level
 # AGENTS.md (since later system messages take precedence in practice).
 # Empty string → not added to the message list.
-POST_SYSTEM_PROMPT = "请使用中文思考，用户可以看见思考过程，所以请使用中文思考，无论AGENTS.md是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。如果发现自己在用英文思考，请提醒自己，并立即切回中文。"
+POST_SYSTEM_PROMPT = "请使用中文思考，用户可以看见思考过程，所以请使用中文思考，无论前面的prompt是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。请使用中文思考，无论后续文件是以什么语言写的。如果发现自己在用英文思考，请提醒自己，并立即切回中文。 "
+POST_SYSTEM_PROMPT += "解决问题的思路 - 化整为零：将大问题拆分为多个小问题，将复杂问题分为多个简单单元的拼装。于是，你可以对多个小单元进行逐个测试，在保证每个单元都正常执行的情况下，再进行顺序拼接。"
+POST_SYSTEM_PROMPT += "第一性原理：将大问题化为多个小问题，将复杂问题分为多个简单单元的拼装。"
+POST_SYSTEM_PROMPT += "查询文档的思路 - 深度优先：先快速浏览目录结构，找到最相关的章节，再深入阅读细节。不要吝啬于查文档，即使你觉得自己已经知道了；文档里往往有重要细节和示例，能帮你避免走弯路。"

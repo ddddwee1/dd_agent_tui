@@ -144,6 +144,12 @@ class SubagentSession:
     last_tool: str | None = None
     tokens_in: int = 0       # cumulative prompt tokens for this subagent
     tokens_out: int = 0      # cumulative completion tokens
+    # Most recent call's prompt_tokens and the model's context window
+    # so the sidebar can render a ctx% gauge and await_agent can prefix
+    # its return with the same number — that's what tells the parent
+    # when to chat_agent the subagent into a compact_self call.
+    last_prompt_tokens: int = 0
+    context_limit: int | None = None
     # asyncio.Task running the current round; None between rounds.
     # Set by spawn_agent / chat_agent, cleared in the task wrapper's
     # `finally`. Cancelled by end_agent / action_clear_chat.
@@ -152,6 +158,12 @@ class SubagentSession:
     # consume. None means "no result pending" (already consumed, or
     # task still running with nothing to return yet).
     last_result: str | None = None
+    # SubagentTabPane the round runner streams thinking/answer/tool
+    # widgets into. Constructed synchronously in _spawn_subagent so the
+    # ref exists before the first stream chunk arrives; mounted into the
+    # TabbedContent shortly after via call_later. None during /load
+    # restores (we don't persist subagent state).
+    pane: "SubagentTabPane | None" = None
 
 
 class TokenCounter:

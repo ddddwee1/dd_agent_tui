@@ -22,6 +22,13 @@ from .widgets import (
     UserBubble,
 )
 
+# compact_self is a subagent-only meta-tool: the parent has its own
+# /compact slash command and shouldn't see compact_self in the
+# advertised tool list. Filtered once at import.
+PARENT_TOOLS = [
+    t for t in TOOLS if t["function"]["name"] != "compact_self"
+]
+
 
 class AppAgentLoopMixin:
     async def _agent_turn(self, user_text: str) -> None:
@@ -81,6 +88,13 @@ class AppAgentLoopMixin:
             except Exception:
                 pass
             self._refresh_status()
+            # Fold older widgets out of layout once the turn is fully
+            # quiescent. Doing it here (not mid-stream) keeps the view
+            # stable while the model is talking.
+            try:
+                await self._maybe_collapse_history()
+            except Exception:
+                pass
 
     async def _run_one_turn(self) -> bool:
         """Inner loop: one user→assistant→(tools→assistant)+ turn.
@@ -165,6 +179,28 @@ class AppAgentLoopMixin:
                                     "content": result,
                                 }
                             )
+                            continue
+
+                        if name == "compact_self":
+                            # Defense in depth — PARENT_TOOLS already
+                            # hides this from the parent, but a model
+                            # may recall it from elsewhere. Redirect
+                            # to the user-facing /compact command
+                            # rather than silently failing.
+                            block = ToolCallBlock(name, args)
+                            await self._mount_widget(block)
+                            result = (
+                                "Error: compact_self is a subagent-only "
+                                "tool. The main agent should compress "
+                                "history via the /compact slash command "
+                                "(user-triggered), not as a tool call."
+                            )
+                            block.set_result(result, blocked=True)
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result,
+                            })
                             continue
 
                         if name in (
@@ -289,7 +325,7 @@ class AppAgentLoopMixin:
         try:
             async for event in self.provider.stream(
                 self.messages,
-                TOOLS,
+                PARENT_TOOLS,
                 self.model,
                 self.effort,
             ):

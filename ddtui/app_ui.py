@@ -8,10 +8,17 @@ from rich.text import Text
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Static, TabbedContent, TabPane
 
-from .config import SUBAGENT_IDLE_TIMEOUT_SEC, SUBAGENT_REAP_INTERVAL_SEC
+from .config import (
+    COLLAPSED_HISTORY_KEEP,
+    MAX_VISIBLE_HISTORY,
+    SUBAGENT_IDLE_TIMEOUT_SEC,
+    SUBAGENT_REAP_INTERVAL_SEC,
+)
 from .state import SubagentSession, kill_all_bash_jobs
 from .widgets import (
     BgJobsBlock,
+    CollapsedHistoryMarker,
+    EditPendingScreen,
     MultilineInput,
     StatusBar,
     SteerBubble,
@@ -182,7 +189,13 @@ class AppUiMixin:
         """Mount a TabPane(SubagentTabPane) for this session as a
         top-level tab. Pane id mirrors the session id ('tab-sub-N')
         so removal is straightforward. Idempotent: if a pane with
-        the same id already exists (shouldn't, but defensive), skip."""
+        the same id already exists (shouldn't, but defensive), skip.
+
+        Uses the SubagentTabPane that `_spawn_subagent` already
+        constructed and attached to `sess.pane`, so any live widgets
+        the round task queued during the call_later window flush in
+        on_mount once we mount the TabPane below.
+        """
         try:
             tabs = self.query_one("#tabs", TabbedContent)
         except Exception:
@@ -194,7 +207,10 @@ class AppUiMixin:
             existing = None
         if existing is not None:
             return
-        pane = TabPane(sess.id, SubagentTabPane(sess), id=pane_id)
+        inner = sess.pane if sess.pane is not None else SubagentTabPane(sess)
+        if sess.pane is None:
+            sess.pane = inner
+        pane = TabPane(sess.id, inner, id=pane_id)
         await tabs.add_pane(pane)
 
     async def _remove_sub_tab(self, sid: str) -> None:
@@ -253,6 +269,11 @@ class AppUiMixin:
         view = self.query_one("#conversation", VerticalScroll)
         for child in list(view.children):
             child.remove()
+        # The marker + the display=False widgets it tracked were just
+        # removed by the children sweep above; drop our references so
+        # the next fold starts fresh.
+        self._collapsed_widgets.clear()
+        self._history_marker = None
         # Defensive: if anything else got into #pending out of band,
         # nuke it too — _drop_{queue,steer} only knows about widgets
         # it tracked via _queued/_steer.
@@ -335,6 +356,50 @@ class AppUiMixin:
         except Exception:
             return
         self._follow_bottom = scroll_y + 1 >= view.max_scroll_y
+
+    def action_copy_selection(self) -> None:
+        """Ctrl+C: copy the current selection to the system clipboard.
+
+        Two selection sources, checked in order:
+
+        1. Screen-wide widget selection — what the user dragged out of
+           a Static/Markdown bubble in the conversation. Cleared after
+           copy so the highlight goes away.
+        2. The input box's own TextArea selection.
+
+        Copy is delivered via App.copy_to_clipboard, which writes an
+        OSC 52 escape. iTerm2 requires Preferences → General → Selection
+        → "Applications in terminal may access clipboard" to actually
+        put the text on the system pasteboard; the notify() line lets
+        the user tell whether the copy fired even if iTerm2 swallowed
+        the escape.
+
+        With nothing selected, surface a hint about Ctrl+Q rather than
+        exit silently — Ctrl+C used to quit, so muscle-memory presses
+        should land on a visible "did nothing" instead of a no-op.
+        """
+        try:
+            sel = self.screen.get_selected_text()
+        except Exception:
+            sel = None
+        if sel:
+            self.copy_to_clipboard(sel)
+            try:
+                self.screen.clear_selection()
+            except Exception:
+                pass
+            self.notify(f"已复制 {len(sel)} 字符到剪贴板", timeout=2)
+            return
+        try:
+            inp = self.query_one("#user-input", MultilineInput)
+            ta_sel = inp.selected_text
+        except Exception:
+            ta_sel = ""
+        if ta_sel:
+            self.copy_to_clipboard(ta_sel)
+            self.notify(f"已复制 {len(ta_sel)} 字符到剪贴板", timeout=2)
+            return
+        self.notify("没有选中文本可复制（退出请用 Ctrl+Q）", timeout=2)
 
     def action_toggle_thinking(self) -> None:
         """Fold every ThinkingBlock if any is currently expanded; else
@@ -456,7 +521,11 @@ class AppUiMixin:
             view.scroll_end(animate=False)
 
     async def _mount_pending(self, widget) -> None:
-        """Mount a bubble into the #pending tray above the input box."""
+        """Mount a bubble into the #pending tray above the input box.
+        The `pending` class arms the bubble's on_click → EditRequested
+        path; bubbles that later get migrated into #conversation are
+        re-created without the class, so only the parked copies are
+        editable."""
         try:
             tray = self.query_one("#pending", Vertical)
         except Exception:
@@ -464,7 +533,150 @@ class AppUiMixin:
             # missing for some reason — better than dropping the bubble.
             await self._mount_widget(widget)
             return
+        try:
+            widget.add_class("pending")
+        except Exception:
+            pass
         await tray.mount(widget)
+
+    def on_user_bubble_edit_requested(
+        self, event: "UserBubble.EditRequested"
+    ) -> None:
+        self._open_pending_edit(event.bubble, kind="queue")
+
+    def on_steer_bubble_edit_requested(
+        self, event: "SteerBubble.EditRequested"
+    ) -> None:
+        self._open_pending_edit(event.bubble, kind="steer")
+
+    def _open_pending_edit(self, bubble, kind: str) -> None:
+        """Look up `bubble` in the matching pending list and push the
+        edit modal. If the bubble has already been consumed by the turn
+        between click and dispatch, silently ignore — there's nothing
+        to edit anymore."""
+        target_list = self._queued if kind == "queue" else self._steer
+        entry = next(
+            ((i, t) for i, (t, w) in enumerate(target_list) if w is bubble),
+            None,
+        )
+        if entry is None:
+            return
+        _, original = entry
+
+        def on_close(result: dict | None) -> None:
+            if result is None:
+                return
+            # Re-resolve the index: the turn loop may have popped this
+            # entry while the modal was open. Bail out cleanly if so.
+            idx = next(
+                (
+                    j
+                    for j, (_, w) in enumerate(target_list)
+                    if w is bubble
+                ),
+                None,
+            )
+            if idx is None:
+                self.notify("该条已被消费，无需编辑", timeout=2.0)
+                return
+            action = result.get("action")
+            if action == "delete":
+                target_list.pop(idx)
+                try:
+                    bubble.remove()
+                except Exception:
+                    pass
+                self._refresh_status()
+                tag = "steer" if kind == "steer" else "排队消息"
+                self.notify(f"已删除 1 条{tag}", timeout=2.0)
+            elif action == "save":
+                new_text = result.get("text", "")
+                target_list[idx] = (new_text, bubble)
+                try:
+                    bubble.set_text(new_text)
+                except Exception:
+                    pass
+
+        self.push_screen(EditPendingScreen(original, kind), on_close)
+
+    async def _maybe_collapse_history(self) -> None:
+        """If #conversation has too many visible children, hide the
+        oldest with display=False and surface a CollapsedHistoryMarker
+        the user can click to restore them. Called from the agent
+        turn's finally block — never mid-stream — so the user doesn't
+        watch widgets vanish while reading. Idempotent: re-folding just
+        extends the existing marker's count."""
+        try:
+            view = self.query_one("#conversation", VerticalScroll)
+        except Exception:
+            return
+        # Skip the marker itself; only count real history children.
+        visible = [
+            c for c in view.children
+            if c is not self._history_marker and c.display
+        ]
+        if len(visible) <= MAX_VISIBLE_HISTORY:
+            return
+        cut = len(visible) - COLLAPSED_HISTORY_KEEP
+        to_collapse = visible[:cut]
+        for w in to_collapse:
+            try:
+                w.display = False
+            except Exception:
+                continue
+            self._collapsed_widgets.append(w)
+        # First-ever fold: mount the marker immediately before the
+        # first widget that's still visible so it reads as "everything
+        # above this line is collapsed". Subsequent folds reuse the
+        # existing marker (Textual lets a display=False sibling sit
+        # between the marker and the new first-visible without any
+        # visual gap).
+        if self._history_marker is None or not self._history_marker.is_mounted:
+            self._history_marker = CollapsedHistoryMarker()
+            anchor = next(
+                (c for c in view.children if c.display), None
+            )
+            try:
+                if anchor is not None:
+                    await view.mount(self._history_marker, before=anchor)
+                else:
+                    await view.mount(self._history_marker)
+            except Exception:
+                # Marker mount failed — abort folding so we don't leak
+                # display=False widgets with no way to restore them.
+                for w in to_collapse:
+                    try:
+                        w.display = True
+                    except Exception:
+                        pass
+                    if self._collapsed_widgets and self._collapsed_widgets[-1] is w:
+                        self._collapsed_widgets.pop()
+                self._history_marker = None
+                return
+        self._history_marker.set_count(len(self._collapsed_widgets))
+
+    def on_collapsed_history_marker_expand_requested(
+        self, event: "CollapsedHistoryMarker.ExpandRequested"
+    ) -> None:
+        """Marker clicked → restore every widget we've hidden so far
+        and drop the marker. Restoration cost is exactly what the
+        original render would have been — fine because the user
+        explicitly asked for it."""
+        n = len(self._collapsed_widgets)
+        for w in self._collapsed_widgets:
+            try:
+                w.display = True
+            except Exception:
+                pass
+        self._collapsed_widgets.clear()
+        if self._history_marker is not None:
+            try:
+                self._history_marker.remove()
+            except Exception:
+                pass
+            self._history_marker = None
+        if n:
+            self.notify(f"已展开 {n} 条折叠历史", timeout=2.0)
 
     def _drop_queue(self) -> int:
         """Remove every parked queue bubble and clear _queued. Returns

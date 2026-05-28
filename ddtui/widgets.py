@@ -19,9 +19,10 @@ from rich.console import Group, RenderableType
 from rich.markdown import Markdown
 from rich.text import Text
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Collapsible, Static, TextArea
+from textual.screen import ModalScreen
+from textual.widgets import Button, Collapsible, Static, TextArea
 
 from .state import BgJob, SubagentSession, TokenCounter, bg_job_status
 
@@ -35,13 +36,48 @@ class UserBubble(Static):
         padding: 0 1;
         border-left: thick #89b4fa;
     }
+    UserBubble.pending {
+        border-left: thick #74c7ec;
+    }
+    UserBubble.pending:hover {
+        background: #45324d;
+    }
     """
 
+    class EditRequested(Message):
+        """Posted when a *pending* bubble is clicked, so the App can
+        open the edit/delete modal. Plain (already-sent) bubbles do not
+        carry the `pending` class and won't post this."""
+
+        def __init__(self, bubble: "UserBubble") -> None:
+            self.bubble = bubble
+            super().__init__()
+
     def __init__(self, text: str) -> None:
+        self._text = text
+        super().__init__(self._render_label(text))
+
+    @staticmethod
+    def _render_label(text: str) -> Text:
         t = Text()
         t.append("you  ", style="bold blue")
         t.append(text)
-        super().__init__(t)
+        return t
+
+    def set_text(self, text: str) -> None:
+        """Re-render with new text. Used by the edit-modal callback so
+        the parked bubble stays in place but reflects the new content."""
+        self._text = text
+        self.update(self._render_label(text))
+
+    @property
+    def text_value(self) -> str:
+        return self._text
+
+    def on_click(self, event) -> None:
+        if self.has_class("pending"):
+            self.post_message(self.EditRequested(self))
+            event.stop()
 
 
 class SteerBubble(Static):
@@ -56,13 +92,195 @@ class SteerBubble(Static):
         padding: 0 1;
         border-left: thick #f9e2af;
     }
+    SteerBubble.pending:hover {
+        background: #45324d;
+    }
     """
 
+    class EditRequested(Message):
+        def __init__(self, bubble: "SteerBubble") -> None:
+            self.bubble = bubble
+            super().__init__()
+
     def __init__(self, text: str) -> None:
+        self._text = text
+        super().__init__(self._render_label(text))
+
+    @staticmethod
+    def _render_label(text: str) -> Text:
         t = Text()
         t.append("⚡ steer  ", style="bold #f9e2af")
         t.append(text)
-        super().__init__(t)
+        return t
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self.update(self._render_label(text))
+
+    @property
+    def text_value(self) -> str:
+        return self._text
+
+    def on_click(self, event) -> None:
+        if self.has_class("pending"):
+            self.post_message(self.EditRequested(self))
+            event.stop()
+
+
+class EditPendingScreen(ModalScreen[dict | None]):
+    """Modal for editing or deleting a parked queue/steer bubble.
+
+    Dismiss payload:
+      * ``{"action": "save", "text": <new>}`` — replace the entry
+      * ``{"action": "delete"}``                — drop the entry
+      * ``None``                                — user cancelled
+
+    Empty save-text collapses to delete so the caller doesn't have to
+    handle the "saved blank" edge case.
+    """
+
+    BINDINGS = [
+        Binding("escape", "do_cancel", show=False),
+        Binding("ctrl+s", "do_save", show=False, priority=True),
+        Binding("ctrl+d", "do_delete", show=False, priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    EditPendingScreen {
+        align: center middle;
+    }
+    #edit-dialog {
+        width: 80%;
+        max-width: 100;
+        height: auto;
+        padding: 1 2;
+        background: #1e1e2e;
+        border: thick #74c7ec;
+    }
+    #edit-dialog.steer {
+        border: thick #f9e2af;
+    }
+    #edit-title {
+        height: auto;
+        margin: 0 0 1 0;
+    }
+    #edit-input {
+        height: 10;
+        min-height: 5;
+        max-height: 20;
+        margin: 0 0 1 0;
+    }
+    #edit-buttons {
+        height: 3;
+        align-horizontal: right;
+    }
+    #edit-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, original: str, kind: str) -> None:
+        self._original = original
+        # "queue" or "steer" — drives title + border colour only.
+        self._kind = kind
+        super().__init__()
+
+    def compose(self):
+        dialog_classes = "steer" if self._kind == "steer" else ""
+        with Vertical(id="edit-dialog", classes=dialog_classes):
+            title = Text()
+            if self._kind == "steer":
+                title.append("⚡ 编辑 steer", style="bold #f9e2af")
+            else:
+                title.append("📋 编辑排队消息", style="bold #74c7ec")
+            title.append(
+                "   ·   Ctrl+S 保存   Ctrl+D 删除   Esc 取消",
+                style="dim",
+            )
+            yield Static(title, id="edit-title")
+            yield TextArea(self._original, id="edit-input")
+            with Horizontal(id="edit-buttons"):
+                yield Button("删除", variant="error", id="btn-delete")
+                yield Button("取消", id="btn-cancel")
+                yield Button("保存", variant="primary", id="btn-save")
+
+    def on_mount(self) -> None:
+        ta = self.query_one("#edit-input", TextArea)
+        ta.focus()
+        # Park the cursor at the end so the user can keep typing without
+        # first having to navigate past the prefilled text.
+        try:
+            last_line = ta.document.line_count - 1
+            last_col = len(ta.document.get_line(last_line))
+            ta.move_cursor((last_line, last_col))
+        except Exception:
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "btn-save":
+            self.action_do_save()
+        elif bid == "btn-delete":
+            self.dismiss({"action": "delete"})
+        elif bid == "btn-cancel":
+            self.dismiss(None)
+
+    def action_do_save(self) -> None:
+        text = self.query_one("#edit-input", TextArea).text.strip()
+        if not text:
+            self.dismiss({"action": "delete"})
+        else:
+            self.dismiss({"action": "save", "text": text})
+
+    def action_do_delete(self) -> None:
+        self.dismiss({"action": "delete"})
+
+    def action_do_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class CollapsedHistoryMarker(Static):
+    """Inline placeholder for widgets hidden by the long-conversation
+    folder. Clicking it restores every widget the App's
+    ``_collapsed_widgets`` list is currently tracking, then removes
+    itself. Only one marker exists at a time — re-folding updates the
+    count instead of stacking more markers.
+    """
+
+    DEFAULT_CSS = """
+    CollapsedHistoryMarker {
+        margin: 1 0;
+        padding: 0 1;
+        color: #cdd6f4;
+        background: #2a1a32;
+        text-align: center;
+    }
+    CollapsedHistoryMarker:hover {
+        background: #45324d;
+    }
+    """
+
+    class ExpandRequested(Message):
+        pass
+
+    def __init__(self) -> None:
+        self._count = 0
+        super().__init__(self._render_label())
+
+    def _render_label(self) -> Text:
+        t = Text()
+        t.append("── ", style="dim")
+        t.append(f"已折叠 {self._count} 条历史", style="bold #cdd6f4")
+        t.append("  ·  点击展开 ──", style="dim")
+        return t
+
+    def set_count(self, n: int) -> None:
+        self._count = n
+        self.update(self._render_label())
+
+    def on_click(self, event) -> None:
+        self.post_message(self.ExpandRequested())
+        event.stop()
 
 
 class AssistantMessage(Static):
@@ -379,29 +597,55 @@ class SubagentsBlock(Static):
                     f"\n    [{s.tokens_in:,}↓ / {s.tokens_out:,}↑]",
                     style="dim",
                 )
+            # Last-call context usage as a percentage of the model's
+            # window. Color jumps once the parent should think about
+            # nudging a compact_self via chat_agent.
+            if s.context_limit and s.last_prompt_tokens:
+                pct = s.last_prompt_tokens * 100.0 / s.context_limit
+                if pct >= 85:
+                    ctx_style = "bold red"
+                elif pct >= 70:
+                    ctx_style = "bold #f9e2af"
+                else:
+                    ctx_style = "dim"
+                t.append(f"  ctx {pct:.0f}%", style=ctx_style)
             if s.prompt_preview:
                 t.append(f'\n    "{s.prompt_preview}"', style="dim italic")
         self.update(t)
 
 
 class SubagentTabPane(VerticalScroll):
-    """Read-only transcript view for one SubagentSession.
+    """Live + read-only transcript view for one SubagentSession.
 
     Lives inside a TabPane in the top-level TabbedContent. Renders
     `sess.messages` as the same widget vocabulary the main conversation
     uses (UserBubble / ThinkingBlock / AssistantMessage / ToolCallBlock)
     so the parent's "what did the subagent do?" view feels familiar.
 
-    Stateful: tracks how many messages have been rendered so a 1 Hz
-    refresh loop can `mount` only the new ones — re-rendering the
-    whole transcript every tick would flicker badly. `_tool_blocks`
-    maps tool_call_id → ToolCallBlock so a later `role=tool` message
-    can attach its result to the block that requested it.
+    Two complementary paths populate it:
 
-    No streaming: `sess.messages` only grows when a round commits an
-    assistant or tool message, so the view always lags the live stream
-    by one round-stage. Acceptable for a read-only "what did it say"
-    panel; the right-side SubagentsBlock shows the live phase.
+    1. **Live streaming** — `_run_subagent_round` pushes reasoning /
+       content chunks into `_live_thinking` / `_live_answer` as they
+       arrive and mounts a ToolCallBlock the moment a tool call lands,
+       so the user sees token-level output in real time. After each
+       message commits to `sess.messages`, the round runner calls
+       `mark_round_committed()` to advance `_rendered_idx` so the
+       fallback path doesn't repaint the same content.
+
+    2. **Fallback replay** — the 1 Hz `_refresh_subagent_panel` tick
+       calls `refresh_from_session()`, which renders any message in
+       `sess.messages` that hasn't been live-mounted (e.g. the user
+       prompt, or content from a state restore).
+
+    `_tool_blocks` maps tool_call_id → ToolCallBlock so a later
+    `role=tool` message in the replay path can attach its result to
+    the right block. The live path uses the same map so tool result
+    set after async tool execution finds the block created at
+    tool-call dispatch.
+
+    `_pending_mounts` covers the spawn-time race: the round task
+    starts before the TabPane is mounted into the DOM. Live widgets
+    constructed during that window queue here and flush in `on_mount`.
     """
 
     DEFAULT_CSS = """
@@ -413,6 +657,137 @@ class SubagentTabPane(VerticalScroll):
         self.sess = sess
         self._rendered_idx = 0
         self._tool_blocks: dict[str, "ToolCallBlock"] = {}
+        # Live-stream widgets owned by the in-flight round. Cleared at
+        # round end (finalize_*) or on stream error (remove_live_blocks).
+        self._live_thinking: ThinkingBlock | None = None
+        self._live_answer: AssistantMessage | None = None
+        # Widgets created before on_mount runs (spawn-time race). Flushed
+        # in order by on_mount AFTER refresh_from_session has rendered
+        # the user prompt, so the DOM order ends up user → thinking →
+        # answer → tools.
+        self._pending_mounts: list = []
+
+    def on_mount(self) -> None:
+        # Render history (system msgs skipped, user prompt mounted) FIRST
+        # so the spawn prompt lands above any live widgets the round
+        # task already queued via _pending_mounts.
+        try:
+            self.refresh_from_session()
+        except Exception:
+            pass
+        if self._pending_mounts:
+            for w in self._pending_mounts:
+                try:
+                    self.mount(w)
+                except Exception:
+                    pass
+            self._pending_mounts.clear()
+            self.scroll_end(animate=False)
+
+    # ───────── live streaming hooks (called from _run_subagent_round) ─────────
+
+    def start_thinking(self) -> None:
+        """Mount a fresh ThinkingBlock for the current LLM call.
+        Idempotent — repeated calls within the same round are no-ops."""
+        if self._live_thinking is not None:
+            return
+        self._live_thinking = ThinkingBlock()
+        if self.is_mounted:
+            self.mount(self._live_thinking)
+        else:
+            self._pending_mounts.append(self._live_thinking)
+
+    def append_thinking(self, text: str) -> None:
+        if self._live_thinking is None:
+            return
+        self._live_thinking.append_text(text)
+        if self.is_mounted:
+            self.scroll_end(animate=False)
+
+    def finalize_thinking(self, reasoning_tokens: int) -> None:
+        if self._live_thinking is not None:
+            self._live_thinking.finalize(reasoning_tokens)
+            self._live_thinking = None
+
+    def start_answer(self) -> None:
+        if self._live_answer is not None:
+            return
+        self._live_answer = AssistantMessage()
+        if self.is_mounted:
+            self.mount(self._live_answer)
+        else:
+            self._pending_mounts.append(self._live_answer)
+
+    def append_answer(self, text: str) -> None:
+        if self._live_answer is None:
+            return
+        self._live_answer.append_text(text)
+        if self.is_mounted:
+            self.scroll_end(animate=False)
+
+    def finalize_answer(self) -> None:
+        # Just drop the ref — the widget stays mounted as historical
+        # content. Same shape as ThinkingBlock.finalize but no title
+        # to refresh.
+        self._live_answer = None
+
+    def add_tool_block(
+        self, tool_call_id: str, name: str, args: dict
+    ) -> "ToolCallBlock":
+        block = ToolCallBlock(name, args)
+        if tool_call_id:
+            self._tool_blocks[tool_call_id] = block
+        if self.is_mounted:
+            self.mount(block)
+            self.scroll_end(animate=False)
+        else:
+            self._pending_mounts.append(block)
+        return block
+
+    def set_tool_result(
+        self, tool_call_id: str, result: str, blocked: bool = False
+    ) -> None:
+        block = self._tool_blocks.get(tool_call_id)
+        if block is not None:
+            block.set_result(result, blocked=blocked)
+
+    def remove_live_blocks(self) -> None:
+        """Drop the in-flight ThinkingBlock / AssistantMessage on a
+        stream error or cancellation. Caller should follow up with
+        mount_exception_notice() so the user sees what went wrong
+        instead of a silent gap."""
+        if self._live_thinking is not None:
+            try:
+                self._live_thinking.remove()
+            except Exception:
+                pass
+            self._live_thinking = None
+        if self._live_answer is not None:
+            try:
+                self._live_answer.remove()
+            except Exception:
+                pass
+            self._live_answer = None
+        # Also drop anything that was queued pre-mount but not yet
+        # flushed — that's the same in-flight content.
+        self._pending_mounts.clear()
+
+    def mount_exception_notice(self, text: str) -> None:
+        block = Static(Text(text, style="bold red"), markup=False)
+        if self.is_mounted:
+            self.mount(block)
+            self.scroll_end(animate=False)
+        else:
+            self._pending_mounts.append(block)
+
+    def mark_round_committed(self) -> None:
+        """Advance _rendered_idx to len(sess.messages) so the 1 Hz
+        fallback won't repaint messages the live path already
+        mounted. Called after each sess.messages.append in the round
+        runner."""
+        self._rendered_idx = len(self.sess.messages)
+
+    # ───────── fallback replay (1 Hz tick + on_mount) ─────────
 
     def refresh_from_session(self) -> None:
         """Append widgets for any messages that arrived since last call.
@@ -425,7 +800,8 @@ class SubagentTabPane(VerticalScroll):
         self._rendered_idx = len(msgs)
         # Keep the view glued to the bottom while the subagent is
         # actively producing output — same UX as the main conversation.
-        self.scroll_end(animate=False)
+        if self.is_mounted:
+            self.scroll_end(animate=False)
 
     def _render_one(self, m: dict) -> None:
         role = m.get("role")
@@ -443,10 +819,10 @@ class SubagentTabPane(VerticalScroll):
                 tb.append_text(rc)
                 # Historical reasoning has no live token count; pass 0
                 # and let `finalize` produce a "完成" title without a
-                # number. Start collapsed so the transcript opens with
-                # the answer prominent, not a wall of thoughts.
+                # number. Default to expanded (matching the live path
+                # and the main conversation) so the user sees the
+                # thought process without an extra click.
                 tb.finalize(0)
-                tb.collapsed = True
                 self.mount(tb)
             content = m.get("content") or ""
             if content:
@@ -678,10 +1054,25 @@ class MultilineInput(TextArea):
         self.post_message(self.SteerSubmitted(self.text))
 
     def _fit_height(self) -> None:
-        # Border eats two rows, so outer height = line_count + 2 to keep
-        # every line visible. Past _MAX_ROWS the TextArea scrolls.
-        rows = max(self._MIN_ROWS, min(self._MAX_ROWS, self.document.line_count + 2))
+        # Use wrapped_document.height (visible lines AFTER soft-wrap),
+        # not document.line_count (logical \n-separated lines) — a long
+        # pasted line that wraps onto 3 visible rows would otherwise
+        # report 1 logical line and the box would stay at _MIN_ROWS.
+        # Border eats 2 rows, so outer height = visible + 2; past
+        # _MAX_ROWS the TextArea starts scrolling internally.
+        try:
+            visible = self.wrapped_document.height
+        except Exception:
+            visible = self.document.line_count
+        rows = max(self._MIN_ROWS, min(self._MAX_ROWS, visible + 2))
         self.styles.height = rows
+
+    def on_resize(self, _event) -> None:
+        # When the terminal (or surrounding layout) resizes, the soft-
+        # wrap column changes — same text may now occupy more/fewer
+        # visible rows. Re-fit so the box matches its content height
+        # without waiting for the next keystroke.
+        self._fit_height()
 
     def on_mount(self) -> None:
         self._fit_height()

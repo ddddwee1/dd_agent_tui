@@ -27,6 +27,7 @@ from .providers import ProviderConfigError, build_provider
 from .state import TokenCounter, ToolContext
 from .widgets import (
     BgJobsBlock,
+    CollapsedHistoryMarker,
     MultilineInput,
     SlashPopup,
     StatusBar,
@@ -49,9 +50,9 @@ class AgentApp(
     #body { height: 1fr; layout: horizontal; }
     #main { width: 1fr; layout: vertical; }
     #sidebar {
-        width: 30%;
-        min-width: 36;
-        max-width: 72;
+        width: 20%;
+        min-width: 24;
+        max-width: 48;
         layout: vertical;
         border-left: solid #cba6f7;
         padding: 0 1;
@@ -79,7 +80,13 @@ class AgentApp(
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "quit", "退出"),
+        # priority=True so this fires before TextArea's built-in
+        # ctrl+c=copy binding. The input is always focused, so without
+        # priority the dispatcher hits TextArea's copy first and a
+        # widget-level selection (a drag on a Static/Markdown bubble in
+        # the conversation) never reaches Screen.action_copy_text.
+        Binding("ctrl+c", "copy_selection", "复制选中", priority=True),
+        Binding("ctrl+q", "quit", "退出"),
         Binding("ctrl+l", "clear_chat", "清空对话"),
         Binding("ctrl+t", "toggle_thinking", "展开/折叠思考"),
         Binding("ctrl+x", "cancel_pending", "取消队列/steer"),
@@ -189,6 +196,13 @@ class AgentApp(
         # waiting for the whole turn to finish like _queued does).
         # Drained by `_run_one_turn` before each `_stream_one()` call.
         self._steer: list[tuple[str, "SteerBubble"]] = []
+        # Long-conversation folding. When #conversation gets too many
+        # children, _maybe_collapse_history hides the oldest with
+        # display=False and stashes them here so the marker's expand
+        # callback can restore them. Single marker, single list — refold
+        # extends both rather than stacking markers.
+        self._collapsed_widgets: list = []
+        self._history_marker: "CollapsedHistoryMarker | None" = None
         # Currently-running agent turn worker — kept so ESC×2 can
         # cancel it. None when idle.
         self._agent_worker = None
@@ -214,7 +228,7 @@ class AgentApp(
                     with TabPane("main", id="tab-main"):
                         yield VerticalScroll(id="conversation")
                 yield Static(
-                    "Enter 发送 · Option+Enter 换行 · Cmd+Enter steer · ESC×2 中断 · Ctrl+X 取消 · Ctrl+L 清空 · Ctrl+C 退出",
+                    "Enter 发送 · Option+Enter 换行 · Cmd+Enter steer · 点击下方排队/steer 气泡可编辑/删除 · ESC×2 中断 · Ctrl+X 全部取消 · Ctrl+L 清空 · Ctrl+Q 退出",
                     id="hint",
                 )
                 yield Vertical(id="pending")

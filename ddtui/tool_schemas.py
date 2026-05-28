@@ -788,6 +788,28 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "compact_self",
+            "description": (
+                "SUBAGENT-ONLY. Compress your own conversation history: "
+                "summarize earlier messages into a single system note, "
+                "keeping the two most recent user/assistant turns "
+                "verbatim. Use when the parent agent's chat_agent prompt "
+                "tells you your context is filling up, or when you "
+                "judge your own history is too long for the work left "
+                "to do. Takes no arguments. Returns before/after "
+                "message + character counts. The parent agent cannot "
+                "call this — it has its own /compact slash command."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "todo_tool",
             "description": (
                 "Maintain a structured TODO list across the conversation. "
