@@ -143,6 +143,7 @@ class EditPendingScreen(ModalScreen[dict | None]):
         Binding("escape", "do_cancel", show=False),
         Binding("ctrl+s", "do_save", show=False, priority=True),
         Binding("ctrl+d", "do_delete", show=False, priority=True),
+        Binding("ctrl+t", "do_convert", show=False, priority=True),
     ]
 
     DEFAULT_CSS = """
@@ -193,14 +194,17 @@ class EditPendingScreen(ModalScreen[dict | None]):
                 title.append("⚡ 编辑 steer", style="bold #f9e2af")
             else:
                 title.append("📋 编辑排队消息", style="bold #74c7ec")
+            convert_hint = "转排队" if self._kind == "steer" else "转 steer"
             title.append(
-                "   ·   Ctrl+S 保存   Ctrl+D 删除   Esc 取消",
+                f"   ·   Ctrl+S 保存   Ctrl+D 删除   Ctrl+T {convert_hint}   Esc 取消",
                 style="dim",
             )
             yield Static(title, id="edit-title")
             yield TextArea(self._original, id="edit-input")
             with Horizontal(id="edit-buttons"):
                 yield Button("删除", variant="error", id="btn-delete")
+                convert_label = "转为排队" if self._kind == "steer" else "转为 steer"
+                yield Button(convert_label, id="btn-convert")
                 yield Button("取消", id="btn-cancel")
                 yield Button("保存", variant="primary", id="btn-save")
 
@@ -222,6 +226,8 @@ class EditPendingScreen(ModalScreen[dict | None]):
             self.action_do_save()
         elif bid == "btn-delete":
             self.dismiss({"action": "delete"})
+        elif bid == "btn-convert":
+            self.action_do_convert()
         elif bid == "btn-cancel":
             self.dismiss(None)
 
@@ -234,6 +240,13 @@ class EditPendingScreen(ModalScreen[dict | None]):
 
     def action_do_delete(self) -> None:
         self.dismiss({"action": "delete"})
+
+    def action_do_convert(self) -> None:
+        text = self.query_one("#edit-input", TextArea).text.strip()
+        if not text:
+            self.dismiss({"action": "delete"})
+        else:
+            self.dismiss({"action": "convert", "text": text})
 
     def action_do_cancel(self) -> None:
         self.dismiss(None)
@@ -378,6 +391,10 @@ class ToolCallBlock(Collapsible):
         self._blocked = blocked
         self._body.update(self._build_body())
         self.title = self._build_title()
+
+    @property
+    def is_pending(self) -> bool:
+        return self._result is None
 
     def _short_args(self) -> str:
         try:

@@ -66,15 +66,17 @@ class AppAgentLoopMixin:
                 await self._mount_widget(UserBubble(pending))
                 self._refresh_status()
         except asyncio.CancelledError:
-            # ESC×2 cancellation: leave `self.messages` and the user's
-            # bubble alone. The half-streamed thinking is already gone
-            # (`_stream_one` removed its widget and never appended the
-            # assistant turn to history), and the user's prompt — plus
-            # any [实时插话] drained earlier this turn — should stay so
-            # the next submission picks up with full context. The toast
-            # from `_interrupt_now` already tells the user it was
-            # cancelled. Re-raise so the worker is marked CANCELLED,
-            # not COMPLETED.
+            # ESC×2 cancellation: keep `self.messages` and the user's
+            # bubble so the next submission picks up with full context.
+            # The half-streamed thinking/answer for a stream-time cancel
+            # is already gone (`_stream_one` removed those widgets and
+            # never appended the assistant turn). But a tool-time cancel
+            # leaves `messages` ending in `assistant(tool_calls=[...])`
+            # with some/all tool results missing — the OpenAI/DeepSeek
+            # protocol then rejects the next request. Pair every orphan
+            # tool_call with a stub `tool` result before re-raising so
+            # the history stays protocol-valid.
+            self._pair_orphan_tool_calls()
             raise
         finally:
             self._set_busy(False)

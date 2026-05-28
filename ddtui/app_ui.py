@@ -25,6 +25,7 @@ from .widgets import (
     SubagentsBlock,
     SubagentTabPane,
     ThinkingBlock,
+    ToolCallBlock,
     UserBubble,
 )
 
@@ -489,6 +490,75 @@ class AppUiMixin:
                 del self.messages[i:]
                 return
 
+    def _pair_orphan_tool_calls(self) -> int:
+        """ESC×2 in the middle of tool execution can leave `self.messages`
+        ending in `assistant(tool_calls=[A,B,...])` with only some (or
+        zero) matching `tool` results appended. The OpenAI / DeepSeek
+        Chat Completions protocol requires every tool_call id to be
+        followed by a corresponding `tool` message before the next user
+        turn — otherwise the next request fails with 400.
+
+        Scan back to the most recent assistant message; for every
+        unpaired tool_call id, append a stub `tool` message marking it
+        cancelled. Also flip any still-pending `ToolCallBlock` widget to
+        a blocked state so the UI doesn't keep showing 「执行中…」.
+
+        Returns the number of stub messages appended.
+        """
+        last_assistant_idx: int | None = None
+        for i in range(len(self.messages) - 1, -1, -1):
+            role = self.messages[i].get("role")
+            if role == "assistant":
+                last_assistant_idx = i
+                break
+            if role == "user":
+                return 0
+        if last_assistant_idx is None:
+            return 0
+
+        tool_calls = self.messages[last_assistant_idx].get("tool_calls") or []
+        if not tool_calls:
+            return 0
+
+        completed_ids = {
+            m.get("tool_call_id")
+            for m in self.messages[last_assistant_idx + 1:]
+            if m.get("role") == "tool"
+        }
+        missing = [
+            tc for tc in tool_calls
+            if tc.get("id") and tc.get("id") not in completed_ids
+        ]
+        if not missing:
+            return 0
+
+        cancel_note = "⛔ Tool execution cancelled by user (ESC×2)"
+        for tc in missing:
+            self.messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id") or "",
+                "content": cancel_note,
+            })
+
+        # Flip still-pending tool widgets to a blocked state. Walk back
+        # from the bottom; stop once we hit the boundary (UserBubble /
+        # SteerBubble) so we don't accidentally retroactively rewrite
+        # blocks from earlier turns.
+        try:
+            view = self.query_one("#conversation", VerticalScroll)
+            for child in reversed(list(view.children)):
+                if isinstance(child, (UserBubble, SteerBubble)):
+                    break
+                if isinstance(child, ToolCallBlock) and child.is_pending:
+                    try:
+                        child.set_result(cancel_note, blocked=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return len(missing)
+
     def _wipe_orphaned_turn_widgets(self) -> None:
         """Drop the UI widgets for the in-flight turn — the trailing
         UserBubble / SteerBubble plus everything mounted after it
@@ -596,6 +666,26 @@ class AppUiMixin:
                     bubble.set_text(new_text)
                 except Exception:
                     pass
+            elif action == "convert":
+                new_text = result.get("text", "")
+                target_list.pop(idx)
+                try:
+                    bubble.remove()
+                except Exception:
+                    pass
+                if kind == "queue":
+                    new_bubble = SteerBubble(new_text)
+                    self._steer.append((new_text, new_bubble))
+                    tag_from, tag_to = "排队消息", "steer"
+                else:
+                    new_bubble = UserBubble(new_text)
+                    self._queued.append((new_text, new_bubble))
+                    tag_from, tag_to = "steer", "排队消息"
+                self.run_worker(self._mount_pending(new_bubble))
+                self._refresh_status()
+                self.notify(
+                    f"已将 1 条{tag_from}转为 {tag_to}", timeout=2.0
+                )
 
         self.push_screen(EditPendingScreen(original, kind), on_close)
 
