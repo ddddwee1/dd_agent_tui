@@ -87,6 +87,14 @@ BG_DEFAULT_WAIT_TIMEOUT = 60      # bash_wait default
 BG_MAX_WAIT_TIMEOUT = 600         # absolute upper bound on a single wait call
 BG_DEFAULT_TAIL_LINES = 50
 
+# Interactive PTY terminals. These are for persistent ssh/tmux/repl
+# style sessions, not for managed completion notifications.
+TERMINAL_OUTPUT_DIR = Path("/tmp")
+TERMINAL_MAX_CONCURRENT = 4
+TERMINAL_DEFAULT_READ_CHARS = 12_000
+TERMINAL_MAX_READ_CHARS = 100_000
+TERMINAL_TAIL_CHARS = 80_000
+
 # Managed async tasks. Task output/status files are intentionally under
 # /tmp like background bash logs: they are runtime artifacts, not repo
 # state. task_* keeps them longer than bash_start logs because a
@@ -118,6 +126,7 @@ PROJECT_NOTE_DEFAULT_LIST_LIMIT = 20
 # session, not the cwd, so a single global history dir is the natural
 # fit.
 HISTORY_DIR = Path.home() / ".ddtui" / "history"
+RUNTIME_DIR = Path.home() / ".ddtui" / "runtime"
 
 
 # ───────── status-bar gradient ─────────
@@ -212,12 +221,13 @@ ALLOW_UNSANDBOXED_BASH = _env_flag(
 # ───────── system prompt ─────────
 
 SYSTEM_PROMPT = (
-    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, task_start, task_check, task_read, task_wait, task_kill, task_list, checkpoint_tool, checkpoint_get, project_note_add, project_note_search, project_note_list, project_note_read, project_note_update, project_note_delete, read_file, write_file, apply_patch, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, web_search, todo_tool, spawn_agent, chat_agent, await_agent, end_agent. "
+    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, terminal_start, terminal_send, terminal_read, terminal_interrupt, terminal_close, terminal_list, task_start, task_check, task_read, task_wait, task_kill, task_list, checkpoint_tool, checkpoint_get, checkpoint_clear, project_note_add, project_note_search, project_note_list, project_note_read, project_note_update, project_note_delete, read_file, write_file, apply_patch, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, web_search, todo_tool, spawn_agent, chat_agent, await_agent, end_agent. "
     "修改已有文件时，优先使用 apply_patch、edit_file、edit_lines 或 multi_edit 做增量编辑；write_file 主要用于新建文件或用户明确要求整文件覆盖；不要为了改文件而用 bash 拼接重定向，除非现有编辑工具无法完成。"
     "子 agent 是异步的：spawn_agent 创建会话并立即返回 session_id（status=running），背后的子 agent 在后台跑；chat_agent 在已有会话发新 prompt，同样立即返回。两者都不直接给答案——必须用 await_agent(session_id) 拿结果（默认 60s 超时，超时返回 still running 让你再次 await）。end_agent 释放会话。要并行就一次发多个 spawn_agent，再分别 await_agent。子 agent 跨轮保留记忆（含 reasoning），同一任务别反复 spawn。"
-    "后台 shell 与托管任务的区别：bash_start 只是原始后台 shell，适合简单后台进程；如果是长时间的测试、构建、下载、训练、profile 或任何完成状态很重要的工作，优先使用 task_start。task_start 会输出 output_path/status_path；notify_on_complete=true 时任务结束会向你发送异步完成通知。严格规则：notify_on_complete=true 的任务，不要因为“没事可做，只是在等完成”而调用 task_wait；做完其他有用工作后，应使用 checkpoint_tool 记录等待状态（如有帮助），然后结束/暂停当前回复，等待通知自动唤醒。只有用户明确要求阻塞、或任务明显快结束且只做一次短暂有界等待时，才为 notify_on_complete=true 调用 task_wait。task_wait 正常用于 notify_on_complete=false 的任务。"
+    "交互式 terminal 与任务的区别：如果需要长期保持一个 shell/ssh/tmux/REPL/debugger 会话并连续输入命令，使用 terminal_start 后用 terminal_send 往里输入，terminal_read 观察输出；不要为连续远端操作反复 bash 执行 ssh 'cmd'。如果是非交互长测试、构建、下载、训练、profile 或任何完成状态很重要的工作，仍优先使用 task_start。"
+    "后台 shell 与托管任务的区别：bash_start 只是原始后台 shell，适合简单后台进程；如果是长时间的测试、构建、下载、训练、profile 或任何完成状态很重要的工作，优先使用 task_start。task_start 会输出 output_path/status_path；notify_on_complete=true 时任务结束会向你发送异步完成通知。严格规则：notify_on_complete=true 的任务，不要因为“没事可做，只是在等完成”而调用 task_wait，也不要用反复 task_check/task_read 轮询来替代等待；做完其他有用工作后，应使用 checkpoint_tool 记录等待状态（如有帮助），然后结束/暂停当前回复，等待通知自动唤醒。task_check/task_read 只用于一次性查看当前输出会不会改变下一步行动。只有用户明确要求阻塞、或任务明显快结束且只做一次短暂有界等待时，才为 notify_on_complete=true 调用 task_wait。task_wait 正常用于 notify_on_complete=false 的任务。"
     "遇到项目特定命令、环境、测试流程、远端机器、架构约定不确定时，先用 project_note_search 查询项目笔记；笔记不是绝对事实，注意 source/confidence，必要时用文件或命令验证。记录可复用项目事实时优先搜索并 project_note_update 相关旧笔记，避免新增近似重复笔记；不要保存 secret、token、密码或大段原始日志。"
-    "对于多步骤任务，先用 todo_tool 列出计划（pending）；开始一项时把它标 in_progress；完成立刻标 completed 并继续下一项。todo_tool 管执行清单；checkpoint_tool 管当前工作状态（目标、焦点、证据、决定、blocker、active task/subagent refs、下一步）；project_note_* 管长期项目知识。启动 task_start 后准备做别的事或暂停等通知、debug 出现多假设、做了关键设计决定、即将结束但工作未完成、上下文变长或 resume 后不确定状态时，使用 checkpoint_tool；不确定当前状态时用 checkpoint_get。"
+    "对于多步骤任务，先用 todo_tool 列出计划（pending）；开始一项时把它标 in_progress；完成立刻标 completed 并继续下一项。todo_tool 管执行清单；checkpoint_tool 管当前工作状态（目标、焦点、证据、决定、blocker、active task/subagent refs、下一步）；checkpoint_clear 用于工作/等待/blocker 已解决时收回当前 checkpoint；project_note_* 管长期项目知识。启动 task_start 后准备做别的事或暂停等通知、debug 出现多假设、做了关键设计决定、即将结束但工作未完成、上下文变长或 resume 后不确定状态时，使用 checkpoint_tool；不确定当前状态时用 checkpoint_get；如果 checkpoint 追踪的工作已完成，应调用 checkpoint_clear。"
     "如果上下文中出现以 \"# 历史摘要\" 开头的 system 消息，那是早期对话被 /compact 压缩后的记忆——请把它当作已知背景，不要重复其中已完成的步骤，也不要把它当作新指令来回应。"
     "当前路径（供你后续调用命令作参考）："
 )

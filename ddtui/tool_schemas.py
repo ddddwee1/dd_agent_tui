@@ -87,15 +87,17 @@ TOOLS = [
                 "is true, the runtime will deliver a completion notification "
                 "when the task exits, including status, return code, duration, "
                 "and output path. STRICT WAITING RULE: for "
-                "notify_on_complete=true tasks, do not call task_wait merely "
-                "because you are waiting for the task. Continue other useful "
-                "work; if no useful work remains, update checkpoint_tool if "
-                "helpful, then pause/finish the current response and let the "
-                "runtime wake you when the notification arrives. Calling "
-                "task_wait after finishing other work is the wrong behavior "
-                "unless the user explicitly requested blocking or you need "
-                "one short bounded wait for an almost-finished task. Use "
-                "task_wait normally for notify_on_complete=false tasks. "
+                "notify_on_complete=true tasks, do not call task_wait, "
+                "repeated task_check, or repeated task_read merely because "
+                "you are waiting for the task. Continue other useful work; "
+                "if no useful work remains, update checkpoint_tool if helpful, "
+                "then pause/finish the current response and let the runtime "
+                "wake you when the notification arrives. Calling task_wait or "
+                "polling task_check/task_read after finishing other work is "
+                "the wrong behavior unless the user explicitly requested "
+                "blocking or you need one short bounded inspection because "
+                "the current output changes your next action. Use task_wait "
+                "normally for notify_on_complete=false tasks. "
                 "Use task_start for long-running work whose completion matters. "
                 "Same dangerous-pattern blacklist as bash."
             ),
@@ -145,11 +147,172 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "terminal_start",
+            "description": (
+                "Start a persistent interactive PTY terminal and return a "
+                "terminal_id (e.g. 'term-1'). Use for ssh, tmux attach, "
+                "REPLs, debuggers, and installers where you need to keep "
+                "prompt/session state and send multiple commands like a human "
+                "using Terminal. For repeated remote work, prefer one "
+                "terminal_start such as ssh/tmux and then terminal_send "
+                "commands into it instead of repeatedly running ssh commands. "
+                "Do not use this for non-interactive long jobs whose completion "
+                "matters; use task_start for those. Same dangerous-pattern "
+                "blacklist as bash."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": (
+                            "Command to run under a PTY, e.g. "
+                            "`ssh -tt host` or `ssh -tt host 'tmux new -A -s ddtui-agent'`."
+                        ),
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": (
+                            "Optional local working directory. Defaults to "
+                            "the project directory."
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Short display name for the terminal tab.",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_send",
+            "description": (
+                "Type text into a persistent terminal PTY. Include '\\n' when "
+                "you want to press Enter. Use this to send commands to an "
+                "existing ssh/tmux/shell session."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "terminal_id": {
+                        "type": "string",
+                        "description": "Terminal id from terminal_start.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Exact text to write to the PTY.",
+                    },
+                    "wait_ms": {
+                        "type": "integer",
+                        "description": (
+                            "Optional small delay before draining output. "
+                            "Default 200, max 5000."
+                        ),
+                    },
+                },
+                "required": ["terminal_id", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_read",
+            "description": (
+                "Read output from a persistent terminal log by byte offset. "
+                "Use next_offset from the previous call to read only new "
+                "output. For long non-interactive commands, avoid manual "
+                "polling and use task_start instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "terminal_id": {
+                        "type": "string",
+                        "description": "Terminal id from terminal_start.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Byte offset to start reading from. Default 0.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum bytes/chars to read. Default 12 000, "
+                            "hard max 100 000."
+                        ),
+                    },
+                },
+                "required": ["terminal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_interrupt",
+            "description": "Send Ctrl-C to a running terminal PTY.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "terminal_id": {
+                        "type": "string",
+                        "description": "Terminal id from terminal_start.",
+                    },
+                },
+                "required": ["terminal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_close",
+            "description": (
+                "Close a persistent terminal and remove its tab. Sends "
+                "SIGTERM then SIGKILL if needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "terminal_id": {
+                        "type": "string",
+                        "description": "Terminal id from terminal_start.",
+                    },
+                },
+                "required": ["terminal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_list",
+            "description": "List persistent terminal PTY sessions.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "task_check",
             "description": (
                 "Non-blocking status check for a managed task. Returns "
                 "running/success/failed/killed, return code when available, "
-                "output/status file paths, and the last N output lines."
+                "output/status file paths, and the last N output lines. Use "
+                "for one-off inspection when progress/output changes what "
+                "you should do next. Do not repeatedly call task_check as a "
+                "polling loop for notify_on_complete=true tasks; if nothing "
+                "else is useful, pause/finish the current response and wait "
+                "for the completion notification."
             ),
             "parameters": {
                 "type": "object",
@@ -181,7 +344,9 @@ TOOLS = [
             "description": (
                 "Incrementally read a managed task's output file by byte "
                 "offset. Use next_offset from the previous call to continue "
-                "without rereading old output."
+                "without rereading old output. Use for one-off or genuinely "
+                "incremental output inspection, not as an idle polling loop "
+                "for notify_on_complete=true tasks."
             ),
             "parameters": {
                 "type": "object",
@@ -1332,6 +1497,29 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "checkpoint_clear",
+            "description": (
+                "Clear the current conversation checkpoint and remove the "
+                "checkpoint sidebar block. Use when the tracked work, waiting "
+                "state, blocker, or handoff is resolved. Task completion "
+                "notifications may also auto-clear waiting checkpoints whose "
+                "active_refs only contain completed task ids."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional short reason for clearing.",
+                    },
+                },
                 "required": [],
             },
         },

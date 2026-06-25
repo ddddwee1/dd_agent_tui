@@ -22,8 +22,17 @@ from .config import (
     SUBAGENT_MAX_AWAIT_TIMEOUT,
     SUBAGENT_RESULT_MAX_CHARS,
 )
+from .runtime_state import (
+    atomic_write_json,
+    clear_path,
+    list_turn_journals,
+    new_session_id,
+    read_json,
+    turn_journal_path,
+)
 from .state import TokenCounter
-from .tools_checkpoint import tool_checkpoint_tool
+from .tools_tasks import recover_tasks_for_session
+from .tools_checkpoint import tool_checkpoint_clear, tool_checkpoint_tool
 from .widgets import (
     AssistantMessage,
     DiffBlock,
@@ -42,9 +51,69 @@ class AppHistoryMixin:
         return {
             "version": 1,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "session_id": self._session_id,
+            "cwd": self.ctx.work_dir,
             "model": self.model,
+            "checkpoint": self.ctx.checkpoint,
             "messages": self.messages,
         }
+
+    def _turn_journal_path(self) -> Path:
+        return turn_journal_path(self._session_id)
+
+    def _write_turn_journal(self, **updates) -> None:
+        existing = read_json(self._turn_journal_path()) or {}
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = {
+            **existing,
+            **updates,
+            "version": 1,
+            "session_id": self._session_id,
+            "updated_at": now,
+        }
+        payload.setdefault("created_at", now)
+        if self._autosave_path is not None:
+            payload["autosave_path"] = str(self._autosave_path)
+            payload["autosave_name"] = self._autosave_path.stem
+        atomic_write_json(self._turn_journal_path(), payload)
+
+    def _clear_turn_journal(self) -> None:
+        clear_path(self._turn_journal_path())
+
+    def _recover_messages_from_journal(
+        self, msgs: list[dict], session_id: str
+    ) -> tuple[list[dict], str | None, str | None, bool]:
+        journal = read_json(turn_journal_path(session_id))
+        if not journal:
+            return msgs, None, None, False
+        phase = str(journal.get("phase") or "unknown")
+        pending = str(journal.get("pending_user_text") or "")
+        before_raw = journal.get("message_len_before_turn")
+        try:
+            before = int(before_raw)
+        except Exception:
+            before = None
+        tool_started = bool(journal.get("tool_started")) or phase in (
+            "tool",
+            "after_tool",
+        )
+        modified = False
+        input_text: str | None = None
+        if not tool_started and before is not None and 0 <= before <= len(msgs):
+            msgs = msgs[:before]
+            input_text = pending or None
+            notice = (
+                "检测到上次会话在模型流式输出期间断开；已回滚到上一条稳定消息，"
+                "并把当时的用户输入放回输入框。"
+            )
+            modified = True
+        else:
+            notice = (
+                "检测到上次会话在工具执行后/执行中断开；不会自动重跑工具。"
+                "已尽量保持历史协议合法，请检查状态后继续。"
+            )
+        clear_path(turn_journal_path(session_id))
+        return msgs, notice, input_text, modified
 
     def _normalize_history_name(self, raw_name: str) -> tuple[str | None, str | None]:
         name = raw_name.strip()
@@ -109,6 +178,25 @@ class AppHistoryMixin:
             self._write_conversation_snapshot(target)
         except Exception as e:
             self.notify(f"自动保存失败：{e}", severity="error", timeout=4)
+
+    async def _show_disconnect_recovery_notice(self) -> None:
+        journals = list_turn_journals()
+        if not journals:
+            return
+        journal = journals[0]
+        name = journal.get("autosave_name")
+        path = journal.get("autosave_path")
+        phase = journal.get("phase") or "unknown"
+        if name:
+            hint = f"可用 /resume {name} 恢复（断在 {phase} 阶段）。"
+        elif path:
+            hint = f"发现未完成会话：{path}（断在 {phase} 阶段）。"
+        else:
+            hint = f"发现未完成会话（断在 {phase} 阶段）。"
+        await self._mount_widget(Static(Text(
+            f"🔌 检测到上次可能异常断线。{hint}",
+            style="bold #f9e2af",
+        )))
 
     def _history_entries(self) -> list[dict]:
         if not HISTORY_DIR.exists():
@@ -405,11 +493,21 @@ class AppHistoryMixin:
                 style="bold red",
             )))
             return
+        session_id = str(payload.get("session_id") or "") or new_session_id()
+        msgs, recovery_notice, recovery_input, recovered_modified = (
+            self._recover_messages_from_journal(msgs, session_id)
+        )
 
         # Wipe the current view + buffers; then drop in the loaded
         # messages and replay them as widgets. Background bash jobs
         # are NOT killed — they belong to the wall-clock-current shell,
         # not the conversation that just got swapped in.
+        self._clear_turn_journal()
+        self._session_id = session_id
+        self.ctx.session_id = session_id
+        self.ctx.tasks.clear()
+        self.ctx.task_next_id = 1
+        recover_tasks_for_session(self.ctx, session_id)
         self.messages = msgs
         self._drop_queue()
         self._drop_steer()
@@ -439,8 +537,33 @@ class AppHistoryMixin:
             self._checkpoint_block.remove()
         self._checkpoint_block = None
 
+        # If the previous process died during a tool call, complete any
+        # orphan assistant tool_calls with an explicit unknown-result stub
+        # so the next model request is protocol-valid and does not rerun
+        # side-effecting tools by accident.
+        if recovery_notice and not recovered_modified:
+            self._pair_orphan_tool_calls(
+                "⛔ Tool result unknown: previous TUI disconnected during recovery."
+            )
+            recovered_modified = True
+
         await self._replay_messages_to_view()
+        if "checkpoint" in payload:
+            snapshot = payload.get("checkpoint")
+            self.ctx.checkpoint = snapshot if isinstance(snapshot, dict) else None
+            await self._sync_checkpoint_block()
         self._autosave_path = target
+        if recovery_input:
+            try:
+                self.query_one("#user-input", MultilineInput).text = recovery_input
+            except Exception:
+                pass
+        if recovery_notice:
+            await self._mount_widget(Static(Text(
+                f"🔌 {recovery_notice}", style="bold #f9e2af"
+            )))
+        if recovered_modified:
+            await self._autosave_conversation()
 
         # Reset token counter — saved file has no original usage info,
         # and pretending the previous turns "cost zero" would lie about
@@ -544,6 +667,16 @@ class AppHistoryMixin:
                             await self._sync_checkpoint_block()
                     continue
 
+                if name == "checkpoint_clear":
+                    if isinstance(args, dict) and "_raw" not in args:
+                        try:
+                            result = tool_checkpoint_clear(self.ctx, **args)
+                        except TypeError:
+                            result = "Error: bad checkpoint_clear arguments"
+                        if not result.startswith("Error:"):
+                            await self._sync_checkpoint_block()
+                    continue
+
                 block = ToolCallBlock(name, args)
                 await self._mount_widget(block)
                 result = tool_results.get(tc.get("id"))
@@ -574,6 +707,7 @@ class AppHistoryMixin:
             "- `/save <name>` 保存到 `~/.ddtui/history/<name>.json`\n"
             "- `/load <name>` 读回保存的对话\n"
             "- `/resume [name]` 恢复对话；不带 name 时打开选择窗口\n"
+            "- 断线后启动会提示可恢复会话；用 `/resume <name>` 接回\n"
             "- `/list-history` 列出已保存对话\n"
             "- `/provider [deepseek|codex]` 查看 / 切换 provider\n"
             "- `/model [<id>]` 查看 / 切换模型（下一轮请求生效）\n"
@@ -596,8 +730,9 @@ class AppHistoryMixin:
             "- `Ctrl+C` 退出\n\n"
             "### 工具(模型可调用)\n"
             "`bash` `bash_start/check/wait/kill/list` "
+            "`terminal_start/send/read/interrupt/close/list` "
             "`task_start/check/read/wait/kill/list` "
-            "`checkpoint_tool/get` "
+            "`checkpoint_tool/get/clear` "
             "`project_note_add/search/list/read/update/delete` "
             "`read_file` `write_file` `apply_patch` `edit_file` `edit_lines` `multi_edit` "
             "`list_files` `glob_files` `search_content` `web_fetch` `web_search` "

@@ -149,6 +149,48 @@ def tool_checkpoint_tool(
     )
 
 
+def tool_checkpoint_clear(ctx: ToolContext, reason: str | None = None) -> str:
+    """Clear the current conversation checkpoint."""
+    had_checkpoint = bool(ctx.checkpoint)
+    ctx.checkpoint = None
+    reason = _clean_text(reason, limit=1000)
+    if not had_checkpoint:
+        return "No checkpoint set."
+    if reason:
+        return f"Checkpoint cleared.\nreason: {reason}"
+    return "Checkpoint cleared."
+
+
+def prune_checkpoint_refs(
+    ctx: ToolContext, completed_refs: list[str]
+) -> dict[str, Any]:
+    """Remove completed task refs from the current checkpoint.
+
+    Returns a small change report. If a waiting checkpoint was only
+    waiting on these refs, it is cleared entirely so the sidebar does
+    not keep stale state around.
+    """
+    cp = ctx.checkpoint
+    if not cp:
+        return {"changed": False, "cleared": False, "removed": []}
+    active_refs = [str(x) for x in cp.get("active_refs") or []]
+    completed = {str(x) for x in completed_refs if str(x)}
+    if not active_refs or not completed:
+        return {"changed": False, "cleared": False, "removed": []}
+    remaining = [ref for ref in active_refs if ref not in completed]
+    removed = [ref for ref in active_refs if ref in completed]
+    if not removed:
+        return {"changed": False, "cleared": False, "removed": []}
+    if cp.get("status") == "waiting" and not remaining:
+        ctx.checkpoint = None
+        return {"changed": True, "cleared": True, "removed": removed}
+    updated = dict(cp)
+    updated["active_refs"] = remaining
+    updated["updated_at"] = _now()
+    ctx.checkpoint = updated
+    return {"changed": True, "cleared": False, "removed": removed}
+
+
 def tool_checkpoint_get(ctx: ToolContext) -> str:
     """Return the current conversation checkpoint."""
     if not ctx.checkpoint:

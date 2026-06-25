@@ -24,6 +24,7 @@ from .app_support import load_agents_md
 from .app_ui import AppUiMixin
 from .config import DEFAULT_PROVIDER, POST_SYSTEM_PROMPT, SYSTEM_PROMPT
 from .providers import ProviderConfigError, build_provider
+from .runtime_state import new_session_id
 from .state import TokenCounter, ToolContext
 from .widgets import (
     BgJobsBlock,
@@ -34,6 +35,7 @@ from .widgets import (
     StatusBar,
     SubagentsBlock,
     TasksBlock,
+    TerminalTabPane,
     TodoBlock,
 )
 
@@ -136,7 +138,11 @@ class AgentApp(
         # Per-conversation runtime state: work_dir + bash job table +
         # id allocator. Threaded explicitly through every execute_tool
         # call so a future subagent can be handed its own ctx.
-        self.ctx = ToolContext(work_dir=os.getcwd())
+        self._session_id = new_session_id()
+        self.ctx = ToolContext(
+            work_dir=os.getcwd(),
+            session_id=self._session_id,
+        )
         # SYSTEM_PROMPT ends with "当前路径为：" — append cwd at startup
         # so the model knows where it's operating.
         self.messages: list = [
@@ -192,6 +198,8 @@ class AgentApp(
         self._live_subagents: dict[str, SubagentSession] = {}
         self._subagent_next_id = 1
         self._subagent_block: SubagentsBlock | None = None
+        # Terminal PTY tabs, keyed by terminal_id.
+        self._terminal_panes: dict[str, TerminalTabPane] = {}
         # Message queue: messages submitted while a turn is in flight
         # land here and are consumed in FIFO order after the current
         # turn finishes. Wiped on /clear and on turn-level runtime error

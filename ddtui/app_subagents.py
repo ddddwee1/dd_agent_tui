@@ -20,6 +20,7 @@ from .state import (
     ToolContext,
     kill_all_bash_jobs,
     kill_all_tasks,
+    kill_all_terminals,
 )
 from .tools import TOOLS, execute_tool
 from .widgets import SubagentTabPane
@@ -383,12 +384,19 @@ class AppSubagentMixin:
                 "end_agent",
                 "checkpoint_tool",
                 "checkpoint_get",
+                "checkpoint_clear",
                 "task_start",
                 "task_check",
                 "task_read",
                 "task_wait",
                 "task_kill",
                 "task_list",
+                "terminal_start",
+                "terminal_send",
+                "terminal_read",
+                "terminal_interrupt",
+                "terminal_close",
+                "terminal_list",
             )
         ]
 
@@ -553,6 +561,7 @@ class AppSubagentMixin:
         if sess.task is not None and not sess.task.done():
             sess.task.cancel()
         kill_all_bash_jobs(sess.ctx.bash_jobs)
+        kill_all_terminals(sess.ctx.terminals)
         kill_all_tasks(sess.ctx.tasks)
         self.call_later(self._remove_sub_tab, sid)
         return (

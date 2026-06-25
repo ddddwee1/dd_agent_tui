@@ -74,9 +74,18 @@ class AppAgentLoopMixin:
         pending = user_text
         try:
             while True:
+                self._ensure_autosave_path()
+                self._write_turn_journal(
+                    phase="turn_started",
+                    pending_user_text=pending,
+                    message_len_before_turn=len(self.messages),
+                    tool_started=False,
+                )
                 self.messages.append({"role": "user", "content": pending})
+                await self._autosave_conversation()
                 ok = await self._run_one_turn()
                 if not ok:
+                    self._clear_turn_journal()
                     # Turn-level runtime error already surfaced + rolled back.
                     # Wipe the queue: don't railroad the user into
                     # more failing turns; let them re-submit if they want.
@@ -84,7 +93,9 @@ class AppAgentLoopMixin:
                     self._refresh_status()
                     return
                 if not self._queued:
+                    self._clear_turn_journal()
                     return
+                self._clear_turn_journal()
                 pending, parked = self._queued.pop(0)
                 # Migrate the parked bubble into the conversation flow:
                 # remove it from #pending and mount a fresh one in
@@ -109,6 +120,7 @@ class AppAgentLoopMixin:
             # tool_call with a stub `tool` result before re-raising so
             # the history stays protocol-valid.
             self._pair_orphan_tool_calls()
+            self._clear_turn_journal()
             raise
         finally:
             self._set_busy(False)
@@ -169,14 +181,26 @@ class AppAgentLoopMixin:
                         await self._mount_widget(SteerBubble(s))
                     self._refresh_status()
 
+                self._write_turn_journal(
+                    phase="streaming",
+                    message_len_current=len(self.messages),
+                )
                 assistant_msg = await self._stream_one()
                 self.messages.append(assistant_msg)
+                await self._autosave_conversation()
                 tool_calls = assistant_msg.get("tool_calls") or []
                 if not tool_calls:
                     return True
                 for tc in tool_calls:
                     name = tc["function"]["name"]
                     raw = tc["function"].get("arguments") or "{}"
+                    self._write_turn_journal(
+                        phase="tool",
+                        tool_started=True,
+                        active_tool_name=name,
+                        active_tool_call_id=tc.get("id"),
+                        message_len_current=len(self.messages),
+                    )
                     try:
                         args = json.loads(raw)
                     except json.JSONDecodeError:
@@ -218,9 +242,14 @@ class AppAgentLoopMixin:
                                     "content": result,
                                 }
                             )
+                            await self._autosave_conversation()
+                            self._write_turn_journal(
+                                phase="after_tool",
+                                message_len_current=len(self.messages),
+                            )
                             continue
 
-                        if name == "checkpoint_tool":
+                        if name in ("checkpoint_tool", "checkpoint_clear"):
                             result = await asyncio.to_thread(
                                 execute_tool, self.ctx, name, args
                             )
@@ -232,6 +261,11 @@ class AppAgentLoopMixin:
                                     "tool_call_id": tc["id"],
                                     "content": result,
                                 }
+                            )
+                            await self._autosave_conversation()
+                            self._write_turn_journal(
+                                phase="after_tool",
+                                message_len_current=len(self.messages),
                             )
                             continue
 
@@ -255,6 +289,11 @@ class AppAgentLoopMixin:
                                 "tool_call_id": tc["id"],
                                 "content": result,
                             })
+                            await self._autosave_conversation()
+                            self._write_turn_journal(
+                                phase="after_tool",
+                                message_len_current=len(self.messages),
+                            )
                             continue
 
                         if name in (
@@ -302,6 +341,11 @@ class AppAgentLoopMixin:
                                     "tool_call_id": tc["id"],
                                     "content": result,
                                 })
+                                await self._autosave_conversation()
+                                self._write_turn_journal(
+                                    phase="after_tool",
+                                    message_len_current=len(self.messages),
+                                )
                                 raise
                             if len(result) > SUBAGENT_RESULT_MAX_CHARS:
                                 result = (
@@ -315,6 +359,11 @@ class AppAgentLoopMixin:
                                 "tool_call_id": tc["id"],
                                 "content": result,
                             })
+                            await self._autosave_conversation()
+                            self._write_turn_journal(
+                                phase="after_tool",
+                                message_len_current=len(self.messages),
+                            )
                             continue
 
                         block = ToolCallBlock(name, args)
@@ -351,6 +400,11 @@ class AppAgentLoopMixin:
                             block.set_result(result, blocked=True)
                     self.messages.append(
                         {"role": "tool", "tool_call_id": tc["id"], "content": result}
+                    )
+                    await self._autosave_conversation()
+                    self._write_turn_journal(
+                        phase="after_tool",
+                        message_len_current=len(self.messages),
                     )
         except Exception as e:
             # Roll back the in-flight turn from history AND wipe its

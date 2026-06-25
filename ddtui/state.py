@@ -22,9 +22,13 @@ import asyncio
 import os
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+
+from .runtime_state import pid_alive, read_json
 
 
 @dataclass
@@ -47,6 +51,32 @@ class BgJob:
 
 
 @dataclass
+class TerminalSession:
+    """One interactive PTY-backed terminal session.
+
+    Unlike task_start, this is meant for long-lived interactive shells:
+    ssh, tmux attach, REPLs, debuggers, and installers that need prompt
+    state. Output is mirrored to log_path and a bounded in-memory tail
+    for the live UI tab.
+    """
+
+    id: str
+    name: str
+    command: str
+    workdir: str
+    master_fd: int
+    log_path: Path
+    proc: subprocess.Popen
+    started_at: float
+    output_size: int = 0
+    tail: str = ""
+    finished_at: float | None = None
+    closed: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    pane: "TerminalTabPane | None" = None
+
+
+@dataclass
 class AsyncTask:
     """One managed asynchronous task started by task_start.
 
@@ -61,15 +91,41 @@ class AsyncTask:
     workdir: str
     output_path: Path
     status_path: Path
-    proc: subprocess.Popen
+    proc: subprocess.Popen | "RecoveredProcess"
     started_at: float
     started_wall: float
     notify_on_complete: bool = True
+    session_id: str | None = None
+    registry_path: Path | None = None
+    runner_pid: int | None = None
+    recovered: bool = False
     finished_at: float | None = None
     finished_wall: float | None = None
     return_code: int | None = None
     killed: bool = False
     notified: bool = False
+
+
+@dataclass
+class RecoveredProcess:
+    """Small poll-compatible stand-in for a runner from a prior TUI process."""
+
+    pid: int
+    status_path: Path
+
+    def poll(self) -> int | None:
+        payload = read_json(self.status_path) or {}
+        status = payload.get("status")
+        rc = payload.get("return_code")
+        if status in ("success", "failed", "killed"):
+            if isinstance(rc, int):
+                return rc
+            return 0 if status == "success" else 1
+        if pid_alive(self.pid):
+            return None
+        if isinstance(rc, int):
+            return rc
+        return 1
 
 
 def kill_all_bash_jobs(jobs: dict[str, BgJob]) -> None:
@@ -99,6 +155,34 @@ def kill_all_bash_jobs(jobs: dict[str, BgJob]) -> None:
         if j.proc.poll() is None:
             _signal_pg(j, signal.SIGKILL)
     jobs.clear()
+
+
+def kill_all_terminals(terminals: dict[str, TerminalSession]) -> None:
+    """Terminate every live terminal and clear the table."""
+    def _signal_pg(t: TerminalSession, sig: int) -> None:
+        try:
+            os.killpg(os.getpgid(t.proc.pid), sig)
+        except Exception:
+            pass
+
+    for t in terminals.values():
+        if t.proc.poll() is None:
+            _signal_pg(t, signal.SIGTERM)
+    for _ in range(20):
+        alive = [t for t in terminals.values() if t.proc.poll() is None]
+        if not alive:
+            break
+        time.sleep(0.005)
+    for t in terminals.values():
+        if t.proc.poll() is None:
+            _signal_pg(t, signal.SIGKILL)
+    for t in terminals.values():
+        try:
+            os.close(t.master_fd)
+        except Exception:
+            pass
+        t.closed = True
+    terminals.clear()
 
 
 def kill_all_tasks(tasks: dict[str, AsyncTask]) -> None:
@@ -143,6 +227,32 @@ def async_task_status(task: AsyncTask) -> tuple[str, int | None, float]:
 
     status_word ∈ {"running", "success", "failed", "killed"}.
     """
+    payload = read_json(task.status_path) or {}
+    payload_status = payload.get("status")
+    payload_rc = payload.get("return_code")
+    if payload_status in ("success", "failed", "killed"):
+        if task.finished_at is None:
+            task.finished_at = time.monotonic()
+            finished_raw = payload.get("finished_at")
+            if isinstance(finished_raw, str):
+                try:
+                    task.finished_wall = datetime.fromisoformat(
+                        finished_raw
+                    ).timestamp()
+                except Exception:
+                    task.finished_wall = time.time()
+            else:
+                task.finished_wall = time.time()
+            task.return_code = payload_rc if isinstance(payload_rc, int) else None
+        if payload_status == "killed":
+            task.killed = True
+            return "killed", task.return_code, task.finished_at - task.started_at
+        return (
+            "success" if payload_status == "success" else "failed",
+            task.return_code,
+            task.finished_at - task.started_at,
+        )
+
     rc = task.proc.poll()
     if rc is None:
         return "running", None, time.monotonic() - task.started_at
@@ -166,10 +276,13 @@ class ToolContext:
     through `execute_tool`; a future subagent will get its own."""
 
     work_dir: str
+    session_id: str = ""
     bash_jobs: dict[str, BgJob] = field(default_factory=dict)
+    terminals: dict[str, TerminalSession] = field(default_factory=dict)
     tasks: dict[str, AsyncTask] = field(default_factory=dict)
     checkpoint: dict | None = None
     bash_next_id: int = 1
+    terminal_next_id: int = 1
     task_next_id: int = 1
 
     def alloc_bash_id(self) -> str:
@@ -177,6 +290,12 @@ class ToolContext:
         i = self.bash_next_id
         self.bash_next_id += 1
         return f"bg-{i}"
+
+    def alloc_terminal_id(self) -> str:
+        """Reserve and return the next terminal id ('term-N')."""
+        i = self.terminal_next_id
+        self.terminal_next_id += 1
+        return f"term-{i}"
 
     def alloc_task_id(self) -> str:
         """Reserve and return the next managed task id ('task-N')."""

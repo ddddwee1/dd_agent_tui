@@ -164,8 +164,9 @@ ddtui
 模型可以调用这些工具：
 
 - shell：`bash`、`bash_start`、`bash_check`、`bash_wait`、`bash_kill`、`bash_list`
+- 交互式 Terminal：`terminal_start`、`terminal_send`、`terminal_read`、`terminal_interrupt`、`terminal_close`、`terminal_list`
 - 托管异步任务：`task_start`、`task_check`、`task_read`、`task_wait`、`task_kill`、`task_list`
-- 会话 checkpoint：`checkpoint_tool`、`checkpoint_get`
+- 会话 checkpoint：`checkpoint_tool`、`checkpoint_get`、`checkpoint_clear`
 - 项目笔记：`project_note_add`、`project_note_search`、`project_note_list`、`project_note_read`、`project_note_update`、`project_note_delete`
 - 文件：`read_file`、`write_file`、`apply_patch`、`edit_file`、`edit_lines`、`multi_edit`
 - 搜索：`list_files`、`glob_files`、`search_content`
@@ -173,15 +174,27 @@ ddtui
 - 任务进度：`todo_tool`
 - 子 agent：`spawn_agent`、`chat_agent`、`await_agent`、`end_agent`
 
+### 交互式 Terminal
+
+`terminal_start` 会启动一个常驻 PTY，并在顶部 tab 里展示实时输出。适合需要保持上下文的交互会话，例如 `ssh`、远端 `tmux`、REPL、debugger 或交互安装器。连续远端操作时，agent 应优先开一个 terminal，然后用 `terminal_send` 往里面输入命令，而不是反复执行 `ssh host "cmd"`。
+
+推荐远端长会话用 tmux，例如：
+
+```bash
+ssh -tt host 'tmux new -A -s ddtui-agent'
+```
+
+非交互的长测试、构建、下载、训练、profile 仍优先用 `task_start`，这样可以自动通知完成状态。
+
 ### 托管异步任务
 
 `bash_start` 是原始后台 shell，适合简单后台进程；如果是测试、构建、下载、训练、profile 等完成状态很重要的长任务，优先用 `task_start`。
 
-`task_start` 会返回 `task_id`、`output_path` 和 `status_path`。agent 可以用 `task_check` 看 tail、用 `task_read` 按 offset 增量读输出。默认 `notify_on_complete=true`，任务完成后会向 agent 发送异步完成通知。严格规则：agent 可以在等待期间继续做别的事；做完其他事后不要再调用 `task_wait`，而是记录 checkpoint（如有帮助）并暂停当前回复，等待通知自动唤醒。`task_wait` 正常用于 `notify_on_complete=false` 的任务；对 `notify_on_complete=true` 只应在用户明确要求阻塞，或任务明显快结束且只做一次短暂有界等待时使用。
+`task_start` 会返回 `task_id`、`output_path` 和 `status_path`。agent 可以用 `task_check` 看 tail、用 `task_read` 按 offset 增量读输出，但它们只用于一次性检查当前输出是否会改变下一步行动。默认 `notify_on_complete=true`，任务完成后会向 agent 发送异步完成通知。严格规则：agent 可以在等待期间继续做别的事；做完其他事后不要调用 `task_wait`，也不要用反复 `task_check` / `task_read` 轮询来替代等待，而是记录 checkpoint（如有帮助）并暂停当前回复，等待通知自动唤醒。`task_wait` 正常用于 `notify_on_complete=false` 的任务；对 `notify_on_complete=true` 只应在用户明确要求阻塞，或任务明显快结束且只做一次短暂有界等待时使用。
 
 ### 会话 checkpoint
 
-`todo_tool` 管执行清单，`checkpoint_tool` 管当前工作状态，`project_note_*` 管长期项目知识。checkpoint 会替换上一份状态，不是追加日志。
+`todo_tool` 管执行清单，`checkpoint_tool` 管当前工作状态，`checkpoint_clear` 收回当前 checkpoint，`project_note_*` 管长期项目知识。checkpoint 会替换上一份状态，不是追加日志。等待中的 checkpoint 如果只引用了已完成 task，task 完成通知也会自动收回它。
 
 适合在长任务、并行 task/subagent、复杂 debug、多假设推理、等待异步通知、准备暂停当前回复、或 `/resume` 后状态不确定时使用。`checkpoint_get` 可以显式读取当前 checkpoint。checkpoint 不单独落文件，但会进入对话历史并跟随 autosave；恢复会话时会从最新一次 `checkpoint_tool` 重建侧边栏。
 
@@ -296,6 +309,8 @@ export DDTUI_ALLOW_UNSANDBOXED_BASH=1
 `/load <name>` 可以恢复对话并重建聊天视图。保存文件只包含 message 历史和少量元信息，不包含原始 token usage；加载后 token 计数会重置。
 
 新会话启动时会创建独立的自动保存文件；每轮结束、回到可输入状态时会自动写入当前对话。`/resume` 不带文件名会打开选择窗口，列表按文件最后编辑时间排序，并显示到年月日小时分钟。
+
+断线恢复使用 `~/.ddtui/runtime/<session_id>/` 记录当前回合和托管异步任务。重启后仍默认进入新会话，但如果检测到未完成回合，会提示用 `/resume <name>` 接回。恢复时，断在模型流式输出阶段的回合会回滚到上一条稳定消息，并把用户输入放回输入框；断在工具执行阶段不会自动重跑工具，而是补一个未知结果占位，避免重复执行有副作用的操作。`task_start` 创建的托管任务由独立 runner 负责写最终状态，恢复会话后可以重新出现在侧边栏并补发完成通知。
 
 `/clear` 会开始一个新的自动保存会话，不会把刚清空的内容写回旧会话文件。
 

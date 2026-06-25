@@ -3,7 +3,8 @@
 The large tool implementation set is split by domain:
 - `tool_schemas` keeps the JSON schemas sent to the LLM.
 - `tools_bash`, `tools_files`, `tools_search`, `tools_web`, and
-  `tools_checkpoint`, `tools_notes`, `tools_tasks`, `tools_todo` contain the concrete Python implementations.
+  `tools_checkpoint`, `tools_notes`, `tools_tasks`, `tools_terminal`,
+  `tools_todo` contain the concrete Python implementations.
 
 `execute_tool` remains the single public dispatch entry point used by
 `AgentApp` and subagents.
@@ -21,7 +22,11 @@ from .tools_bash import (
     tool_bash_start,
     tool_bash_wait,
 )
-from .tools_checkpoint import tool_checkpoint_get, tool_checkpoint_tool
+from .tools_checkpoint import (
+    tool_checkpoint_clear,
+    tool_checkpoint_get,
+    tool_checkpoint_tool,
+)
 from .tools_files import (
     tool_apply_patch,
     tool_edit_file,
@@ -47,6 +52,14 @@ from .tools_tasks import (
     tool_task_start,
     tool_task_wait,
 )
+from .tools_terminal import (
+    tool_terminal_close,
+    tool_terminal_interrupt,
+    tool_terminal_list,
+    tool_terminal_read,
+    tool_terminal_send,
+    tool_terminal_start,
+)
 from .tools_todo import tool_todo_tool
 from .tools_web import tool_web_fetch, tool_web_search
 
@@ -63,12 +76,19 @@ TOOL_FUNCS = {
     "bash_list": tool_bash_list,
     "checkpoint_tool": tool_checkpoint_tool,
     "checkpoint_get": tool_checkpoint_get,
+    "checkpoint_clear": tool_checkpoint_clear,
     "task_start": tool_task_start,
     "task_check": tool_task_check,
     "task_read": tool_task_read,
     "task_wait": tool_task_wait,
     "task_kill": tool_task_kill,
     "task_list": tool_task_list,
+    "terminal_start": tool_terminal_start,
+    "terminal_send": tool_terminal_send,
+    "terminal_read": tool_terminal_read,
+    "terminal_interrupt": tool_terminal_interrupt,
+    "terminal_close": tool_terminal_close,
+    "terminal_list": tool_terminal_list,
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "apply_patch": tool_apply_patch,

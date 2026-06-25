@@ -829,6 +829,41 @@ class SubagentsBlock(Static):
         self.update(t)
 
 
+class TerminalTabPane(VerticalScroll):
+    """Live read-only view of one PTY terminal session."""
+
+    DEFAULT_CSS = """
+    TerminalTabPane { padding: 0 1; }
+    """
+
+    def __init__(self, sess) -> None:
+        super().__init__()
+        self.sess = sess
+        self._content = Static()
+
+    def on_mount(self) -> None:
+        self.mount(self._content)
+        self.refresh_from_session()
+
+    def refresh_from_session(self) -> None:
+        rc = self.sess.proc.poll()
+        if rc is None and not self.sess.closed:
+            status = "running"
+            style = "bold #89b4fa"
+        else:
+            status = f"exited {rc}"
+            style = "bold #a6e3a1" if rc == 0 else "bold #f38ba8"
+        header = Text()
+        header.append(f"{self.sess.id}  ", style="bold #89b4fa")
+        header.append(self.sess.name, style="bold")
+        header.append(f"  {status}", style=style)
+        header.append(f"\ncmd: {self.sess.command}", style="dim")
+        header.append(f"\nlog: {self.sess.log_path}\n\n", style="dim")
+        body = Text.from_ansi(self.sess.tail or "(no output yet)")
+        self._content.update(Group(header, body))
+        self.scroll_end(animate=False)
+
+
 class SubagentTabPane(VerticalScroll):
     """Live + read-only transcript view for one SubagentSession.
 
@@ -1133,10 +1168,7 @@ class TasksBlock(Static):
     def render_tasks(self, tasks: list[AsyncTask]) -> None:
         t = Text()
         t.append("Tasks  ", style="bold #89b4fa")
-        statuses = [async_task_status(task)[0] for task in tasks]
-        n_run = sum(1 for status in statuses if status == "running")
-        n_done = len(tasks) - n_run
-        t.append(f"({n_run} 跑 · {n_done} 完)", style="dim")
+        t.append(f"({len(tasks)} 跑)", style="dim")
         if not tasks:
             t.append("\n  (empty)", style="dim italic")
             self.update(t)
@@ -1146,18 +1178,8 @@ class TasksBlock(Static):
             label = self._clip(task.name or task.command, 30)
             output = self._clip(str(task.output_path), 34)
             t.append("\n  ")
-            if status == "running":
-                t.append("▶ ", style="bold cyan")
-                t.append(f"{task.id}", style="bold cyan")
-            elif status == "success":
-                t.append("✓ ", style="bold green")
-                t.append(f"{task.id}", style="green")
-            elif status == "killed":
-                t.append("! ", style="bold yellow")
-                t.append(f"{task.id}", style="yellow")
-            else:
-                t.append("✗ ", style="bold red")
-                t.append(f"{task.id}", style="red")
+            t.append("▶ ", style="bold cyan")
+            t.append(f"{task.id}", style="bold cyan")
             t.append(f"  {elapsed:5.1f}s ", style="dim")
             t.append(label)
             if rc is not None:

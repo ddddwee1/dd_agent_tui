@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,21 @@ from .config import (
     TASK_READ_MAX_CHARS,
     TASK_RETENTION_SECONDS,
 )
-from .state import AsyncTask, ToolContext, async_task_status as _task_status
+from .runtime_state import (
+    atomic_write_json,
+    clear_path,
+    read_json,
+    task_registry_path,
+    task_spec_path,
+    tasks_dir,
+)
+from .state import (
+    AsyncTask,
+    RecoveredProcess,
+    ToolContext,
+    async_task_status as _task_status,
+)
+from .tools_checkpoint import prune_checkpoint_refs
 from .tool_utils import (
     _check_dangerous,
     _safe_path,
@@ -72,6 +87,47 @@ def _iso_from_ts(ts: float | None) -> str | None:
     return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
 
 
+def _ts_from_iso(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except Exception:
+        return None
+
+
+def _task_registry_payload(task: AsyncTask) -> dict:
+    status, rc, elapsed = _task_status(task)
+    return {
+        "version": 1,
+        "session_id": task.session_id,
+        "task_id": task.id,
+        "name": task.name,
+        "command": task.command,
+        "workdir": task.workdir,
+        "output_path": str(task.output_path),
+        "status_path": str(task.status_path),
+        "registry_path": str(task.registry_path) if task.registry_path else None,
+        "runner_pid": task.runner_pid or getattr(task.proc, "pid", None),
+        "pid": task.runner_pid or getattr(task.proc, "pid", None),
+        "started_wall": task.started_wall,
+        "started_at": _iso_from_ts(task.started_wall),
+        "finished_at": _iso_from_ts(task.finished_wall),
+        "duration_sec": round(elapsed, 3),
+        "status": status,
+        "return_code": rc,
+        "notify_on_complete": task.notify_on_complete,
+        "notified": task.notified,
+        "killed": task.killed,
+    }
+
+
+def _write_registry(task: AsyncTask) -> None:
+    if task.registry_path is None:
+        return
+    atomic_write_json(task.registry_path, _task_registry_payload(task))
+
+
 def _write_status(task: AsyncTask) -> None:
     status, rc, elapsed = _task_status(task)
     payload = {
@@ -80,12 +136,15 @@ def _write_status(task: AsyncTask) -> None:
         "status": status,
         "return_code": rc,
         "pid": task.proc.pid,
+        "runner_pid": task.runner_pid or getattr(task.proc, "pid", None),
+        "session_id": task.session_id,
         "command": task.command,
         "workdir": task.workdir,
         "started_at": _iso_from_ts(task.started_wall),
         "finished_at": _iso_from_ts(task.finished_wall),
         "duration_sec": round(elapsed, 3),
         "output_path": str(task.output_path),
+        "status_path": str(task.status_path),
         "notify_on_complete": task.notify_on_complete,
     }
     tmp = task.status_path.with_name(
@@ -96,6 +155,7 @@ def _write_status(task: AsyncTask) -> None:
         encoding="utf-8",
     )
     tmp.replace(task.status_path)
+    _write_registry(task)
 
 
 def _task_gc(tasks: dict[str, AsyncTask]) -> None:
@@ -111,13 +171,80 @@ def _task_gc(tasks: dict[str, AsyncTask]) -> None:
             stale.append(tid)
     for tid in stale:
         task = tasks.pop(tid)
-        for path in (task.output_path, task.status_path):
+        paths = [task.output_path, task.status_path]
+        if task.registry_path is not None:
+            paths.append(task.registry_path)
+            paths.append(task.registry_path.with_suffix(".spec.json"))
+        for path in paths:
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
             except Exception:
                 pass
+
+
+def recover_tasks_for_session(ctx: ToolContext, session_id: str) -> list[AsyncTask]:
+    """Load persisted task registry entries for *session_id* into ctx."""
+    ctx.tasks.clear()
+    max_seen = 0
+    recovered: list[AsyncTask] = []
+    task_dir = tasks_dir(session_id)
+    if not task_dir.exists():
+        return recovered
+    for path in sorted(task_dir.glob("task-*.json")):
+        if path.name.endswith(".spec.json"):
+            continue
+        payload = read_json(path)
+        if not payload:
+            continue
+        task_id = str(payload.get("task_id") or path.stem)
+        try:
+            idx = int(task_id.rsplit("-", 1)[-1])
+            max_seen = max(max_seen, idx)
+        except Exception:
+            pass
+        status_path = Path(str(payload.get("status_path") or ""))
+        output_path = Path(str(payload.get("output_path") or ""))
+        runner_pid = payload.get("runner_pid") or payload.get("pid") or 0
+        try:
+            runner_pid = int(runner_pid)
+        except Exception:
+            runner_pid = 0
+        started_wall = payload.get("started_wall")
+        if not isinstance(started_wall, (int, float)):
+            started_wall = (
+                _ts_from_iso(str(payload.get("started_at") or ""))
+                or time.time()
+            )
+        started_at = time.monotonic() - max(
+            0.0, time.time() - float(started_wall)
+        )
+        proc = RecoveredProcess(pid=runner_pid, status_path=status_path)
+        task = AsyncTask(
+            id=task_id,
+            name=str(payload.get("name") or task_id),
+            command=str(payload.get("command") or ""),
+            workdir=str(payload.get("workdir") or ctx.work_dir),
+            output_path=output_path,
+            status_path=status_path,
+            proc=proc,
+            started_at=started_at,
+            started_wall=float(started_wall),
+            notify_on_complete=bool(payload.get("notify_on_complete", True)),
+            session_id=session_id,
+            registry_path=path,
+            runner_pid=runner_pid,
+            recovered=True,
+            notified=bool(payload.get("notified", False)),
+            killed=bool(payload.get("killed", False)),
+        )
+        ctx.tasks[task_id] = task
+        recovered.append(task)
+    if max_seen >= ctx.task_next_id:
+        ctx.task_next_id = max_seen + 1
+    _task_gc(ctx.tasks)
+    return recovered
 
 
 def _format_task(task: AsyncTask, tail_lines: int) -> str:
@@ -134,6 +261,13 @@ def _format_task(task: AsyncTask, tail_lines: int) -> str:
         f"Status: {task.status_path}\n"
         f"notify_on_complete: {task.notify_on_complete}"
     )
+    if status == "running" and task.notify_on_complete:
+        head += (
+            "\nwaiting_rule: do not poll task_check/task_read just to wait. "
+            "Work on other useful tasks in parallel, or if nothing useful "
+            "remains, pause the session and wait for the completion "
+            "notification."
+        )
     tail = _tail(task.output_path, tail_lines)
     if not tail:
         return head + "\n(no output yet)"
@@ -172,6 +306,8 @@ def collect_task_completion_events(ctx: ToolContext) -> list[str]:
             continue
         task.notified = True
         events.append(_completion_event(task))
+        prune_checkpoint_refs(ctx, [task.id])
+        _write_registry(task)
     _task_gc(ctx.tasks)
     return events
 
@@ -202,7 +338,11 @@ def tool_task_start(
             + "\nWait for one to finish or task_kill it first."
         )
 
-    cwd_path = _safe_path(ctx.work_dir, workdir) if workdir else Path(ctx.work_dir).resolve()
+    cwd_path = (
+        _safe_path(ctx.work_dir, workdir)
+        if workdir
+        else Path(ctx.work_dir).resolve()
+    )
     if not ALLOW_UNSANDBOXED_BASH:
         err = _sandbox_error(ctx.work_dir, cwd_path, kind="start task in a workdir")
         if err:
@@ -219,18 +359,36 @@ def tool_task_start(
     file_token = f"{task_id}-{os.getpid()}-{int(time.time() * 1000)}"
     output_path = TASK_OUTPUT_DIR / f"ddtui-{file_token}.out"
     status_path = TASK_OUTPUT_DIR / f"ddtui-{file_token}.status.json"
+    session_id = ctx.session_id or "default"
+    registry_path = task_registry_path(session_id, task_id)
+    spec_path = task_spec_path(session_id, task_id)
+    started_wall = time.time()
+    spec = {
+        "version": 1,
+        "session_id": session_id,
+        "task_id": task_id,
+        "name": task_name,
+        "command": command,
+        "workdir": cwd,
+        "output_path": str(output_path),
+        "status_path": str(status_path),
+        "notify_on_complete": bool(notify_on_complete),
+        "started_wall": started_wall,
+    }
+    atomic_write_json(spec_path, spec)
     try:
-        log_fh = open(output_path, "wb")
         proc = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            cwd=cwd,
+            [
+                sys.executable,
+                str(Path(__file__).with_name("task_runner.py")),
+                str(spec_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        log_fh.close()
     except Exception as e:
+        clear_path(spec_path)
         return f"Error starting task: {e}"
 
     task = AsyncTask(
@@ -242,22 +400,31 @@ def tool_task_start(
         status_path=status_path,
         proc=proc,
         started_at=time.monotonic(),
-        started_wall=time.time(),
+        started_wall=started_wall,
         notify_on_complete=bool(notify_on_complete),
+        session_id=session_id,
+        registry_path=registry_path,
+        runner_pid=proc.pid,
     )
     ctx.tasks[task_id] = task
+    _write_registry(task)
     _write_status(task)
 
     if task.notify_on_complete:
         wait_guidance = (
             "WAITING RULE: notify_on_complete=True, so do NOT call "
-            "task_wait just to wait for this task. Continue other useful "
-            "work; if no useful work remains, update checkpoint_tool with "
+            "task_wait, repeated task_check, or repeated task_read just to "
+            "wait for this task. You can work on other useful tasks in "
+            "parallel while this task runs. If no useful work remains, "
+            "update checkpoint_tool with "
             f"status='waiting' and active_refs=['{task_id}'] if helpful, "
-            "then finish/pause the current response and wait for the runtime "
-            "completion notification. Use task_wait only when the user "
-            "explicitly requested blocking, or for one short bounded wait "
-            "for an almost-finished task."
+            "then pause the session by finishing the current response and "
+            "wait for the runtime completion notification. Do not call "
+            "task_check as a polling loop. Use task_check/task_read only "
+            "for a one-off inspection when the current output changes what "
+            "you should do next. Use task_wait only when the user explicitly "
+            "requested blocking, or for one short bounded wait for an "
+            "almost-finished task."
         )
     else:
         wait_guidance = (

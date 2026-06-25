@@ -14,8 +14,15 @@ from .config import (
     SUBAGENT_IDLE_TIMEOUT_SEC,
     SUBAGENT_REAP_INTERVAL_SEC,
 )
-from .state import SubagentSession, kill_all_bash_jobs, kill_all_tasks
+from .runtime_state import new_session_id
+from .state import (
+    SubagentSession,
+    kill_all_bash_jobs,
+    kill_all_tasks,
+    kill_all_terminals,
+)
 from .tools_tasks import collect_task_completion_events
+from .tools_terminal import drain_terminal_output
 from .widgets import (
     BgJobsBlock,
     CheckpointBlock,
@@ -27,6 +34,7 @@ from .widgets import (
     SubagentsBlock,
     SubagentTabPane,
     TasksBlock,
+    TerminalTabPane,
     ThinkingBlock,
     ToolCallBlock,
     UserBubble,
@@ -40,6 +48,7 @@ class AppUiMixin:
         self._refresh_status()
         self.query_one("#user-input", MultilineInput).focus()
         self.call_later(self._autosave_conversation)
+        self.call_later(self._show_disconnect_recovery_notice)
         if self._startup_provider_error:
             self.call_later(self._show_startup_provider_error)
         # Watch the conversation's scroll position: scrolling up
@@ -61,6 +70,9 @@ class AppUiMixin:
         # Managed async task monitor. Completion notification delivery
         # is handled separately below; this is only the visual sidebar.
         self.set_interval(1.0, self._refresh_task_panel)
+        # Live PTY terminal tabs. These are long-lived interactive
+        # sessions such as ssh/tmux/repl.
+        self.set_interval(0.5, self._refresh_terminal_tabs)
         # Same cadence for the subagent monitor — phase changes happen
         # on millisecond scales but the user only needs a coarse "what's
         # it doing" pulse.
@@ -77,7 +89,11 @@ class AppUiMixin:
         )
 
     def _poll_task_notifications(self) -> None:
+        checkpoint_before = self.ctx.checkpoint
         events = collect_task_completion_events(self.ctx)
+        if checkpoint_before is not self.ctx.checkpoint:
+            self.call_later(self._sync_checkpoint_block)
+            self.call_later(self._autosave_conversation)
         if events:
             self._task_events.extend(events)
             self.notify(
@@ -168,9 +184,9 @@ class AppUiMixin:
     def _refresh_task_panel(self) -> None:
         """Mirror ctx.tasks into the sidebar widget.
 
-        Like the background panel, it stays visible while at least one
-        managed task is running. Finished siblings remain visible in the
-        same batch so the user can see which task in the group completed.
+        The sidebar is a live monitor, so it only shows tasks that are
+        currently running. Finished tasks remain available via task
+        notifications and task_check/task_list.
         """
         tasks = list(self.ctx.tasks.values())
         running = [task for task in tasks if task.proc.poll() is None]
@@ -194,7 +210,7 @@ class AppUiMixin:
             self._tasks_block = TasksBlock()
             self.call_later(self._mount_task_block)
             return
-        self._tasks_block.render_tasks(tasks)
+        self._tasks_block.render_tasks(running)
         sidebar.add_class("visible")
 
     async def _mount_task_block(self) -> None:
@@ -207,7 +223,11 @@ class AppUiMixin:
         if not self._tasks_block.is_mounted:
             await sidebar.mount(self._tasks_block)
         sidebar.add_class("visible")
-        self._tasks_block.render_tasks(list(self.ctx.tasks.values()))
+        running = [
+            task for task in self.ctx.tasks.values()
+            if task.proc.poll() is None
+        ]
+        self._tasks_block.render_tasks(running)
 
     def _refresh_subagent_panel(self) -> None:
         """Mirror _live_subagents into the sidebar widget. Panel exists
@@ -259,6 +279,61 @@ class AppUiMixin:
         self._subagent_block.render_sessions(
             list(self._live_subagents.values())
         )
+
+    def _refresh_terminal_tabs(self) -> None:
+        """Drain PTY output and keep terminal tabs in sync."""
+        active_ids = set(self.ctx.terminals.keys())
+        for tid in list(self._terminal_panes.keys()):
+            if tid not in active_ids:
+                self._terminal_panes.pop(tid, None)
+                self.call_later(self._remove_terminal_tab, tid)
+
+        for term in list(self.ctx.terminals.values()):
+            try:
+                drain_terminal_output(term)
+            except Exception:
+                pass
+            pane = self._terminal_panes.get(term.id)
+            if pane is None:
+                pane = term.pane if term.pane is not None else TerminalTabPane(term)
+                term.pane = pane
+                self._terminal_panes[term.id] = pane
+                self.call_later(self._add_terminal_tab, term.id)
+                continue
+            if pane.is_mounted:
+                try:
+                    pane.refresh_from_session()
+                except Exception:
+                    pass
+
+    async def _add_terminal_tab(self, terminal_id: str) -> None:
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            return
+        term = self.ctx.terminals.get(terminal_id)
+        pane = self._terminal_panes.get(terminal_id)
+        if term is None or pane is None:
+            return
+        pane_id = f"tab-{terminal_id}"
+        try:
+            existing = tabs.query_one(f"#{pane_id}", TabPane)
+        except Exception:
+            existing = None
+        if existing is not None:
+            return
+        label = f"{terminal_id}:{term.name[:12]}"
+        await tabs.add_pane(TabPane(label, pane, id=pane_id))
+
+    async def _remove_terminal_tab(self, terminal_id: str) -> None:
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            return
+        try:
+            await tabs.remove_pane(f"tab-{terminal_id}")
+        except Exception:
+            pass
 
     async def _sync_checkpoint_block(self) -> None:
         """Mirror ctx.checkpoint into the sidebar."""
@@ -358,6 +433,7 @@ class AppUiMixin:
             if sess.task is not None and not sess.task.done():
                 sess.task.cancel()
             kill_all_bash_jobs(sess.ctx.bash_jobs)
+            kill_all_terminals(sess.ctx.terminals)
             kill_all_tasks(sess.ctx.tasks)
             self._live_subagents.pop(sid, None)
             self.call_later(self._remove_sub_tab, sid)
@@ -411,10 +487,14 @@ class AppUiMixin:
         # whole process group, briefly waits, then SIGKILLs any
         # stragglers — ~100 ms cap so /clear stays snappy.
         kill_all_bash_jobs(self.ctx.bash_jobs)
+        kill_all_terminals(self.ctx.terminals)
         kill_all_tasks(self.ctx.tasks)
         if self._bg_jobs_block is not None and self._bg_jobs_block.is_mounted:
             self._bg_jobs_block.remove()
         self._bg_jobs_block = None
+        for tid in list(self._terminal_panes.keys()):
+            self.call_later(self._remove_terminal_tab, tid)
+        self._terminal_panes.clear()
         if self._tasks_block is not None and self._tasks_block.is_mounted:
             self._tasks_block.remove()
         self._tasks_block = None
@@ -426,6 +506,7 @@ class AppUiMixin:
             if sess.task is not None and not sess.task.done():
                 sess.task.cancel()
             kill_all_bash_jobs(sess.ctx.bash_jobs)
+            kill_all_terminals(sess.ctx.terminals)
             kill_all_tasks(sess.ctx.tasks)
         self._live_subagents.clear()
         self._subagent_next_id = 1
@@ -443,6 +524,10 @@ class AppUiMixin:
             pass
         # `/clear` starts a fresh conversation, so don't overwrite the
         # autosave file that held the just-cleared transcript.
+        self._clear_turn_journal()
+        self._session_id = new_session_id()
+        self.ctx.session_id = self._session_id
+        self.ctx.task_next_id = 1
         self._autosave_path = None
         self.call_later(self._autosave_conversation)
 
@@ -614,7 +699,10 @@ class AppUiMixin:
                 del self.messages[i:]
                 return
 
-    def _pair_orphan_tool_calls(self) -> int:
+    def _pair_orphan_tool_calls(
+        self,
+        cancel_note: str = "⛔ Tool execution cancelled by user (ESC×2)",
+    ) -> int:
         """ESC×2 in the middle of tool execution can leave `self.messages`
         ending in `assistant(tool_calls=[A,B,...])` with only some (or
         zero) matching `tool` results appended. The OpenAI / DeepSeek
@@ -656,7 +744,6 @@ class AppUiMixin:
         if not missing:
             return 0
 
-        cancel_note = "⛔ Tool execution cancelled by user (ESC×2)"
         for tc in missing:
             self.messages.append({
                 "role": "tool",
