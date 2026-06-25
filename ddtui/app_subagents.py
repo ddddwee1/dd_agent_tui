@@ -15,7 +15,12 @@ from .config import (
     SUBAGENT_MAX_AWAIT_TIMEOUT,
     SYSTEM_PROMPT,
 )
-from .state import SubagentSession, ToolContext, kill_all_bash_jobs
+from .state import (
+    SubagentSession,
+    ToolContext,
+    kill_all_bash_jobs,
+    kill_all_tasks,
+)
 from .tools import TOOLS, execute_tool
 from .widgets import SubagentTabPane
 
@@ -372,7 +377,18 @@ class AppSubagentMixin:
         sub_tools = [
             t for t in TOOLS
             if t["function"]["name"] not in (
-                "spawn_agent", "chat_agent", "await_agent", "end_agent"
+                "spawn_agent",
+                "chat_agent",
+                "await_agent",
+                "end_agent",
+                "checkpoint_tool",
+                "checkpoint_get",
+                "task_start",
+                "task_check",
+                "task_read",
+                "task_wait",
+                "task_kill",
+                "task_list",
             )
         ]
 
@@ -537,6 +553,7 @@ class AppSubagentMixin:
         if sess.task is not None and not sess.task.done():
             sess.task.cancel()
         kill_all_bash_jobs(sess.ctx.bash_jobs)
+        kill_all_tasks(sess.ctx.tasks)
         self.call_later(self._remove_sub_tab, sid)
         return (
             f"Session {sid} ended (turns={sess.turn}, "

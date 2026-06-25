@@ -27,11 +27,13 @@ from .providers import ProviderConfigError, build_provider
 from .state import TokenCounter, ToolContext
 from .widgets import (
     BgJobsBlock,
+    CheckpointBlock,
     CollapsedHistoryMarker,
     MultilineInput,
     SlashPopup,
     StatusBar,
     SubagentsBlock,
+    TasksBlock,
     TodoBlock,
 )
 
@@ -50,9 +52,9 @@ class AgentApp(
     #body { height: 1fr; layout: horizontal; }
     #main { width: 1fr; layout: vertical; }
     #sidebar {
-        width: 20%;
-        min-width: 24;
-        max-width: 48;
+        width: 26%;
+        min-width: 30;
+        max-width: 60;
         layout: vertical;
         border-left: solid #cba6f7;
         padding: 0 1;
@@ -173,9 +175,15 @@ class AgentApp(
         # when an "all completed" fade-out finishes.
         self._todo_block: TodoBlock | None = None
         self._todo_dismiss_timer = None  # set_timer handle for fade-out
+        # Single CheckpointBlock mirroring ctx.checkpoint. Reset on
+        # /clear; restored on /resume replay from the latest
+        # checkpoint_tool call.
+        self._checkpoint_block: CheckpointBlock | None = None
         # Single BgJobsBlock that mirrors ctx.bash_jobs into the sidebar.
         # Driven by a 1-second timer started in on_mount.
         self._bg_jobs_block: BgJobsBlock | None = None
+        # Single TasksBlock that mirrors ctx.tasks into the sidebar.
+        self._tasks_block: TasksBlock | None = None
         # Live subagent sessions, keyed by id. spawn_agent inserts one;
         # chat_agent advances the turn counter and messages on the
         # existing entry; end_agent (or the idle reaper) removes it.
@@ -206,6 +214,15 @@ class AgentApp(
         # Currently-running agent turn worker — kept so ESC×2 can
         # cancel it. None when idle.
         self._agent_worker = None
+        # Per-process autosave target. Fresh app launches allocate a
+        # distinct file; loading/resuming a saved conversation retargets
+        # autosave to that conversation so later edits bump its mtime.
+        self._autosave_path = None
+        # Managed task completion events waiting to be delivered to
+        # the agent. The UI poller appends here; the agent loop drains
+        # it before model calls, or auto-wakes from idle.
+        self._task_events: list[str] = []
+        self._task_event_wake_scheduled = False
         # ESC×2 to interrupt: first press arms, second press within
         # ESC_DOUBLE_WINDOW seconds fires _interrupt_now. The disarm
         # timer auto-resets the armed flag if no second press lands.

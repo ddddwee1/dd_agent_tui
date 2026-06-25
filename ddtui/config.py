@@ -13,6 +13,13 @@ import os
 from pathlib import Path
 
 
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # ───────── API / model providers ─────────
 
 API_KEY_PATH = os.environ.get(
@@ -79,6 +86,30 @@ BG_RETENTION_SECONDS = 300        # keep finished jobs in dict this long
 BG_DEFAULT_WAIT_TIMEOUT = 60      # bash_wait default
 BG_MAX_WAIT_TIMEOUT = 600         # absolute upper bound on a single wait call
 BG_DEFAULT_TAIL_LINES = 50
+
+# Managed async tasks. Task output/status files are intentionally under
+# /tmp like background bash logs: they are runtime artifacts, not repo
+# state. task_* keeps them longer than bash_start logs because a
+# completion notification may arrive after the agent has moved on.
+TASK_OUTPUT_DIR = Path("/tmp")
+TASK_MAX_CONCURRENT = 5
+TASK_RETENTION_SECONDS = 3600
+TASK_DEFAULT_TAIL_LINES = 80
+TASK_DEFAULT_WAIT_TIMEOUT = 60
+TASK_MAX_WAIT_TIMEOUT = 600
+TASK_READ_DEFAULT_CHARS = 12_000
+TASK_READ_MAX_CHARS = 100_000
+TASK_EVENT_TAIL_LINES = 40
+TASK_EVENT_MAX_CHARS = 12_000
+
+# Project-local notes. By default each repo gets <repo>/.ddtui/notes,
+# but users can point DDTUI_PROJECT_NOTES_DIR elsewhere for personal
+# notes that should not live in the checkout.
+PROJECT_NOTES_DIR = os.environ.get("DDTUI_PROJECT_NOTES_DIR", "").strip()
+PROJECT_NOTE_BODY_MAX_CHARS = 20_000
+PROJECT_NOTE_SEARCH_SNIPPET_CHARS = 600
+PROJECT_NOTE_DEFAULT_SEARCH_LIMIT = 5
+PROJECT_NOTE_DEFAULT_LIST_LIMIT = 20
 
 
 # ───────── /save target ─────────
@@ -165,29 +196,28 @@ DANGEROUS_SHELL_PATTERNS = [
     r"\brm\s+-rf\s+/",
 ]
 
-# Tool sandbox. By default, file-writing tools and bash workdirs must
-# stay under ToolContext.work_dir. Read/search/web tools keep their old
-# behavior (read arbitrary paths) so the user can inspect files outside
-# the repo when needed; writes and shell execution are the dangerous
-# operations. Set DDTUI_ALLOW_UNSANDBOXED_WRITES=1 or
-# DDTUI_ALLOW_UNSANDBOXED_BASH=1 to opt out.
-ALLOW_UNSANDBOXED_WRITES = (
-    os.environ.get("DDTUI_ALLOW_UNSANDBOXED_WRITES", "").strip().lower()
-    in ("1", "true", "yes", "on")
+# Tool sandbox. File-writing tools may edit arbitrary paths by default
+# so the agent can work across repos. Set
+# DDTUI_ALLOW_UNSANDBOXED_WRITES=0 to restore the old project-only
+# write/edit restriction. Bash workdirs remain under
+# ToolContext.work_dir unless DDTUI_ALLOW_UNSANDBOXED_BASH=1 is set.
+ALLOW_UNSANDBOXED_WRITES = _env_flag(
+    "DDTUI_ALLOW_UNSANDBOXED_WRITES", default=True
 )
-ALLOW_UNSANDBOXED_BASH = (
-    os.environ.get("DDTUI_ALLOW_UNSANDBOXED_BASH", "").strip().lower()
-    in ("1", "true", "yes", "on")
+ALLOW_UNSANDBOXED_BASH = _env_flag(
+    "DDTUI_ALLOW_UNSANDBOXED_BASH", default=False
 )
 
 
 # ───────── system prompt ─────────
 
 SYSTEM_PROMPT = (
-    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, read_file, write_file, apply_patch, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, web_search, todo_tool, spawn_agent, chat_agent, await_agent, end_agent. "
+    "你可以使用下列tools: bash, bash_start, bash_check, bash_wait, bash_kill, bash_list, task_start, task_check, task_read, task_wait, task_kill, task_list, checkpoint_tool, checkpoint_get, project_note_add, project_note_search, project_note_list, project_note_read, project_note_update, project_note_delete, read_file, write_file, apply_patch, edit_file, edit_lines, multi_edit, list_files, glob_files, search_content, web_fetch, web_search, todo_tool, spawn_agent, chat_agent, await_agent, end_agent. "
     "修改已有文件时，优先使用 apply_patch、edit_file、edit_lines 或 multi_edit 做增量编辑；write_file 主要用于新建文件或用户明确要求整文件覆盖；不要为了改文件而用 bash 拼接重定向，除非现有编辑工具无法完成。"
     "子 agent 是异步的：spawn_agent 创建会话并立即返回 session_id（status=running），背后的子 agent 在后台跑；chat_agent 在已有会话发新 prompt，同样立即返回。两者都不直接给答案——必须用 await_agent(session_id) 拿结果（默认 60s 超时，超时返回 still running 让你再次 await）。end_agent 释放会话。要并行就一次发多个 spawn_agent，再分别 await_agent。子 agent 跨轮保留记忆（含 reasoning），同一任务别反复 spawn。"
-    "对于多步骤任务，先用 todo_tool 列出计划（pending）；开始一项时把它标 in_progress；完成立刻标 completed 并继续下一项。"
+    "后台 shell 与托管任务的区别：bash_start 只是原始后台 shell，适合简单后台进程；如果是长时间的测试、构建、下载、训练、profile 或任何完成状态很重要的工作，优先使用 task_start。task_start 会输出 output_path/status_path；notify_on_complete=true 时任务结束会向你发送异步完成通知。严格规则：notify_on_complete=true 的任务，不要因为“没事可做，只是在等完成”而调用 task_wait；做完其他有用工作后，应使用 checkpoint_tool 记录等待状态（如有帮助），然后结束/暂停当前回复，等待通知自动唤醒。只有用户明确要求阻塞、或任务明显快结束且只做一次短暂有界等待时，才为 notify_on_complete=true 调用 task_wait。task_wait 正常用于 notify_on_complete=false 的任务。"
+    "遇到项目特定命令、环境、测试流程、远端机器、架构约定不确定时，先用 project_note_search 查询项目笔记；笔记不是绝对事实，注意 source/confidence，必要时用文件或命令验证。记录可复用项目事实时优先搜索并 project_note_update 相关旧笔记，避免新增近似重复笔记；不要保存 secret、token、密码或大段原始日志。"
+    "对于多步骤任务，先用 todo_tool 列出计划（pending）；开始一项时把它标 in_progress；完成立刻标 completed 并继续下一项。todo_tool 管执行清单；checkpoint_tool 管当前工作状态（目标、焦点、证据、决定、blocker、active task/subagent refs、下一步）；project_note_* 管长期项目知识。启动 task_start 后准备做别的事或暂停等通知、debug 出现多假设、做了关键设计决定、即将结束但工作未完成、上下文变长或 resume 后不确定状态时，使用 checkpoint_tool；不确定当前状态时用 checkpoint_get。"
     "如果上下文中出现以 \"# 历史摘要\" 开头的 system 消息，那是早期对话被 /compact 压缩后的记忆——请把它当作已知背景，不要重复其中已完成的步骤，也不要把它当作新指令来回应。"
     "当前路径（供你后续调用命令作参考）："
 )

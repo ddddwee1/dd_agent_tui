@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 
+from rich.text import Text
 from textual.containers import Vertical, VerticalScroll
+from textual.widgets import Static
 
 from .app_errors import _exception_block
 from .app_support import _merge_tool_call_delta
@@ -31,6 +33,36 @@ PARENT_TOOLS = [
 
 
 class AppAgentLoopMixin:
+    def _pop_task_event_text(self) -> str | None:
+        if not self._task_events:
+            return None
+        events = self._task_events
+        self._task_events = []
+        return "\n\n".join(events)
+
+    async def _mount_task_event_notice(self, text: str) -> None:
+        await self._mount_widget(Static(Text(text, style="bold #94e2d5")))
+
+    async def _drain_task_events_to_messages(self) -> None:
+        text = self._pop_task_event_text()
+        if not text:
+            return
+        self.messages.append({"role": "user", "content": text})
+        await self._mount_task_event_notice(text)
+
+    async def _start_task_event_turn(self) -> None:
+        self._task_event_wake_scheduled = False
+        if self._busy:
+            return
+        text = self._pop_task_event_text()
+        if not text:
+            return
+        self._follow_bottom = True
+        await self._mount_task_event_notice(text)
+        self._agent_worker = self.run_worker(
+            self._agent_turn(text), exclusive=True
+        )
+
     async def _agent_turn(self, user_text: str) -> None:
         """Outer loop: drives one or more user turns end-to-end.
 
@@ -97,6 +129,7 @@ class AppAgentLoopMixin:
                 await self._maybe_collapse_history()
             except Exception:
                 pass
+            await self._autosave_conversation()
 
     async def _run_one_turn(self) -> bool:
         """Inner loop: one user→assistant→(tools→assistant)+ turn.
@@ -107,6 +140,10 @@ class AppAgentLoopMixin:
         """
         try:
             while True:
+                # Managed task completions are delivered at model-call
+                # boundaries, never by fabricating tool results.
+                await self._drain_task_events_to_messages()
+
                 # Drain any steer messages submitted since the last
                 # round. Tagged with [实时插话] so the model can tell
                 # this is a mid-turn interjection from the user (and
@@ -174,6 +211,21 @@ class AppAgentLoopMixin:
                             result = await asyncio.to_thread(
                                 execute_tool, self.ctx, name, args
                             )
+                            self.messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tc["id"],
+                                    "content": result,
+                                }
+                            )
+                            continue
+
+                        if name == "checkpoint_tool":
+                            result = await asyncio.to_thread(
+                                execute_tool, self.ctx, name, args
+                            )
+                            if not result.startswith("Error:"):
+                                await self._sync_checkpoint_block()
                             self.messages.append(
                                 {
                                     "role": "tool",

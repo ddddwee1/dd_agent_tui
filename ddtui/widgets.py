@@ -22,9 +22,16 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Collapsible, Static, TextArea
+from textual.widgets import Button, Collapsible, DataTable, Static, TextArea
 
-from .state import BgJob, SubagentSession, TokenCounter, bg_job_status
+from .state import (
+    AsyncTask,
+    BgJob,
+    SubagentSession,
+    TokenCounter,
+    async_task_status,
+    bg_job_status,
+)
 
 
 # ───────── conversation bubbles ─────────
@@ -247,6 +254,127 @@ class EditPendingScreen(ModalScreen[dict | None]):
             self.dismiss({"action": "delete"})
         else:
             self.dismiss({"action": "convert", "text": text})
+
+    def action_do_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ResumeConversationScreen(ModalScreen[str | None]):
+    """Modal picker for `/resume` when the user doesn't pass a name."""
+
+    BINDINGS = [
+        Binding("escape", "do_cancel", show=False),
+        Binding("enter", "do_select", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ResumeConversationScreen {
+        align: center middle;
+    }
+    #resume-dialog {
+        width: 90%;
+        max-width: 110;
+        height: 80%;
+        max-height: 32;
+        padding: 1 2;
+        background: #1e1e2e;
+        border: thick #94e2d5;
+    }
+    #resume-title {
+        height: auto;
+        margin: 0 0 1 0;
+    }
+    #resume-empty {
+        height: 1fr;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #resume-table {
+        height: 1fr;
+        margin: 0 0 1 0;
+    }
+    #resume-buttons {
+        height: 3;
+        align-horizontal: right;
+    }
+    #resume-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, entries: list[dict]) -> None:
+        self._entries = entries
+        self._names = [str(e.get("name") or "") for e in entries]
+        super().__init__()
+
+    def compose(self):
+        with Vertical(id="resume-dialog"):
+            title = Text()
+            title.append("恢复会话", style="bold #94e2d5")
+            title.append("   ·   Enter 选择   Esc 取消", style="dim")
+            yield Static(title, id="resume-title")
+            if not self._entries:
+                yield Static(
+                    "还没有保存过会话",
+                    id="resume-empty",
+                )
+            else:
+                table = DataTable(id="resume-table")
+                table.cursor_type = "row"
+                table.zebra_stripes = True
+                table.add_columns("会话", "最后编辑", "大小")
+                for entry in self._entries:
+                    name = str(entry.get("name") or "")
+                    table.add_row(
+                        name,
+                        str(entry.get("edited_at_label") or ""),
+                        str(entry.get("size_label") or ""),
+                        key=name,
+                    )
+                yield table
+            with Horizontal(id="resume-buttons"):
+                yield Button("取消", id="btn-resume-cancel")
+                yield Button(
+                    "恢复",
+                    variant="primary",
+                    id="btn-resume-open",
+                    disabled=not self._entries,
+                )
+
+    def on_mount(self) -> None:
+        if self._entries:
+            self.query_one("#resume-table", DataTable).focus()
+        else:
+            self.query_one("#btn-resume-cancel", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "btn-resume-open":
+            self.action_do_select()
+        elif bid == "btn-resume-cancel":
+            self.action_do_cancel()
+
+    def on_data_table_row_selected(
+        self, event: DataTable.RowSelected
+    ) -> None:
+        self.dismiss(str(event.row_key.value))
+
+    def _current_name(self) -> str | None:
+        if not self._entries:
+            return None
+        try:
+            table = self.query_one("#resume-table", DataTable)
+            row = table.cursor_row
+        except Exception:
+            return None
+        if 0 <= row < len(self._names):
+            return self._names[row]
+        return None
+
+    def action_do_select(self) -> None:
+        name = self._current_name()
+        if name:
+            self.dismiss(name)
 
     def action_do_cancel(self) -> None:
         self.dismiss(None)
@@ -487,6 +615,76 @@ class DiffBlock(Collapsible):
 
 
 # ───────── sidebar ─────────
+
+class CheckpointBlock(Static):
+    """Sidebar snapshot of the current conversation working state."""
+
+    DEFAULT_CSS = """
+    CheckpointBlock {
+        margin: 1 0;
+        padding: 0 1;
+        border: round #94e2d5;
+    }
+    """
+
+    def __init__(self) -> None:
+        self._checkpoint: dict | None = None
+        super().__init__(self._build())
+
+    def set_checkpoint(self, checkpoint: dict | None) -> None:
+        self._checkpoint = checkpoint
+        self.update(self._build())
+
+    @staticmethod
+    def _short(value: str, limit: int = 72) -> str:
+        text = (value or "").replace("\n", " ").strip()
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    def _append_items(
+        self, t: Text, label: str, items: list[str], *, limit: int = 3
+    ) -> None:
+        if not items:
+            return
+        t.append(f"\n{label}", style="bold #94e2d5")
+        extra = max(0, len(items) - limit)
+        for item in items[:limit]:
+            t.append("\n  - ", style="dim")
+            t.append(self._short(item), style="dim")
+        if extra:
+            t.append(f"\n  … +{extra}", style="dim")
+
+    def _build(self) -> Text:
+        cp = self._checkpoint or {}
+        t = Text()
+        t.append("Checkpoint", style="bold #94e2d5")
+        if not cp:
+            t.append("\n  (empty)", style="dim italic")
+            return t
+        status = cp.get("status") or "?"
+        confidence = cp.get("confidence") or "?"
+        t.append(f"  {status} · {confidence}", style="dim")
+        goal = self._short(str(cp.get("goal") or ""), 80)
+        if goal:
+            t.append("\nGoal  ", style="bold")
+            t.append(goal)
+        focus = self._short(str(cp.get("current_focus") or ""), 80)
+        if focus:
+            t.append("\nFocus ", style="bold")
+            t.append(focus, style="dim")
+        blockers = [str(x) for x in cp.get("blockers") or []]
+        next_steps = [str(x) for x in cp.get("next_steps") or []]
+        refs = [str(x) for x in cp.get("active_refs") or []]
+        self._append_items(t, "Blockers", blockers, limit=2)
+        self._append_items(t, "Next", next_steps, limit=3)
+        if refs:
+            t.append("\nRefs  ", style="bold")
+            t.append(", ".join(refs[:4]), style="dim")
+            if len(refs) > 4:
+                t.append(f", … +{len(refs) - 4}", style="dim")
+        return t
+
 
 class TodoBlock(Static):
     """Persistent TODO list maintained by the model via `todo_tool`.
@@ -914,6 +1112,61 @@ class BgJobsBlock(Static):
         self.update(t)
 
 
+class TasksBlock(Static):
+    """Sidebar widget showing live managed async tasks."""
+
+    DEFAULT_CSS = """
+    TasksBlock {
+        margin: 1 0;
+        padding: 0 1;
+        border: round #89b4fa;
+    }
+    """
+
+    @staticmethod
+    def _clip(text: str, limit: int) -> str:
+        one_line = " ".join(text.split())
+        if len(one_line) <= limit:
+            return one_line
+        return one_line[: limit - 1] + "…"
+
+    def render_tasks(self, tasks: list[AsyncTask]) -> None:
+        t = Text()
+        t.append("Tasks  ", style="bold #89b4fa")
+        statuses = [async_task_status(task)[0] for task in tasks]
+        n_run = sum(1 for status in statuses if status == "running")
+        n_done = len(tasks) - n_run
+        t.append(f"({n_run} 跑 · {n_done} 完)", style="dim")
+        if not tasks:
+            t.append("\n  (empty)", style="dim italic")
+            self.update(t)
+            return
+        for task in tasks:
+            status, rc, elapsed = async_task_status(task)
+            label = self._clip(task.name or task.command, 30)
+            output = self._clip(str(task.output_path), 34)
+            t.append("\n  ")
+            if status == "running":
+                t.append("▶ ", style="bold cyan")
+                t.append(f"{task.id}", style="bold cyan")
+            elif status == "success":
+                t.append("✓ ", style="bold green")
+                t.append(f"{task.id}", style="green")
+            elif status == "killed":
+                t.append("! ", style="bold yellow")
+                t.append(f"{task.id}", style="yellow")
+            else:
+                t.append("✗ ", style="bold red")
+                t.append(f"{task.id}", style="red")
+            t.append(f"  {elapsed:5.1f}s ", style="dim")
+            t.append(label)
+            if rc is not None:
+                t.append(f" rc={rc}", style="dim")
+            t.append("\n     out: ", style="dim")
+            t.append(output, style="dim")
+        self.update(t)
+
+
 # ───────── input ─────────
 
 class SlashPopup(Static):
@@ -946,6 +1199,7 @@ class SlashPopup(Static):
         ("/compact", "压缩历史，保留最近两轮原文"),
         ("/save <name>", "保存到 ~/.ddtui/history/<name>.json"),
         ("/load <name>", "读回保存的对话"),
+        ("/resume [name]", "恢复对话；不带 name 时打开选择窗口"),
         ("/list-history", "列出已保存对话"),
         ("/provider [deepseek|codex]", "查看 / 切换 provider"),
         ("/model [<id>]", "查看 / 切换模型（下一轮请求生效）"),

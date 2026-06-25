@@ -80,6 +80,20 @@ class AppInputMixin:
                 return
             await self._load_conversation(arg)
             return
+        if text == "/resume" or text.startswith("/resume "):
+            inp.text = ""
+            arg = text[len("/resume"):].strip()
+            if self._busy:
+                self.notify(
+                    "正在跑任务；先 ESC×2 中断或等结束再 /resume",
+                    timeout=3,
+                )
+                return
+            if arg:
+                await self._load_conversation(arg)
+            else:
+                await self._resume_conversation_picker()
+            return
         if text in ("/list-history", "/history", "/list_history"):
             inp.text = ""
             await self._list_history()

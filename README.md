@@ -16,6 +16,9 @@
 - 内置工具调用：bash、文件读写/编辑、搜索/glob、网页抓取、Brave Search、TODO、子 agent。
 - 写文件/编辑文件前弹窗确认。
 - bash 后台任务面板：长任务可以 `bash_start` 后用 `bash_check` / `bash_wait` / `bash_kill` 管理。
+- 托管异步任务：`task_start` 会写临时输出文件，并在任务完成后通知 agent。
+- 会话 checkpoint：记录当前目标、证据、决策、blocker、active refs 和下一步。
+- 项目笔记：记录 repo-local runbook、坑点、验证过的命令和约定。
 - 子 agent 异步并发：可 spawn 多个子会话，在侧边栏和 tab 中观察状态。
 - 对话保存、加载、压缩、回退和重新思考。
 - 自动读取项目根目录下的 `AGENTS.md` 作为项目级指令。
@@ -146,6 +149,7 @@ ddtui
 - `/compact`：压缩历史，保留最近两轮原文。
 - `/save <name>`：保存到 `~/.ddtui/history/<name>.json`。
 - `/load <name>`：读回保存的对话。
+- `/resume [name]`：恢复保存的对话；不带名字时弹出选择窗口。
 - `/list-history`：列出已保存对话。
 - `/provider [deepseek|codex]`：查看 / 切换 provider。
 - `/model [<id>]`：查看 / 切换模型。
@@ -160,11 +164,38 @@ ddtui
 模型可以调用这些工具：
 
 - shell：`bash`、`bash_start`、`bash_check`、`bash_wait`、`bash_kill`、`bash_list`
+- 托管异步任务：`task_start`、`task_check`、`task_read`、`task_wait`、`task_kill`、`task_list`
+- 会话 checkpoint：`checkpoint_tool`、`checkpoint_get`
+- 项目笔记：`project_note_add`、`project_note_search`、`project_note_list`、`project_note_read`、`project_note_update`、`project_note_delete`
 - 文件：`read_file`、`write_file`、`apply_patch`、`edit_file`、`edit_lines`、`multi_edit`
 - 搜索：`list_files`、`glob_files`、`search_content`
 - Web：`web_fetch`、`web_search`
 - 任务进度：`todo_tool`
 - 子 agent：`spawn_agent`、`chat_agent`、`await_agent`、`end_agent`
+
+### 托管异步任务
+
+`bash_start` 是原始后台 shell，适合简单后台进程；如果是测试、构建、下载、训练、profile 等完成状态很重要的长任务，优先用 `task_start`。
+
+`task_start` 会返回 `task_id`、`output_path` 和 `status_path`。agent 可以用 `task_check` 看 tail、用 `task_read` 按 offset 增量读输出。默认 `notify_on_complete=true`，任务完成后会向 agent 发送异步完成通知。严格规则：agent 可以在等待期间继续做别的事；做完其他事后不要再调用 `task_wait`，而是记录 checkpoint（如有帮助）并暂停当前回复，等待通知自动唤醒。`task_wait` 正常用于 `notify_on_complete=false` 的任务；对 `notify_on_complete=true` 只应在用户明确要求阻塞，或任务明显快结束且只做一次短暂有界等待时使用。
+
+### 会话 checkpoint
+
+`todo_tool` 管执行清单，`checkpoint_tool` 管当前工作状态，`project_note_*` 管长期项目知识。checkpoint 会替换上一份状态，不是追加日志。
+
+适合在长任务、并行 task/subagent、复杂 debug、多假设推理、等待异步通知、准备暂停当前回复、或 `/resume` 后状态不确定时使用。`checkpoint_get` 可以显式读取当前 checkpoint。checkpoint 不单独落文件，但会进入对话历史并跟随 autosave；恢复会话时会从最新一次 `checkpoint_tool` 重建侧边栏。
+
+### 项目笔记
+
+项目笔记默认保存在当前 repo 的：
+
+```text
+.ddtui/notes/notes.json
+```
+
+也可以用 `DDTUI_PROJECT_NOTES_DIR` 指到个人目录。笔记用于记录可复用的项目事实，例如测试命令、环境设置、远端连接、架构约定、坑点和用户确认过的决策。agent 不确定项目特定流程时会优先 `project_note_search`，但仍应根据 `source` / `confidence` 判断是否需要再验证。
+
+为了控制体量，相关旧笔记应该用 `project_note_update` 合并更新，而不是反复新增近似重复 note。`project_note_delete` 是软删除，会把 note 标为 `archived=true`；普通 search/list 默认隐藏 archived note。不要保存 token、密码、API key、private key 或大段原始日志。
 
 ### 子 agent
 
@@ -213,19 +244,24 @@ export BRAVE_API_KEY_FILE="$HOME/brave_apikey.txt"
 
 默认情况下：
 
-- 写文件/编辑文件只能作用在启动目录（项目目录）内。
-- `bash` / `bash_start` 的 workdir 也必须在项目目录内。
+- 写文件/编辑文件可以作用在任意路径（包括项目外）。
+- `bash` / `bash_start` / `task_start` 的 workdir 也必须在项目目录内。
 
-如果你明确想关闭限制：
+如果你想恢复旧行为，只允许项目目录内写入/编辑：
 
 ```bash
-export DDTUI_ALLOW_UNSANDBOXED_WRITES=1
+export DDTUI_ALLOW_UNSANDBOXED_WRITES=0
+```
+
+如果你明确想关闭 shell workdir 的限制：
+
+```bash
 export DDTUI_ALLOW_UNSANDBOXED_BASH=1
 ```
 
 ### bash 危险命令拦截
 
-`bash` 和 `bash_start` 会拒绝一些明显危险模式，例如：
+`bash`、`bash_start` 和 `task_start` 会拒绝一些明显危险模式，例如：
 
 - `sudo`
 - `curl`
@@ -258,6 +294,10 @@ export DDTUI_ALLOW_UNSANDBOXED_BASH=1
 ```
 
 `/load <name>` 可以恢复对话并重建聊天视图。保存文件只包含 message 历史和少量元信息，不包含原始 token usage；加载后 token 计数会重置。
+
+新会话启动时会创建独立的自动保存文件；每轮结束、回到可输入状态时会自动写入当前对话。`/resume` 不带文件名会打开选择窗口，列表按文件最后编辑时间排序，并显示到年月日小时分钟。
+
+`/clear` 会开始一个新的自动保存会话，不会把刚清空的内容写回旧会话文件。
 
 `/compact` 会把较早历史压缩成一个摘要 system message，保留最近两轮原文，适合长对话里降低上下文压力。
 

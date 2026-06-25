@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -22,9 +23,12 @@ from .config import (
     SUBAGENT_RESULT_MAX_CHARS,
 )
 from .state import TokenCounter
+from .tools_checkpoint import tool_checkpoint_tool
 from .widgets import (
     AssistantMessage,
     DiffBlock,
+    MultilineInput,
+    ResumeConversationScreen,
     SteerBubble,
     ThinkingBlock,
     TodoBlock,
@@ -34,6 +38,101 @@ from .widgets import (
 
 
 class AppHistoryMixin:
+    def _history_payload(self) -> dict:
+        return {
+            "version": 1,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "model": self.model,
+            "messages": self.messages,
+        }
+
+    def _normalize_history_name(self, raw_name: str) -> tuple[str | None, str | None]:
+        name = raw_name.strip()
+        if name.endswith(".json"):
+            name = name[:-5]
+        name = name.strip()
+        if not name:
+            return None, "文件名不能为空。"
+        # Cheap sanity check before letting Path see the string. This
+        # rejects most accidental path-injection patterns with a clearer
+        # error than the resolve()/relative_to guard below.
+        if "/" in name or "\\" in name or ".." in name:
+            return None, f"文件名 {raw_name!r} 不能含 / \\ 或 .."
+        return name, None
+
+    def _history_path_for_name(
+        self, raw_name: str
+    ) -> tuple[Path | None, str | None]:
+        name, error = self._normalize_history_name(raw_name)
+        if error is not None:
+            return None, error
+        assert name is not None
+        target = HISTORY_DIR / f"{name}.json"
+        resolved = target.resolve()
+        try:
+            resolved.relative_to(HISTORY_DIR.resolve())
+        except ValueError:
+            return None, f"解析后路径逃出 history 目录：{resolved}"
+        return target, None
+
+    def _allocate_autosave_path(self) -> Path:
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = f"session-{stamp}"
+        for i in range(100):
+            suffix = "" if i == 0 else f"-{i:02d}"
+            candidate = HISTORY_DIR / f"{base}{suffix}.json"
+            if not candidate.exists():
+                return candidate
+        return HISTORY_DIR / f"{base}-{datetime.now().microsecond:06d}.json"
+
+    def _ensure_autosave_path(self) -> Path:
+        path = self._autosave_path
+        if path is None:
+            path = self._allocate_autosave_path()
+            self._autosave_path = path
+        return path
+
+    def _write_conversation_snapshot(self, target: Path) -> int:
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        payload = self._history_payload()
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(target)
+        return target.stat().st_size
+
+    async def _autosave_conversation(self) -> None:
+        """Persist the current conversation without adding UI noise."""
+        try:
+            target = self._ensure_autosave_path()
+            self._write_conversation_snapshot(target)
+        except Exception as e:
+            self.notify(f"自动保存失败：{e}", severity="error", timeout=4)
+
+    def _history_entries(self) -> list[dict]:
+        if not HISTORY_DIR.exists():
+            return []
+        entries: list[dict] = []
+        for path in HISTORY_DIR.glob("*.json"):
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            edited_at = datetime.fromtimestamp(stat.st_mtime)
+            entries.append(
+                {
+                    "name": path.stem,
+                    "path": path,
+                    "size": stat.st_size,
+                    "edited_at": edited_at,
+                    "edited_at_label": edited_at.strftime("%Y-%m-%d %H:%M"),
+                    "size_label": f"{stat.st_size:,} 字节",
+                }
+            )
+        entries.sort(key=lambda e: e["edited_at"], reverse=True)
+        return entries
+
     async def _compact_messages(
         self, messages: list[dict]
     ) -> tuple[list[dict], dict]:
@@ -188,6 +287,7 @@ class AppHistoryMixin:
                 return
 
             self.messages = new_messages
+            await self._autosave_conversation()
             await self._mount_widget(
                 Static(Text(
                     f"📦 已压缩：{stats['before_n']} → {stats['after_n']} 条消息，"
@@ -204,53 +304,15 @@ class AppHistoryMixin:
         """Dump self.messages (plus a small metadata header) to
         HISTORY_DIR / <name>.json. Overwrites silently — the user
         already provided a name, second-guessing them would be annoying."""
-        name = raw_name.strip()
-        if name.endswith(".json"):
-            name = name[:-5]
-        name = name.strip()
-        if not name:
+        target, error = self._history_path_for_name(raw_name)
+        if error is not None or target is None:
             await self._mount_widget(Static(Text(
-                "错误：文件名不能为空。", style="bold red"
+                f"错误：{error}", style="bold red"
             )))
             return
-        # Cheap sanity check before letting Path see the string. This
-        # rejects most accidental path-injection patterns with a clearer
-        # error than the resolve()/relative_to guard below.
-        if "/" in name or "\\" in name or ".." in name:
-            await self._mount_widget(Static(Text(
-                f"错误：文件名 {raw_name!r} 不能含 / \\ 或 ..",
-                style="bold red",
-            )))
-            return
-
         try:
-            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-            target = HISTORY_DIR / f"{name}.json"
-            # Defense in depth: even if the cheap check missed
-            # something, make sure the resolved path is still inside
-            # HISTORY_DIR.
-            resolved = target.resolve()
-            try:
-                resolved.relative_to(HISTORY_DIR.resolve())
-            except ValueError:
-                await self._mount_widget(Static(Text(
-                    f"错误：解析后路径逃出 history 目录：{resolved}",
-                    style="bold red",
-                )))
-                return
-
             existed = target.exists()
-            payload = {
-                "version": 1,
-                "saved_at": datetime.now().isoformat(timespec="seconds"),
-                "model": self.model,
-                "messages": self.messages,
-            }
-            target.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            size = target.stat().st_size
+            size = self._write_conversation_snapshot(target)
         except Exception as e:
             await self._mount_widget(Static(Text(
                 f"❌ 保存失败:{e}", style="bold red"
@@ -278,64 +340,47 @@ class AppHistoryMixin:
             )))
             return
         try:
-            files = sorted(
-                HISTORY_DIR.glob("*.json"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
+            entries = self._history_entries()
         except Exception as e:
             await self._mount_widget(Static(Text(
                 f"列出 {HISTORY_DIR} 失败：{e}", style="bold red"
             )))
             return
-        if not files:
+        if not entries:
             await self._mount_widget(Static(Text(
                 f"{HISTORY_DIR} 还没保存过对话", style="dim"
             )))
             return
         t = Text()
-        t.append(f"📂 {HISTORY_DIR}（{len(files)} 个对话）\n", style="bold")
-        for p in files:
-            try:
-                stat = p.stat()
-                ts = datetime.fromtimestamp(stat.st_mtime).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-                t.append(f"  {p.stem}", style="bold green")
-                t.append(f"  ({stat.st_size:,} 字节, {ts})\n", style="dim")
-            except Exception:
-                t.append(f"  {p.stem}\n", style="bold green")
-        t.append("用 /load <name> 读回。", style="dim italic")
+        t.append(f"📂 {HISTORY_DIR}（{len(entries)} 个对话）\n", style="bold")
+        for entry in entries:
+            t.append(f"  {entry['name']}", style="bold green")
+            t.append(
+                f"  ({entry['size_label']}, 最后编辑 {entry['edited_at_label']})\n",
+                style="dim",
+            )
+        t.append("用 /resume <name> 读回；/resume 可打开选择窗口。", style="dim italic")
         await self._mount_widget(Static(t))
+
+    async def _resume_conversation_picker(self) -> None:
+        entries = self._history_entries()
+
+        def on_close(name: str | None) -> None:
+            if not name:
+                return
+            self.run_worker(self._load_conversation(name))
+
+        self.push_screen(ResumeConversationScreen(entries), on_close)
 
     async def _load_conversation(self, raw_name: str) -> None:
         """Replace `self.messages` with a saved JSON and replay every
         bubble / tool-call / diff into the conversation view so the
         history "looks lived in" rather than appearing as a single
         opaque blob."""
-        name = raw_name.strip()
-        if name.endswith(".json"):
-            name = name[:-5]
-        name = name.strip()
-        if not name:
+        target, error = self._history_path_for_name(raw_name)
+        if error is not None or target is None:
             await self._mount_widget(Static(Text(
-                "错误：文件名不能为空。", style="bold red"
-            )))
-            return
-        if "/" in name or "\\" in name or ".." in name:
-            await self._mount_widget(Static(Text(
-                f"错误：文件名 {raw_name!r} 不能含 / \\ 或 ..",
-                style="bold red",
-            )))
-            return
-        target = HISTORY_DIR / f"{name}.json"
-        try:
-            resolved = target.resolve()
-            resolved.relative_to(HISTORY_DIR.resolve())
-        except ValueError:
-            await self._mount_widget(Static(Text(
-                f"错误：解析后路径逃出 history 目录：{resolved}",
-                style="bold red",
+                f"错误：{error}", style="bold red"
             )))
             return
         if not target.exists():
@@ -386,8 +431,16 @@ class AppHistoryMixin:
         if self._todo_block is not None and self._todo_block.is_mounted:
             self._todo_block.remove()
         self._todo_block = None
+        self.ctx.checkpoint = None
+        if (
+            self._checkpoint_block is not None
+            and self._checkpoint_block.is_mounted
+        ):
+            self._checkpoint_block.remove()
+        self._checkpoint_block = None
 
         await self._replay_messages_to_view()
+        self._autosave_path = target
 
         # Reset token counter — saved file has no original usage info,
         # and pretending the previous turns "cost zero" would lie about
@@ -481,6 +534,16 @@ class AppHistoryMixin:
                         sidebar.add_class("visible")
                     continue
 
+                if name == "checkpoint_tool":
+                    if isinstance(args, dict) and "_raw" not in args:
+                        try:
+                            result = tool_checkpoint_tool(self.ctx, **args)
+                        except TypeError:
+                            result = "Error: bad checkpoint_tool arguments"
+                        if not result.startswith("Error:"):
+                            await self._sync_checkpoint_block()
+                    continue
+
                 block = ToolCallBlock(name, args)
                 await self._mount_widget(block)
                 result = tool_results.get(tc.get("id"))
@@ -510,6 +573,7 @@ class AppHistoryMixin:
             "- `/compact` 压缩历史，保留最近两轮原文\n"
             "- `/save <name>` 保存到 `~/.ddtui/history/<name>.json`\n"
             "- `/load <name>` 读回保存的对话\n"
+            "- `/resume [name]` 恢复对话；不带 name 时打开选择窗口\n"
             "- `/list-history` 列出已保存对话\n"
             "- `/provider [deepseek|codex]` 查看 / 切换 provider\n"
             "- `/model [<id>]` 查看 / 切换模型（下一轮请求生效）\n"
@@ -532,6 +596,9 @@ class AppHistoryMixin:
             "- `Ctrl+C` 退出\n\n"
             "### 工具(模型可调用)\n"
             "`bash` `bash_start/check/wait/kill/list` "
+            "`task_start/check/read/wait/kill/list` "
+            "`checkpoint_tool/get` "
+            "`project_note_add/search/list/read/update/delete` "
             "`read_file` `write_file` `apply_patch` `edit_file` `edit_lines` `multi_edit` "
             "`list_files` `glob_files` `search_content` `web_fetch` `web_search` "
             "`todo_tool` `spawn_agent` `chat_agent` `await_agent` `end_agent`\n"
@@ -568,6 +635,7 @@ class AppHistoryMixin:
             raw_content = raw_content[len("[实时插话] "):]
         del self.messages[last_user_idx:]
         await self._rebuild_conversation_view()
+        await self._autosave_conversation()
         inp = self.query_one("#user-input", MultilineInput)
         inp.text = raw_content
         inp.focus()
@@ -592,6 +660,7 @@ class AppHistoryMixin:
             return
         del self.messages[cut:]
         await self._rebuild_conversation_view()
+        await self._autosave_conversation()
         self.notify("已删除最近一轮助手回复", timeout=2.5)
 
     async def _rebuild_conversation_view(self) -> None:

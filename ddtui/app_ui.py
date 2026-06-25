@@ -14,9 +14,11 @@ from .config import (
     SUBAGENT_IDLE_TIMEOUT_SEC,
     SUBAGENT_REAP_INTERVAL_SEC,
 )
-from .state import SubagentSession, kill_all_bash_jobs
+from .state import SubagentSession, kill_all_bash_jobs, kill_all_tasks
+from .tools_tasks import collect_task_completion_events
 from .widgets import (
     BgJobsBlock,
+    CheckpointBlock,
     CollapsedHistoryMarker,
     EditPendingScreen,
     MultilineInput,
@@ -24,6 +26,7 @@ from .widgets import (
     SteerBubble,
     SubagentsBlock,
     SubagentTabPane,
+    TasksBlock,
     ThinkingBlock,
     ToolCallBlock,
     UserBubble,
@@ -36,6 +39,7 @@ class AppUiMixin:
         self._update_subtitle()
         self._refresh_status()
         self.query_one("#user-input", MultilineInput).focus()
+        self.call_later(self._autosave_conversation)
         if self._startup_provider_error:
             self.call_later(self._show_startup_provider_error)
         # Watch the conversation's scroll position: scrolling up
@@ -54,10 +58,16 @@ class AppUiMixin:
         # just iterates the dict (≤ ~10 entries) and re-renders one
         # widget.
         self.set_interval(1.0, self._refresh_bg_panel)
+        # Managed async task monitor. Completion notification delivery
+        # is handled separately below; this is only the visual sidebar.
+        self.set_interval(1.0, self._refresh_task_panel)
         # Same cadence for the subagent monitor — phase changes happen
         # on millisecond scales but the user only needs a coarse "what's
         # it doing" pulse.
         self.set_interval(1.0, self._refresh_subagent_panel)
+        # Managed async tasks can notify the agent when they complete.
+        # Polling is cheap and avoids a thread per task.
+        self.set_interval(1.0, self._poll_task_notifications)
         # Idle-reaper: end_agent any session that hasn't seen a
         # chat_agent call in SUBAGENT_IDLE_TIMEOUT_SEC. Coarse interval
         # — the only work to do is "kill timed-out sessions", not worth
@@ -65,6 +75,24 @@ class AppUiMixin:
         self.set_interval(
             SUBAGENT_REAP_INTERVAL_SEC, self._reap_idle_subagents
         )
+
+    def _poll_task_notifications(self) -> None:
+        events = collect_task_completion_events(self.ctx)
+        if events:
+            self._task_events.extend(events)
+            self.notify(
+                f"{len(events)} 个异步任务完成，已通知 agent",
+                timeout=4,
+            )
+        if not self._task_events:
+            return
+        worker_alive = (
+            self._agent_worker is not None and not self._agent_worker.is_finished
+        )
+        if self._busy or worker_alive or self._task_event_wake_scheduled:
+            return
+        self._task_event_wake_scheduled = True
+        self.call_later(self._start_task_event_turn)
 
     async def _show_startup_provider_error(self) -> None:
         await self._mount_widget(Static(Text(
@@ -101,14 +129,15 @@ class AppUiMixin:
         except Exception:
             return
         if not running:
-            # Nothing in flight → drop the panel. Don't toggle sidebar
-            # visibility class here; TodoBlock owns that.
+            # Nothing in flight → drop the panel, then let the shared
+            # visibility helper account for todo/checkpoint/subagents.
             if (
                 self._bg_jobs_block is not None
                 and self._bg_jobs_block.is_mounted
             ):
                 self._bg_jobs_block.remove()
             self._bg_jobs_block = None
+            self._refresh_sidebar_visibility()
             return
         if (
             self._bg_jobs_block is None
@@ -136,6 +165,50 @@ class AppUiMixin:
         sidebar.add_class("visible")
         self._bg_jobs_block.render_jobs(list(self.ctx.bash_jobs.values()))
 
+    def _refresh_task_panel(self) -> None:
+        """Mirror ctx.tasks into the sidebar widget.
+
+        Like the background panel, it stays visible while at least one
+        managed task is running. Finished siblings remain visible in the
+        same batch so the user can see which task in the group completed.
+        """
+        tasks = list(self.ctx.tasks.values())
+        running = [task for task in tasks if task.proc.poll() is None]
+        try:
+            sidebar = self.query_one("#sidebar", Vertical)
+        except Exception:
+            return
+        if not running:
+            if (
+                self._tasks_block is not None
+                and self._tasks_block.is_mounted
+            ):
+                self._tasks_block.remove()
+            self._tasks_block = None
+            self._refresh_sidebar_visibility()
+            return
+        if (
+            self._tasks_block is None
+            or not self._tasks_block.is_mounted
+        ):
+            self._tasks_block = TasksBlock()
+            self.call_later(self._mount_task_block)
+            return
+        self._tasks_block.render_tasks(tasks)
+        sidebar.add_class("visible")
+
+    async def _mount_task_block(self) -> None:
+        try:
+            sidebar = self.query_one("#sidebar", Vertical)
+        except Exception:
+            return
+        if self._tasks_block is None:
+            return
+        if not self._tasks_block.is_mounted:
+            await sidebar.mount(self._tasks_block)
+        sidebar.add_class("visible")
+        self._tasks_block.render_tasks(list(self.ctx.tasks.values()))
+
     def _refresh_subagent_panel(self) -> None:
         """Mirror _live_subagents into the sidebar widget. Panel exists
         iff at least one session is alive (running OR idle waiting for
@@ -153,6 +226,7 @@ class AppUiMixin:
             ):
                 self._subagent_block.remove()
             self._subagent_block = None
+            self._refresh_sidebar_visibility()
             return
         if (
             self._subagent_block is None
@@ -185,6 +259,42 @@ class AppUiMixin:
         self._subagent_block.render_sessions(
             list(self._live_subagents.values())
         )
+
+    async def _sync_checkpoint_block(self) -> None:
+        """Mirror ctx.checkpoint into the sidebar."""
+        try:
+            sidebar = self.query_one("#sidebar", Vertical)
+        except Exception:
+            return
+        checkpoint = self.ctx.checkpoint
+        if not checkpoint:
+            if (
+                self._checkpoint_block is not None
+                and self._checkpoint_block.is_mounted
+            ):
+                self._checkpoint_block.remove()
+            self._checkpoint_block = None
+            self._refresh_sidebar_visibility()
+            return
+        if (
+            self._checkpoint_block is None
+            or not self._checkpoint_block.is_mounted
+        ):
+            self._checkpoint_block = CheckpointBlock()
+            await sidebar.mount(self._checkpoint_block)
+        self._checkpoint_block.set_checkpoint(checkpoint)
+        sidebar.add_class("visible")
+
+    def _refresh_sidebar_visibility(self) -> None:
+        try:
+            sidebar = self.query_one("#sidebar", Vertical)
+        except Exception:
+            return
+        has_visible = any(child.is_mounted for child in sidebar.children)
+        if has_visible:
+            sidebar.add_class("visible")
+        else:
+            sidebar.remove_class("visible")
 
     async def _add_sub_tab(self, sess: SubagentSession) -> None:
         """Mount a TabPane(SubagentTabPane) for this session as a
@@ -248,6 +358,7 @@ class AppUiMixin:
             if sess.task is not None and not sess.task.done():
                 sess.task.cancel()
             kill_all_bash_jobs(sess.ctx.bash_jobs)
+            kill_all_tasks(sess.ctx.tasks)
             self._live_subagents.pop(sid, None)
             self.call_later(self._remove_sub_tab, sid)
 
@@ -288,14 +399,25 @@ class AppUiMixin:
         if self._todo_block is not None and self._todo_block.is_mounted:
             self._todo_block.remove()
         self._todo_block = None
+        self.ctx.checkpoint = None
+        if (
+            self._checkpoint_block is not None
+            and self._checkpoint_block.is_mounted
+        ):
+            self._checkpoint_block.remove()
+        self._checkpoint_block = None
         # Background jobs are tied to the conversation that spawned
         # them, so a /clear nukes them too. The helper SIGTERMs the
         # whole process group, briefly waits, then SIGKILLs any
         # stragglers — ~100 ms cap so /clear stays snappy.
         kill_all_bash_jobs(self.ctx.bash_jobs)
+        kill_all_tasks(self.ctx.tasks)
         if self._bg_jobs_block is not None and self._bg_jobs_block.is_mounted:
             self._bg_jobs_block.remove()
         self._bg_jobs_block = None
+        if self._tasks_block is not None and self._tasks_block.is_mounted:
+            self._tasks_block.remove()
+        self._tasks_block = None
         # Live subagent sessions: cancel any in-flight task, kill each
         # one's bash jobs, drop them. Tied to the parent conversation,
         # so /clear releases all. Tab removal scheduled for each id.
@@ -304,6 +426,7 @@ class AppUiMixin:
             if sess.task is not None and not sess.task.done():
                 sess.task.cancel()
             kill_all_bash_jobs(sess.ctx.bash_jobs)
+            kill_all_tasks(sess.ctx.tasks)
         self._live_subagents.clear()
         self._subagent_next_id = 1
         for sid in sub_ids_to_drop:
@@ -318,6 +441,10 @@ class AppUiMixin:
             self.query_one("#sidebar").remove_class("visible")
         except Exception:
             pass
+        # `/clear` starts a fresh conversation, so don't overwrite the
+        # autosave file that held the just-cleared transcript.
+        self._autosave_path = None
+        self.call_later(self._autosave_conversation)
 
     def _start_dismiss(self) -> None:
         """Fade the TodoBlock out over 1.5s, then unmount and hide
@@ -344,10 +471,7 @@ class AppUiMixin:
         if self._todo_block is not None and self._todo_block.is_mounted:
             self._todo_block.remove()
         self._todo_block = None
-        try:
-            self.query_one("#sidebar").remove_class("visible")
-        except Exception:
-            pass
+        self._refresh_sidebar_visibility()
 
     def _handle_scroll_change(self, scroll_y: float) -> None:
         """Reactive watcher: keep `_follow_bottom` in sync with where

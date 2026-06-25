@@ -46,6 +46,32 @@ class BgJob:
     finished_at: float | None = None
 
 
+@dataclass
+class AsyncTask:
+    """One managed asynchronous task started by task_start.
+
+    It is shell-backed like BgJob, but carries task-level lifecycle
+    metadata: stable status file, optional completion notification,
+    and a longer retention window for later inspection.
+    """
+
+    id: str
+    name: str
+    command: str
+    workdir: str
+    output_path: Path
+    status_path: Path
+    proc: subprocess.Popen
+    started_at: float
+    started_wall: float
+    notify_on_complete: bool = True
+    finished_at: float | None = None
+    finished_wall: float | None = None
+    return_code: int | None = None
+    killed: bool = False
+    notified: bool = False
+
+
 def kill_all_bash_jobs(jobs: dict[str, BgJob]) -> None:
     """Tear down every still-running BgJob in *jobs*: SIGTERM the
     process group, give it ~100 ms to exit, then SIGKILL stragglers.
@@ -75,6 +101,29 @@ def kill_all_bash_jobs(jobs: dict[str, BgJob]) -> None:
     jobs.clear()
 
 
+def kill_all_tasks(tasks: dict[str, AsyncTask]) -> None:
+    """Tear down every still-running AsyncTask and clear the table."""
+    def _signal_pg(t: AsyncTask, sig: int) -> None:
+        try:
+            os.killpg(os.getpgid(t.proc.pid), sig)
+        except Exception:
+            pass
+
+    for t in tasks.values():
+        if t.proc.poll() is None:
+            t.killed = True
+            _signal_pg(t, signal.SIGTERM)
+    for _ in range(20):
+        alive = [t for t in tasks.values() if t.proc.poll() is None]
+        if not alive:
+            break
+        time.sleep(0.005)
+    for t in tasks.values():
+        if t.proc.poll() is None:
+            _signal_pg(t, signal.SIGKILL)
+    tasks.clear()
+
+
 def bg_job_status(job: BgJob) -> tuple[str, int | None, float]:
     """Returns (status_word, returncode_or_None, elapsed_sec).
 
@@ -89,6 +138,27 @@ def bg_job_status(job: BgJob) -> tuple[str, int | None, float]:
     return "exited", rc, job.finished_at - job.started_at
 
 
+def async_task_status(task: AsyncTask) -> tuple[str, int | None, float]:
+    """Returns (status_word, returncode_or_None, elapsed_sec).
+
+    status_word ∈ {"running", "success", "failed", "killed"}.
+    """
+    rc = task.proc.poll()
+    if rc is None:
+        return "running", None, time.monotonic() - task.started_at
+    if task.finished_at is None:
+        task.finished_at = time.monotonic()
+        task.finished_wall = time.time()
+        task.return_code = rc
+    if task.killed:
+        return "killed", rc, task.finished_at - task.started_at
+    return (
+        "success" if rc == 0 else "failed",
+        rc,
+        task.finished_at - task.started_at,
+    )
+
+
 @dataclass
 class ToolContext:
     """Runtime state shared across tool invocations within ONE
@@ -97,13 +167,22 @@ class ToolContext:
 
     work_dir: str
     bash_jobs: dict[str, BgJob] = field(default_factory=dict)
+    tasks: dict[str, AsyncTask] = field(default_factory=dict)
+    checkpoint: dict | None = None
     bash_next_id: int = 1
+    task_next_id: int = 1
 
     def alloc_bash_id(self) -> str:
         """Reserve and return the next bash job id ('bg-N')."""
         i = self.bash_next_id
         self.bash_next_id += 1
         return f"bg-{i}"
+
+    def alloc_task_id(self) -> str:
+        """Reserve and return the next managed task id ('task-N')."""
+        i = self.task_next_id
+        self.task_next_id += 1
+        return f"task-{i}"
 
 
 @dataclass

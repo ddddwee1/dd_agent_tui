@@ -46,13 +46,15 @@ TOOLS = [
         "function": {
             "name": "bash_start",
             "description": (
-                "Start a long-running bash command in the BACKGROUND and "
-                "return immediately with a job id (e.g. 'bg-3'). The "
-                "process is detached (own session) so it survives short "
-                "agent stalls. stdout+stderr are merged into a log file. "
-                "Use bash_check / bash_wait / bash_kill / bash_list to "
-                "interact with it. Cap: at most 5 jobs running at once. "
-                "Same dangerous-pattern blacklist as bash."
+                "Start a raw background shell command and return "
+                "immediately with a job id (e.g. 'bg-3'). Use this only "
+                "for simple background shell processes where you do NOT "
+                "need structured task lifecycle, completion notifications, "
+                "or agent-visible done signals. For long-running validation, "
+                "build, test, download, training, profiling, or any operation "
+                "whose completion matters, prefer task_start. stdout+stderr "
+                "are merged into a log file. Same dangerous-pattern blacklist "
+                "as bash."
             ),
             "parameters": {
                 "type": "object",
@@ -70,6 +72,225 @@ TOOLS = [
                     },
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_start",
+            "description": (
+                "Start a managed asynchronous task. The command runs in the "
+                "background and streams stdout/stderr to a temporary output "
+                "file. The agent can inspect progress with task_check or "
+                "task_read while continuing other work. If notify_on_complete "
+                "is true, the runtime will deliver a completion notification "
+                "when the task exits, including status, return code, duration, "
+                "and output path. STRICT WAITING RULE: for "
+                "notify_on_complete=true tasks, do not call task_wait merely "
+                "because you are waiting for the task. Continue other useful "
+                "work; if no useful work remains, update checkpoint_tool if "
+                "helpful, then pause/finish the current response and let the "
+                "runtime wake you when the notification arrives. Calling "
+                "task_wait after finishing other work is the wrong behavior "
+                "unless the user explicitly requested blocking or you need "
+                "one short bounded wait for an almost-finished task. Use "
+                "task_wait normally for notify_on_complete=false tasks. "
+                "Use task_start for long-running work whose completion matters. "
+                "Same dangerous-pattern blacklist as bash."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run as a managed task.",
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": (
+                            "Optional working directory. Defaults to the "
+                            "project directory."
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Short human-readable task name for task_list "
+                            "and completion notifications."
+                        ),
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "Optional task description. Used as a fallback "
+                            "name if name is omitted."
+                        ),
+                    },
+                    "notify_on_complete": {
+                        "type": "boolean",
+                        "description": (
+                            "Default true. If true, the runtime sends the "
+                            "agent a completion notification when the task "
+                            "exits; the agent can do other work or pause "
+                            "and let the runtime wake it instead of blocking "
+                            "with task_wait."
+                        ),
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_check",
+            "description": (
+                "Non-blocking status check for a managed task. Returns "
+                "running/success/failed/killed, return code when available, "
+                "output/status file paths, and the last N output lines."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id from task_start, e.g. 'task-3'.",
+                    },
+                    "tail_lines": {
+                        "type": "integer",
+                        "description": "How many trailing output lines to return. Default 80.",
+                    },
+                    "max_output_chars": {
+                        "type": "integer",
+                        "description": (
+                            "Override the default returned text cap. Hard "
+                            "upper bound is 100 000."
+                        ),
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_read",
+            "description": (
+                "Incrementally read a managed task's output file by byte "
+                "offset. Use next_offset from the previous call to continue "
+                "without rereading old output."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id from task_start.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Byte offset to start reading from. Default 0.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum bytes/chars to read. Default 12 000, "
+                            "hard max 100 000."
+                        ),
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_wait",
+            "description": (
+                "BLOCK until a managed task finishes or timeout seconds "
+                "elapse. The task keeps running on timeout. Use this for "
+                "tasks started with notify_on_complete=false, for an explicit "
+                "user request to block, or for one short bounded wait when an "
+                "almost-finished result is immediately useful. STRICT RULE: "
+                "if notify_on_complete=true, do not call task_wait merely "
+                "because there is no other work left. Finish/pause the "
+                "current response and wait for the completion notification "
+                "instead. Repeated task_wait calls for a notified task are "
+                "wrong unless the user explicitly asked for blocking."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id from task_start.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Max seconds to block. Default 60, max 600.",
+                    },
+                    "tail_lines": {
+                        "type": "integer",
+                        "description": "Trailing output lines to return. Default 80.",
+                    },
+                    "max_output_chars": {
+                        "type": "integer",
+                        "description": (
+                            "Override the default returned text cap. Hard "
+                            "upper bound is 100 000."
+                        ),
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_kill",
+            "description": (
+                "Terminate a running managed task. Sends SIGTERM by default; "
+                "set force=true to send SIGKILL. Completion notification is "
+                "still delivered for notify_on_complete tasks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id from task_start.",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Send SIGKILL instead of SIGTERM. Default false.",
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_list",
+            "description": (
+                "List managed tasks with id, name, status, runtime, command, "
+                "and output path. By default includes recently finished tasks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_finished": {
+                        "type": "boolean",
+                        "description": "Default true. Set false to list only running tasks.",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -182,6 +403,207 @@ TOOLS = [
                 "path. Finished jobs are kept around for 5 minutes."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_note_add",
+            "description": (
+                "Add a reusable project-local note to <repo>/.ddtui/notes/notes.json "
+                "or DDTUI_PROJECT_NOTES_DIR. Use this for durable facts such "
+                "as verified commands, environment setup, repo-specific gotchas, "
+                "API conventions, or user-approved decisions. Do not store "
+                "secrets, one-off transient observations, or large raw logs. "
+                "Prefer concise notes with tags. If the note is an inference "
+                "rather than a verified fact, set source='inferred' and lower "
+                "confidence. Before adding, prefer project_note_search and "
+                "project_note_update when an existing related note should be "
+                "consolidated instead of duplicated."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short note title.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Concise reusable note body. Do not include secrets.",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional tags such as runbook, test, deploy, "
+                            "remote, debug, gotcha, architecture, style, "
+                            "decision, env."
+                        ),
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "One of user, observed, inferred, imported. Default observed.",
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "description": "One of low, medium, high. Default medium.",
+                    },
+                },
+                "required": ["title", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_note_search",
+            "description": (
+                "Search project-local notes for reusable context before "
+                "guessing repo-specific commands, environment setup, gotchas, "
+                "or conventions. Results are not automatically authoritative; "
+                "check source/confidence and verify when stale or risky."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query.",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tag filter; all listed tags must match.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results. Default 5, max 50.",
+                    },
+                    "include_archived": {
+                        "type": "boolean",
+                        "description": "Include archived notes. Default false.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_note_list",
+            "description": (
+                "List recent project-local notes, optionally filtered by tags. "
+                "Use this to inspect available runbook memory without a "
+                "specific search query."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional tag filter; all listed tags must match.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum notes. Default 20, max 100.",
+                    },
+                    "include_archived": {
+                        "type": "boolean",
+                        "description": "Include archived notes. Default false.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_note_read",
+            "description": "Read one full project-local note by note_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {
+                        "type": "string",
+                        "description": "Note id from project_note_search/list.",
+                    },
+                },
+                "required": ["note_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_note_update",
+            "description": (
+                "Patch an existing project-local note in place. Use update "
+                "when a note is stale, incomplete, or should be consolidated. "
+                "Prefer updating an existing related note over adding a "
+                "near-duplicate note. Unspecified fields are unchanged. "
+                "Set archived=true to hide an outdated note from normal "
+                "search/list results."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {
+                        "type": "string",
+                        "description": "Existing note id.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional replacement title.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional replacement body. Do not include secrets.",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional replacement tag list.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Optional source: user, observed, inferred, imported.",
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "description": "Optional confidence: low, medium, high.",
+                    },
+                    "archived": {
+                        "type": "boolean",
+                        "description": "Set true to archive/soft-delete; false to restore.",
+                    },
+                },
+                "required": ["note_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_note_delete",
+            "description": (
+                "Soft-delete a project-local note by setting archived=true. "
+                "Archived notes are hidden from normal search/list but can be "
+                "included with include_archived=true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {
+                        "type": "string",
+                        "description": "Existing note id.",
+                    },
+                },
+                "required": ["note_id"],
+            },
         },
     },
     {
@@ -804,6 +1226,113 @@ TOOLS = [
                 "type": "object",
                 "properties": {},
                 "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "checkpoint_tool",
+            "description": (
+                "Maintain a concise working-state checkpoint for the current "
+                "conversation. This replaces the previous checkpoint; do not "
+                "append a diary. Use during long or multi-branch tasks to "
+                "record the current goal, focus, hypotheses, evidence, "
+                "decisions, blockers, active task/subagent refs, touched files, "
+                "and next steps. Use todo_tool for checklist items. Use "
+                "project_note_* only for durable repo knowledge. Keep it short "
+                "and factual."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "Current overall objective.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "planning",
+                            "in_progress",
+                            "waiting",
+                            "blocked",
+                            "ready_for_review",
+                            "done",
+                            "abandoned",
+                        ],
+                        "description": "Current work state.",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Short factual summary of current state.",
+                    },
+                    "current_focus": {
+                        "type": "string",
+                        "description": "What you are focused on right now.",
+                    },
+                    "hypotheses": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Current hypotheses or debugging theories.",
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Verified evidence gathered so far.",
+                    },
+                    "decisions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Important decisions already made.",
+                    },
+                    "blockers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Known blockers or open constraints.",
+                    },
+                    "next_steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Immediate next steps from here.",
+                    },
+                    "active_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Active task ids, subagent ids, PR ids, etc.",
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Relevant touched or inspected file paths.",
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Confidence in this checkpoint. Default medium.",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional short caveat or handoff note.",
+                    },
+                },
+                "required": ["goal", "status", "summary"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "checkpoint_get",
+            "description": (
+                "Read the current conversation checkpoint. Use when resuming, "
+                "after long context, after task notifications, or whenever "
+                "you are unsure of the current working state."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
             },
         },
     },
