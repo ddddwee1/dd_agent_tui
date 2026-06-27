@@ -614,6 +614,26 @@ class DiffBlock(Collapsible):
         return t
 
 
+class ExploreSummaryBlock(Collapsible):
+    """Rendered summary of a completed exploration span."""
+
+    DEFAULT_CSS = """
+    ExploreSummaryBlock { margin: 0 0 1 0; }
+    ExploreSummaryBlock > Contents { padding: 0 0 0 2; }
+    """
+
+    def __init__(self, message: dict) -> None:
+        self._message = message
+        body = Static(Markdown(message.get("content") or ""))
+        super().__init__(body, title=self._title(message), collapsed=False)
+
+    @staticmethod
+    def _title(message: dict) -> str:
+        explore_id = message.get("explore_id") or "explore"
+        kind = message.get("explore_kind") or "custom"
+        return f"explore summary · {explore_id} · {kind}"
+
+
 # ───────── sidebar ─────────
 
 class CheckpointBlock(Static):

@@ -101,6 +101,25 @@ class LLMProvider:
         yield LLMStreamEvent()
 
 
+_WIRE_MESSAGE_KEYS = {
+    "role",
+    "content",
+    "name",
+    "tool_call_id",
+    "tool_calls",
+    # DeepSeek thinking mode requires reasoning_content on subsequent
+    # assistant messages, but local ddtui metadata must not be sent.
+    "reasoning_content",
+}
+
+
+def _messages_for_wire(messages: list[dict]) -> list[dict]:
+    return [
+        {k: v for k, v in message.items() if k in _WIRE_MESSAGE_KEYS}
+        for message in messages
+    ]
+
+
 class DeepSeekProvider(LLMProvider):
     key = "deepseek"
     label = "DeepSeek"
@@ -119,7 +138,7 @@ class DeepSeekProvider(LLMProvider):
     ) -> str:
         response = await self.client.chat.completions.create(
             model=model,
-            messages=messages,
+            messages=_messages_for_wire(messages),
             stream=False,
         )
         return (response.choices[0].message.content or "").strip()
@@ -133,7 +152,7 @@ class DeepSeekProvider(LLMProvider):
     ) -> AsyncIterator[LLMStreamEvent]:
         stream = await self.client.chat.completions.create(
             model=model,
-            messages=messages,
+            messages=_messages_for_wire(messages),
             tools=tools,
             tool_choice="auto",
             stream=True,

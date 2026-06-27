@@ -17,6 +17,7 @@ from textual.widgets import Header, Static, TabbedContent, TabPane
 
 from .app_agent_loop import AppAgentLoopMixin
 from .app_confirm import ToolConfirmHook, always_allow
+from .app_explore import AppExploreMixin
 from .app_history import AppHistoryMixin
 from .app_input import AppInputMixin
 from .app_subagents import AppSubagentMixin
@@ -43,6 +44,7 @@ from .widgets import (
 class AgentApp(
     AppInputMixin,
     AppHistoryMixin,
+    AppExploreMixin,
     AppAgentLoopMixin,
     AppSubagentMixin,
     AppUiMixin,
@@ -166,6 +168,8 @@ class AgentApp(
             self.messages.append(
                 {"role": "system", "content": POST_SYSTEM_PROMPT}
             )
+        self._active_explore: dict | None = None
+        self._explore_next_id = 1
         self.counter = TokenCounter()
         # Hook: replace this attribute (or override) to gate tools.
         # Default policy allows every tool call; embedders can swap in

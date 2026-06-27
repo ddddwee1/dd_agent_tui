@@ -1397,6 +1397,133 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "explore_start",
+            "description": (
+                "Start a temporary exploration span in the parent "
+                "conversation. Use when the next work is evidence "
+                "gathering, probing, comparison, or low-signal search, "
+                "and the raw intermediate context should not live in "
+                "the main transcript after a concise conclusion is "
+                "produced. Good uses include single-feature probing, "
+                "bug debugging, hypothesis checks, code archaeology, "
+                "design scouting, broad web/docs research with low "
+                "information density, API/library behavior probes, "
+                "environment or permission checks, performance/numeric "
+                "experiments, test discovery, data sample inspection, "
+                "log clustering, and read-only risk audits. Do NOT use "
+                "for final implementation, final user answers, "
+                "irreversible actions, or durable project knowledge "
+                "that belongs in files, project notes, or checkpoint_tool. "
+                "Call explore_start ALONE in its own tool-call batch; "
+                "after the exploration, call explore_end ALONE to archive "
+                "the raw span and replace it with a summary, or "
+                "explore_cancel if the span should remain normal history."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": (
+                            "The concrete question this exploration should answer."
+                        ),
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "debug",
+                            "feature_probe",
+                            "code_archaeology",
+                            "design_scouting",
+                            "web_research",
+                            "env_probe",
+                            "perf_experiment",
+                            "data_inspection",
+                            "test_discovery",
+                            "log_clustering",
+                            "risk_audit",
+                            "hypothesis_check",
+                            "api_probe",
+                            "custom",
+                        ],
+                        "description": (
+                            "Exploration category. Default feature_probe."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Why this should be explored in a temporary span "
+                            "instead of the main line."
+                        ),
+                    },
+                    "expected_outputs": {
+                        "type": "string",
+                        "description": (
+                            "What evidence or conclusion should come back "
+                            "to the main task."
+                        ),
+                    },
+                },
+                "required": ["goal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explore_end",
+            "description": (
+                "End the active exploration span. The app archives the raw "
+                "messages between explore_start and this call, summarizes "
+                "them into a system exploration summary, and removes the "
+                "raw span from the live model context. Call this ALONE in "
+                "its own tool-call batch once the exploration has a useful "
+                "conclusion or an explicit uncertainty to carry forward."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "outcome_hint": {
+                        "type": "string",
+                        "description": (
+                            "Optional concise statement of the conclusion, "
+                            "negative result, or remaining uncertainty. "
+                            "The summarizer uses this as guidance but still "
+                            "checks the raw exploration history."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explore_cancel",
+            "description": (
+                "Cancel the active exploration without summarizing or "
+                "rewriting history. Use when the span was opened by "
+                "mistake, the raw work is actually needed verbatim, or "
+                "the exploration should be treated as normal conversation. "
+                "Call this ALONE in its own tool-call batch."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional short reason for cancelling.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "checkpoint_tool",
             "description": (
                 "Maintain a concise working-state checkpoint for the current "

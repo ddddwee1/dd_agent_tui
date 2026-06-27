@@ -297,6 +297,60 @@ class AppAgentLoopMixin:
                             continue
 
                         if name in (
+                            "explore_start",
+                            "explore_end",
+                            "explore_cancel",
+                        ):
+                            block = ToolCallBlock(name, args)
+                            await self._mount_widget(block)
+                            try:
+                                tool_call_count = len(tool_calls)
+                                if name == "explore_start":
+                                    result = await self._explore_start_tool(
+                                        args, tool_call_count
+                                    )
+                                elif name == "explore_end":
+                                    result = await self._explore_end_tool(
+                                        args, tool_call_count
+                                    )
+                                else:
+                                    result = await self._explore_cancel_tool(
+                                        args, tool_call_count
+                                    )
+                            except asyncio.CancelledError:
+                                result = f"⛔ {name} cancelled (parent ESC×2)"
+                                block.set_result(result, blocked=True)
+                                self.messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc["id"],
+                                    "content": result,
+                                })
+                                await self._autosave_conversation()
+                                self._write_turn_journal(
+                                    phase="after_tool",
+                                    message_len_current=len(self.messages),
+                                )
+                                raise
+                            except Exception as e:
+                                result = (
+                                    f"Error: {name} failed: "
+                                    f"{type(e).__name__}: {e}"
+                                )
+                            blocked = result.startswith("Error:")
+                            block.set_result(result, blocked=blocked)
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result,
+                            })
+                            await self._autosave_conversation()
+                            self._write_turn_journal(
+                                phase="after_tool",
+                                message_len_current=len(self.messages),
+                            )
+                            continue
+
+                        if name in (
                             "spawn_agent", "chat_agent",
                             "await_agent", "end_agent",
                         ):

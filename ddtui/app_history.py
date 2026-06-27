@@ -36,6 +36,7 @@ from .tools_checkpoint import tool_checkpoint_clear, tool_checkpoint_tool
 from .widgets import (
     AssistantMessage,
     DiffBlock,
+    ExploreSummaryBlock,
     MultilineInput,
     ResumeConversationScreen,
     SteerBubble,
@@ -55,6 +56,7 @@ class AppHistoryMixin:
             "cwd": self.ctx.work_dir,
             "model": self.model,
             "checkpoint": self.ctx.checkpoint,
+            "active_explore": self._explore_payload(),
             "messages": self.messages,
         }
 
@@ -342,6 +344,16 @@ class AppHistoryMixin:
             user_count = sum(
                 1 for m in self.messages if m.get("role") == "user"
             )
+            if self._active_explore is not None:
+                active_id = self._active_explore.get("id", "?")
+                await self._mount_widget(
+                    Static(Text(
+                        f"探索 {active_id} 仍在进行中；先让 agent 调用 "
+                        "explore_end 或 explore_cancel，再 /compact。",
+                        style="dim",
+                    ))
+                )
+                return
             if user_count <= COMPACT_KEEP_RECENT_TURNS:
                 await self._mount_widget(
                     Static(Text(
@@ -526,6 +538,7 @@ class AppHistoryMixin:
         except Exception:
             pass
         self._cancel_dismiss()
+        self._restore_explore_payload(payload.get("active_explore"))
         if self._todo_block is not None and self._todo_block.is_mounted:
             self._todo_block.remove()
         self._todo_block = None
@@ -597,7 +610,11 @@ class AppHistoryMixin:
 
         for m in self.messages:
             role = m.get("role")
-            if role in ("system", "tool"):
+            if role == "system":
+                if m.get("ddtui_kind") == "explore_summary":
+                    await self._mount_widget(ExploreSummaryBlock(m))
+                continue
+            if role == "tool":
                 continue
             content = m.get("content") or ""
             if role == "user":
@@ -732,6 +749,7 @@ class AppHistoryMixin:
             "`bash` `bash_start/check/wait/kill/list` "
             "`terminal_start/send/read/interrupt/close/list` "
             "`task_start/check/read/wait/kill/list` "
+            "`explore_start/end/cancel` "
             "`checkpoint_tool/get/clear` "
             "`project_note_add/search/list/read/update/delete` "
             "`read_file` `write_file` `apply_patch` `edit_file` `edit_lines` `multi_edit` "
@@ -769,6 +787,7 @@ class AppHistoryMixin:
         if raw_content.startswith("[实时插话] "):
             raw_content = raw_content[len("[实时插话] "):]
         del self.messages[last_user_idx:]
+        self._drop_explore_if_truncated()
         await self._rebuild_conversation_view()
         await self._autosave_conversation()
         inp = self.query_one("#user-input", MultilineInput)
@@ -794,6 +813,7 @@ class AppHistoryMixin:
             )
             return
         del self.messages[cut:]
+        self._drop_explore_if_truncated()
         await self._rebuild_conversation_view()
         await self._autosave_conversation()
         self.notify("已删除最近一轮助手回复", timeout=2.5)

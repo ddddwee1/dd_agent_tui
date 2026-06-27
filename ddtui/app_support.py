@@ -15,13 +15,17 @@ from .providers import ToolCallDelta
 def _render_history_for_summary(messages: list) -> str:
     """Flatten a slice of message history to plain text for the
     summarizer prompt. Drops reasoning_content (only useful at the time
-    it was produced) and truncates tool results."""
+    it was produced) and truncates tool results. Ordinary system messages
+    are skipped because leading system prompts are preserved, but
+    non-leading exploration summaries need to survive later compaction."""
     lines: list[str] = []
     for m in messages:
         role = m.get("role")
         content = m.get("content") or ""
         if role == "user":
             lines.append(f"=== USER ===\n{content}")
+        elif role == "system" and m.get("ddtui_kind") == "explore_summary":
+            lines.append(f"=== EXPLORE SUMMARY ===\n{content}")
         elif role == "assistant":
             block = ["=== ASSISTANT ==="]
             if content:
@@ -37,9 +41,8 @@ def _render_history_for_summary(messages: list) -> str:
             if len(content) > COMPACT_TOOL_SNIPPET_CHARS:
                 snippet += " …[truncated]"
             lines.append(f"=== TOOL RESULT ===\n{snippet}")
-        # role == "system" intentionally skipped — system messages are
-        # preserved across the compaction, so they don't belong in the
-        # "what happened" recap.
+        # Other system messages are intentionally skipped — leading
+        # system prompts are preserved across compaction.
     return "\n\n".join(lines)
 
 

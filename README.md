@@ -166,6 +166,7 @@ ddtui
 - shell：`bash`、`bash_start`、`bash_check`、`bash_wait`、`bash_kill`、`bash_list`
 - 交互式 Terminal：`terminal_start`、`terminal_send`、`terminal_read`、`terminal_interrupt`、`terminal_close`、`terminal_list`
 - 托管异步任务：`task_start`、`task_check`、`task_read`、`task_wait`、`task_kill`、`task_list`
+- 临时探索：`explore_start`、`explore_end`、`explore_cancel`
 - 会话 checkpoint：`checkpoint_tool`、`checkpoint_get`、`checkpoint_clear`
 - 项目笔记：`project_note_add`、`project_note_search`、`project_note_list`、`project_note_read`、`project_note_update`、`project_note_delete`
 - 文件：`read_file`、`write_file`、`apply_patch`、`edit_file`、`edit_lines`、`multi_edit`
@@ -315,6 +316,8 @@ export DDTUI_ALLOW_UNSANDBOXED_BASH=1
 `/clear` 会开始一个新的自动保存会话，不会把刚清空的内容写回旧会话文件。
 
 `/compact` 会把较早历史压缩成一个摘要 system message，保留最近两轮原文，适合长对话里降低上下文压力。
+
+`explore_start` / `explore_end` 让 agent 把一段临时探索从主上下文里收束掉：适合单点功能探针、bug 定位、假设验证、代码考古、方案侦察、低密度资料搜索、环境检查、性能/数值实验、测试面发现、数据样本检查、日志聚类和风险预检。`explore_end` 会把 raw 过程归档到 `~/.ddtui/explorations/<session_id>/<explore_id>.json`，并在对话里留下一个探索摘要 system message；`explore_cancel` 则取消边界，不压缩历史。
 
 ## 开发结构
 

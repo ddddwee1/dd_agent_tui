@@ -476,6 +476,7 @@ class AppUiMixin:
             self._todo_block.remove()
         self._todo_block = None
         self.ctx.checkpoint = None
+        self._reset_explore_state()
         if (
             self._checkpoint_block is not None
             and self._checkpoint_block.is_mounted
@@ -697,6 +698,7 @@ class AppUiMixin:
         for i in range(len(self.messages) - 1, -1, -1):
             if self.messages[i].get("role") == "user":
                 del self.messages[i:]
+                self._drop_explore_if_truncated()
                 return
 
     def _pair_orphan_tool_calls(
