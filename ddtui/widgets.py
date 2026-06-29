@@ -1318,6 +1318,7 @@ class SlashPopup(Static):
         ("/save <name>", "保存到 ~/.ddtui/history/<name>.json"),
         ("/load <name>", "读回保存的对话"),
         ("/resume [name]", "恢复对话；不带 name 时打开选择窗口"),
+        ("/remote [status|on|off]", "管理 VPS 远控连接"),
         ("/list-history", "列出已保存对话"),
         ("/provider [deepseek|codex]", "查看 / 切换 provider"),
         ("/model [<id>]", "查看 / 切换模型（下一轮请求生效）"),

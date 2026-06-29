@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -12,6 +13,10 @@ from .remote_protocol import now_iso, url_with_query
 
 
 log = logging.getLogger(__name__)
+
+DELTA_FLUSH_INTERVAL = 0.04
+DELTA_MAX_EVENTS = 48
+DELTA_MAX_CHARS = 16000
 
 CommandHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 SnapshotFactory = Callable[[], dict[str, Any]]
@@ -205,9 +210,79 @@ class RemoteClient:
         }
 
     async def _send_loop(self, ws) -> None:
+        pending: deque[dict[str, Any]] = deque()
         while not self._stop.is_set():
-            message = await self._queue.get()
+            message = pending.popleft() if pending else await self._queue.get()
+            if self._is_assistant_delta(message):
+                message, leftovers = await self._coalesce_assistant_delta(message)
+                pending.extend(leftovers)
             await ws.send(json.dumps(message, ensure_ascii=False))
+
+    async def _coalesce_assistant_delta(
+        self, first: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Merge bursts of same-kind assistant delta events before sending.
+
+        Model providers can emit very small chunks. Sending and rendering each
+        one separately makes mobile browsers lag behind the local TUI, so we
+        trade at most a few dozen milliseconds for much lower relay/UI churn.
+        """
+        kind = self._assistant_delta_kind(first)
+        chunks = [first]
+        leftovers: list[dict[str, Any]] = []
+        total_chars = len(self._assistant_delta_text(first))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + DELTA_FLUSH_INTERVAL
+
+        while (
+            len(chunks) < DELTA_MAX_EVENTS
+            and total_chars < DELTA_MAX_CHARS
+            and not self._stop.is_set()
+        ):
+            timeout = deadline - loop.time()
+            if timeout <= 0:
+                break
+            try:
+                candidate = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                break
+            if (
+                not self._is_assistant_delta(candidate)
+                or self._assistant_delta_kind(candidate) != kind
+            ):
+                leftovers.append(candidate)
+                break
+            chunks.append(candidate)
+            total_chars += len(self._assistant_delta_text(candidate))
+
+        if len(chunks) == 1:
+            return first, leftovers
+
+        merged = dict(first)
+        merged_payload = dict(first.get("payload") or {})
+        merged_payload["kind"] = kind
+        merged_payload["text"] = "".join(
+            self._assistant_delta_text(item) for item in chunks
+        )
+        merged["payload"] = merged_payload
+        merged["seq"] = chunks[-1].get("seq", first.get("seq"))
+        merged["sent_at"] = chunks[-1].get("sent_at", first.get("sent_at"))
+        return merged, leftovers
+
+    def _is_assistant_delta(self, message: dict[str, Any]) -> bool:
+        return (
+            message.get("kind") == "event"
+            and message.get("type") == "assistant.delta"
+            and isinstance(message.get("payload"), dict)
+        )
+
+    def _assistant_delta_kind(self, message: dict[str, Any]) -> str:
+        payload = message.get("payload") or {}
+        return str(payload.get("kind") or "content")
+
+    def _assistant_delta_text(self, message: dict[str, Any]) -> str:
+        payload = message.get("payload") or {}
+        return str(payload.get("text") or "")
 
     async def _recv_loop(self, ws) -> None:
         async for raw in ws:

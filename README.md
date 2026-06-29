@@ -312,6 +312,12 @@ export DDTUI_REMOTE_TLS=0
 - 发送普通输入、steer 实时插话、interrupt。
 - 读取 terminal 输出。
 
+断线行为：
+
+- 本地 ddtui session 到 VPS relay 会自动重连，网络短断后通常不需要重新输入 `/remote on`。
+- 浏览器网页到 VPS relay 也会自动重连；重连后会刷新在线 session 列表，并对当前 session 重新订阅和拉取 snapshot。
+- 手动点击网页 `Logout`，或在本地执行 `/remote off`，会主动停止对应连接，需要之后手动重新登录或 `/remote on`。
+
 远程 `terminal_send` 和 `terminal_interrupt` 默认关闭，因为它相当于远程向交互 shell 输入命令。确实需要时，在本地 ddtui 进程设置：
 
 ```bash

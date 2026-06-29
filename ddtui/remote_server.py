@@ -62,6 +62,8 @@ class RelayState:
     def session_summaries(self) -> list[dict[str, Any]]:
         items = []
         for record in self.sessions.values():
+            if not record.online:
+                continue
             meta = record.meta or {}
             items.append(
                 {
@@ -265,12 +267,26 @@ def create_app(*, token: str):
             pass
         finally:
             if session_id:
+                subscribers = []
                 async with state.lock:
                     record = state.sessions.get(session_id)
                     if record is not None and record.ws is ws:
                         record.online = False
                         record.ws = None
                         record.updated_at = now_iso()
+                        subscribers = list(record.subscribers)
+                        state.sessions.pop(session_id, None)
+                for sub in subscribers:
+                    await _send_json_safe(
+                        sub,
+                        {
+                            "kind": "event",
+                            "type": "session.offline",
+                            "session_id": session_id,
+                            "sent_at": now_iso(),
+                            "payload": {"session_id": session_id},
+                        },
+                    )
                 await broadcast_sessions()
 
     @app.websocket("/ws/control")
