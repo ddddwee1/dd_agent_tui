@@ -87,6 +87,13 @@ class AppUiMixin:
         self.set_interval(
             SUBAGENT_REAP_INTERVAL_SEC, self._reap_idle_subagents
         )
+        if hasattr(self, "_maybe_start_remote_from_config"):
+            self.call_later(self._maybe_start_remote_from_config)
+
+    def on_unmount(self) -> None:
+        client = getattr(self, "_remote_client", None)
+        if client is not None:
+            client.stop()
 
     def _poll_task_notifications(self) -> None:
         checkpoint_before = self.ctx.checkpoint
@@ -290,9 +297,22 @@ class AppUiMixin:
 
         for term in list(self.ctx.terminals.values()):
             try:
-                drain_terminal_output(term)
+                drained = drain_terminal_output(term)
             except Exception:
+                drained = 0
                 pass
+            if drained:
+                try:
+                    self._remote_emit(
+                        "terminal.tail",
+                        {
+                            "terminal_id": term.id,
+                            "output_size": term.output_size,
+                            "tail": term.tail[-4000:],
+                        },
+                    )
+                except Exception:
+                    pass
             pane = self._terminal_panes.get(term.id)
             if pane is None:
                 pane = term.pane if term.pane is not None else TerminalTabPane(term)
@@ -530,6 +550,8 @@ class AppUiMixin:
         self.ctx.session_id = self._session_id
         self.ctx.task_next_id = 1
         self._autosave_path = None
+        if hasattr(self, "_remote_on_session_reset"):
+            self._remote_on_session_reset()
         self.call_later(self._autosave_conversation)
 
     def _start_dismiss(self) -> None:
@@ -1015,10 +1037,18 @@ class AppUiMixin:
             queued=len(self._queued),
             steer=len(self._steer),
         )
+        try:
+            self._remote_emit_status("status")
+        except Exception:
+            pass
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self._refresh_status()
+        try:
+            self._remote_emit_status("busy", force=True)
+        except Exception:
+            pass
 
     def _context_limit(self) -> int | None:
         try:

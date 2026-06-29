@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ddtui remote</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #191a16;
+      --panel: #24251f;
+      --panel-2: #2d2e27;
+      --line: #55533f;
+      --text: #f8f8f2;
+      --muted: #a59f85;
+      --cyan: #66d9ef;
+      --green: #a6e22e;
+      --yellow: #e6db74;
+      --red: #f92672;
+    }
+    * { box-sizing: border-box; }
+    html { height: 100%; }
+    body {
+      margin: 0;
+      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      min-height: 100dvh;
+      overflow: hidden;
+    }
+    button, input, textarea {
+      font: inherit;
+      color: inherit;
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+    button {
+      cursor: pointer;
+      padding: 8px 10px;
+      background: #35362e;
+      min-height: 38px;
+      white-space: nowrap;
+    }
+    button:hover { border-color: var(--cyan); }
+    button.primary { color: #111; background: var(--cyan); border-color: var(--cyan); }
+    button.warn { color: #111; background: var(--yellow); border-color: var(--yellow); }
+    input, textarea {
+      width: 100%;
+      padding: 9px 10px;
+      outline: none;
+      min-height: 38px;
+    }
+    textarea {
+      min-height: 92px;
+      resize: vertical;
+    }
+    .app {
+      display: grid;
+      grid-template-columns: 310px 1fr;
+      height: 100vh;
+      min-height: 100dvh;
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    h1 {
+      font-size: 16px;
+      margin: 0;
+      font-weight: 650;
+    }
+    .login {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      gap: 8px;
+    }
+    .sessions {
+      overflow: auto;
+      padding: 8px;
+      display: grid;
+      gap: 8px;
+      min-height: 0;
+    }
+    .session {
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      text-align: left;
+    }
+    .session.active { border-color: var(--cyan); }
+    .session .id {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: var(--cyan);
+      word-break: break-all;
+    }
+    .session .meta {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+      word-break: break-word;
+    }
+    main {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      height: 100vh;
+      min-height: 100dvh;
+    }
+    .status {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .pill {
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .pill.online { color: var(--green); border-color: var(--green); }
+    .pill.busy { color: var(--yellow); border-color: var(--yellow); }
+    .log {
+      overflow: auto;
+      padding: 14px;
+      display: grid;
+      align-content: start;
+      gap: 10px;
+      min-height: 0;
+      -webkit-overflow-scrolling: touch;
+    }
+    .msg {
+      max-width: min(980px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: var(--panel);
+    }
+    .msg.user { border-color: #75715e; }
+    .msg.assistant { border-color: #3f6f46; }
+    .msg.tool { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .msg.reasoning { color: var(--muted); border-style: dashed; }
+    .role {
+      font-size: 12px;
+      color: var(--cyan);
+      margin-bottom: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .composer {
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .terminal {
+      border-top: 1px solid var(--line);
+      padding-top: 8px;
+      display: grid;
+      gap: 8px;
+    }
+    .terminal summary {
+      cursor: pointer;
+      color: var(--muted);
+      list-style-position: inside;
+      min-height: 32px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .terminal summary::marker { color: var(--cyan); }
+    .terminal select {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+    }
+    @media (max-width: 820px) {
+      body { height: 100dvh; }
+      .app {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto minmax(0, 1fr);
+        height: 100dvh;
+      }
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+        max-height: 34dvh;
+        min-height: 158px;
+        overflow: hidden;
+      }
+      header {
+        padding: 8px 10px;
+      }
+      h1 { font-size: 15px; }
+      #refreshBtn { padding-inline: 9px; }
+      .login {
+        padding: 8px 10px;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        align-items: center;
+        gap: 6px;
+      }
+      .login .actions {
+        display: contents;
+      }
+      .login button {
+        padding-inline: 8px;
+      }
+      .sessions {
+        display: flex;
+        gap: 8px;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding: 8px 10px 10px;
+        -webkit-overflow-scrolling: touch;
+      }
+      .session {
+        min-width: min(82vw, 310px);
+        max-width: min(82vw, 310px);
+        padding: 8px 9px;
+      }
+      .session .id {
+        font-size: 11px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        word-break: normal;
+      }
+      .session .meta {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        word-break: normal;
+      }
+      main {
+        height: auto;
+        min-height: 0;
+      }
+      .status {
+        padding: 7px 10px;
+        gap: 6px;
+        overflow-x: auto;
+        flex-wrap: nowrap;
+        -webkit-overflow-scrolling: touch;
+      }
+      .log {
+        padding: 10px;
+        gap: 8px;
+      }
+      .msg {
+        padding: 9px 10px;
+        font-size: 13px;
+      }
+      .role {
+        font-size: 11px;
+        margin-bottom: 4px;
+      }
+      .composer {
+        padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+        gap: 7px;
+      }
+      textarea {
+        min-height: 68px;
+        max-height: 28dvh;
+      }
+      .composer > .actions {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 6px;
+      }
+      .composer > .actions button {
+        padding: 8px 4px;
+        min-width: 0;
+      }
+      .terminal {
+        padding-top: 4px;
+        gap: 6px;
+      }
+      .terminal .actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+      }
+      .terminal select,
+      .terminal input {
+        min-height: 40px;
+      }
+    }
+    @media (max-width: 420px) {
+      body { font-size: 13px; }
+      aside { max-height: 36dvh; }
+      .login {
+        grid-template-columns: 1fr auto;
+      }
+      .login .actions {
+        display: grid;
+        grid-column: 1 / -1;
+        grid-template-columns: 1fr 1fr;
+      }
+      .composer > .actions {
+        grid-template-columns: 1fr 1fr;
+      }
+      .terminal .actions {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <header>
+        <h1>ddtui remote</h1>
+        <button id="refreshBtn">Refresh</button>
+      </header>
+      <section class="login">
+        <input id="tokenInput" type="password" placeholder="Login token">
+        <div class="actions">
+          <button id="connectBtn" class="primary">Connect</button>
+          <button id="logoutBtn">Logout</button>
+        </div>
+      </section>
+      <section id="sessions" class="sessions"></section>
+    </aside>
+    <main>
+      <section id="status" class="status">
+        <span class="pill">disconnected</span>
+      </section>
+      <section id="log" class="log"></section>
+      <section class="composer">
+        <textarea id="input" placeholder="Message this active ddtui session"></textarea>
+        <div class="actions">
+          <button id="sendBtn" class="primary">Send</button>
+          <button id="steerBtn">Steer</button>
+          <button id="interruptBtn" class="warn">Interrupt</button>
+          <button id="snapshotBtn">Snapshot</button>
+        </div>
+        <details class="terminal">
+          <summary>Terminal</summary>
+          <select id="terminalSelect"></select>
+          <input id="terminalInput" placeholder="Terminal input, include Enter by pressing the button">
+          <div class="actions">
+            <button id="terminalReadBtn">Read Terminal</button>
+            <button id="terminalSendBtn">Send Terminal Text</button>
+          </div>
+        </details>
+      </section>
+    </main>
+  </div>
+  <script>
+    const els = {
+      token: document.getElementById("tokenInput"),
+      connect: document.getElementById("connectBtn"),
+      logout: document.getElementById("logoutBtn"),
+      refresh: document.getElementById("refreshBtn"),
+      sessions: document.getElementById("sessions"),
+      status: document.getElementById("status"),
+      log: document.getElementById("log"),
+      input: document.getElementById("input"),
+      send: document.getElementById("sendBtn"),
+      steer: document.getElementById("steerBtn"),
+      interrupt: document.getElementById("interruptBtn"),
+      snapshot: document.getElementById("snapshotBtn"),
+      terminalSelect: document.getElementById("terminalSelect"),
+      terminalInput: document.getElementById("terminalInput"),
+      terminalRead: document.getElementById("terminalReadBtn"),
+      terminalSend: document.getElementById("terminalSendBtn"),
+    };
+
+    let ws = null;
+    let sessions = [];
+    let activeSession = "";
+    let activeStatus = null;
+    let messages = [];
+    let streaming = null;
+    let clientId = `web-${Math.random().toString(16).slice(2)}`;
+    let lastSeq = 0;
+
+    els.token.value = localStorage.getItem("ddtuiRemoteToken") || "";
+
+    function wsUrl() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const token = encodeURIComponent(els.token.value.trim());
+      return `${proto}//${location.host}/ws/control?token=${token}`;
+    }
+
+    function connect() {
+      if (ws) ws.close();
+      const token = els.token.value.trim();
+      if (!token) return notice("Enter the login token first.");
+      localStorage.setItem("ddtuiRemoteToken", token);
+      ws = new WebSocket(wsUrl());
+      ws.onopen = () => {
+        notice("connected");
+        sendRaw({ kind: "list_sessions" });
+      };
+      ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
+      ws.onclose = () => notice("disconnected");
+      ws.onerror = () => notice("socket error");
+    }
+
+    function sendRaw(message) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        notice("not connected");
+        return;
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function command(type, payload = {}) {
+      if (!activeSession) {
+        notice("select a session first");
+        return;
+      }
+      sendRaw({
+        kind: "command",
+        type,
+        session_id: activeSession,
+        command_id: `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        client_id: clientId,
+        payload,
+      });
+    }
+
+    function handleMessage(message) {
+      if (message.seq) lastSeq = Math.max(lastSeq, Number(message.seq) || 0);
+      if (message.kind === "sessions.list") {
+        sessions = message.sessions || [];
+        renderSessions();
+        return;
+      }
+      if (message.kind === "command_ack") {
+        notice(`${message.status}: ${message.message || message.command_id || ""}`);
+        if (message.payload && message.payload.result) {
+          appendMessage("tool", message.payload.result);
+        }
+        return;
+      }
+      if (message.kind === "error") {
+        notice(message.message || "error");
+        return;
+      }
+      if (message.kind !== "event") return;
+      if (message.session_id && message.session_id !== activeSession) return;
+      const payload = message.payload || {};
+      if (message.type === "session.snapshot") {
+        const snap = payload.messages ? payload : payload;
+        activeStatus = snap.status || activeStatus;
+        messages = snap.messages || [];
+        streaming = null;
+        renderStatus();
+        renderMessages();
+      } else if (message.type === "status.changed") {
+        activeStatus = (payload.status || payload);
+        renderStatus();
+      } else if (message.type === "message.append") {
+        if (streaming) {
+          messages.push(streaming);
+          streaming = null;
+        }
+        if (payload.message) messages.push(payload.message);
+        renderMessages();
+      } else if (message.type === "assistant.delta") {
+        const kind = payload.kind || "content";
+        if (!streaming || streaming.role !== "assistant") {
+          streaming = { role: "assistant", content: "", reasoning_content: "" };
+        }
+        if (kind === "reasoning") {
+          streaming.reasoning_content += payload.text || "";
+        } else {
+          streaming.content += payload.text || "";
+        }
+        renderMessages();
+      } else if (message.type === "terminal.tail") {
+        appendMessage("tool", `[${payload.terminal_id}] ${payload.tail || ""}`);
+      } else if (message.type === "remote.input" || message.type === "tool.started") {
+        appendMessage("tool", `${message.type}: ${JSON.stringify(payload)}`);
+      }
+    }
+
+    function renderSessions() {
+      els.sessions.innerHTML = "";
+      for (const session of sessions) {
+        const btn = document.createElement("button");
+        btn.className = `session${session.session_id === activeSession ? " active" : ""}`;
+        btn.innerHTML = `
+          <div class="id">${escapeHtml(session.session_id)}</div>
+          <div class="meta">${session.online ? "online" : "offline"} · ${escapeHtml(session.model || "-")} · ${session.busy ? "busy" : "idle"}</div>
+          <div class="meta">${escapeHtml(session.cwd || "")}</div>
+        `;
+        btn.onclick = () => selectSession(session.session_id);
+        els.sessions.appendChild(btn);
+      }
+    }
+
+    function selectSession(sessionId) {
+      activeSession = sessionId;
+      messages = [];
+      streaming = null;
+      lastSeq = 0;
+      renderSessions();
+      renderMessages();
+      sendRaw({ kind: "subscribe", session_id: sessionId, after_seq: -1 });
+      command("snapshot");
+    }
+
+    function renderStatus() {
+      if (!activeStatus) {
+        els.status.innerHTML = `<span class="pill">no session</span>`;
+        renderTerminals([]);
+        return;
+      }
+      const terminals = activeStatus.terminals || [];
+      els.status.innerHTML = `
+        <span class="pill online">${escapeHtml(activeStatus.session_id || activeSession)}</span>
+        <span class="pill ${activeStatus.busy ? "busy" : ""}">${activeStatus.busy ? "busy" : "idle"}</span>
+        <span class="pill">${escapeHtml(activeStatus.provider || "")} ${escapeHtml(activeStatus.model || "")}</span>
+        <span class="pill">queue ${activeStatus.queued || 0}</span>
+        <span class="pill">steer ${activeStatus.steer || 0}</span>
+        <span class="pill">terminal_send ${activeStatus.terminal_send_enabled ? "on" : "off"}</span>
+      `;
+      renderTerminals(terminals);
+    }
+
+    function renderTerminals(terminals) {
+      const previous = els.terminalSelect.value;
+      els.terminalSelect.innerHTML = "";
+      if (!terminals.length) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "No terminals";
+        els.terminalSelect.appendChild(opt);
+        return;
+      }
+      for (const term of terminals) {
+        const opt = document.createElement("option");
+        opt.value = term.id;
+        opt.textContent = `${term.id} ${term.name || ""} ${term.status || ""}`;
+        els.terminalSelect.appendChild(opt);
+      }
+      if (previous) els.terminalSelect.value = previous;
+    }
+
+    function renderMessages() {
+      els.log.innerHTML = "";
+      const all = streaming ? [...messages, streaming] : messages;
+      for (const message of all) {
+        renderMessage(message);
+      }
+      els.log.scrollTop = els.log.scrollHeight;
+    }
+
+    function renderMessage(message) {
+      const role = message.role || "event";
+      if (message.reasoning_content) {
+        const reasoning = document.createElement("div");
+        reasoning.className = "msg reasoning";
+        reasoning.innerHTML = `<div class="role">reasoning</div>${escapeHtml(message.reasoning_content)}`;
+        els.log.appendChild(reasoning);
+      }
+      const div = document.createElement("div");
+      div.className = `msg ${role}`;
+      let content = message.content || "";
+      if (message.tool_calls) {
+        content += `\n\n${JSON.stringify(message.tool_calls, null, 2)}`;
+      }
+      div.innerHTML = `<div class="role">${escapeHtml(role)}</div>${escapeHtml(content)}`;
+      els.log.appendChild(div);
+    }
+
+    function appendMessage(role, content) {
+      messages.push({ role, content });
+      renderMessages();
+    }
+
+    function notice(text) {
+      const current = els.status.innerHTML;
+      els.status.innerHTML = `<span class="pill">${escapeHtml(text)}</span>${current}`;
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    els.connect.onclick = connect;
+    els.logout.onclick = () => {
+      localStorage.removeItem("ddtuiRemoteToken");
+      els.token.value = "";
+      if (ws) ws.close();
+    };
+    els.refresh.onclick = () => sendRaw({ kind: "list_sessions" });
+    els.send.onclick = () => {
+      const text = els.input.value.trim();
+      if (!text) return;
+      command("submit", { text });
+      els.input.value = "";
+    };
+    els.steer.onclick = () => {
+      const text = els.input.value.trim();
+      if (!text) return;
+      command("steer", { text });
+      els.input.value = "";
+    };
+    els.interrupt.onclick = () => command("interrupt");
+    els.snapshot.onclick = () => command("snapshot");
+    els.terminalRead.onclick = () => {
+      const terminal_id = els.terminalSelect.value;
+      if (!terminal_id) return;
+      command("terminal_read", { terminal_id, offset: 0, max_chars: 12000 });
+    };
+    els.terminalSend.onclick = () => {
+      const terminal_id = els.terminalSelect.value;
+      const text = els.terminalInput.value;
+      if (!terminal_id || !text) return;
+      command("terminal_send", { terminal_id, text: `${text}\n`, wait_ms: 250 });
+      els.terminalInput.value = "";
+    };
+    els.input.addEventListener("keydown", (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        els.steer.click();
+      } else if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        els.send.click();
+      }
+    });
+  </script>
+</body>
+</html>

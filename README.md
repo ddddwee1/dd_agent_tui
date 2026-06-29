@@ -150,6 +150,7 @@ ddtui
 - `/save <name>`：保存到 `~/.ddtui/history/<name>.json`。
 - `/load <name>`：读回保存的对话。
 - `/resume [name]`：恢复保存的对话；不带名字时弹出选择窗口。
+- `/remote [status|on [url]|off|snapshot]`：管理 VPS 远程控制连接。
 - `/list-history`：列出已保存对话。
 - `/provider [deepseek|codex]`：查看 / 切换 provider。
 - `/model [<id>]`：查看 / 切换模型。
@@ -158,6 +159,166 @@ ddtui
 - `/rethink`：删除最近一轮助手回复，让模型重新思考。
 - `/help`：显示内置帮助。
 - `/exit` / `/quit`：退出。
+
+## 远程控制
+
+远控是三段式结构：本地活跃 ddtui session 主动连到 VPS relay，浏览器登录 relay 前端后订阅并控制这个 session。VPS 不运行 agent，也不直接读写你的本机文件；它只做 WebSocket 转发、在线 session 列表和短期事件缓存。
+
+```text
+Browser Web UI  <->  VPS relay  <->  local ddtui session
+```
+
+安装远控依赖：
+
+```bash
+pip install -e '.[remote]'
+# 或
+pip install -r requirements-remote.txt
+```
+
+生成/设置一个登录 token。本地 `/remote on` 如果找不到 token，会自动写入 `~/.ddtui/remote_token`；VPS relay 也需要同一个 token。
+
+在 VPS 上启动 relay：
+
+```bash
+export DDTUI_REMOTE_TOKEN='replace-with-a-long-random-token'
+ddtui-remote-server --host 0.0.0.0 --port 10000
+```
+
+VPS 端口建议使用 `10000~10010` 这一段；默认是 `10000`，如果这个端口被占用，可以在同一段里换一个端口，并让本地 `DDTUI_REMOTE_PORT` / `/remote on <url>` 保持一致。
+
+### VPS 部署 / 更新流程
+
+下面是一套直接可用的部署流程。假设 `~/vps_addr.txt` 里写着 SSH 目标，例如：
+
+```text
+root@<vps-host>
+```
+
+本地先准备登录 token；本地 ddtui 和 VPS relay 必须使用同一个 token：
+
+```bash
+mkdir -p ~/.ddtui
+test -s ~/.ddtui/remote_token || python3 - <<'PY'
+from pathlib import Path
+import secrets
+p = Path.home() / ".ddtui" / "remote_token"
+p.write_text(secrets.token_urlsafe(32) + "\n", encoding="utf-8")
+p.chmod(0o600)
+PY
+```
+
+把当前工作树和 token 同步到 VPS：
+
+```bash
+ssh -o StrictHostKeyChecking=accept-new "$(cat ~/vps_addr.txt)" \
+  'mkdir -p /root/dd_agent_tui /root/.ddtui && chmod 700 /root/.ddtui'
+
+rsync -az --delete \
+  --exclude .git --exclude .venv --exclude '__pycache__' --exclude '*.pyc' \
+  -e 'ssh -o StrictHostKeyChecking=accept-new' \
+  ./ "$(cat ~/vps_addr.txt)":/root/dd_agent_tui/
+
+scp -q ~/.ddtui/remote_token \
+  "$(cat ~/vps_addr.txt)":/root/.ddtui/remote_token
+
+ssh "$(cat ~/vps_addr.txt)" 'chmod 600 /root/.ddtui/remote_token'
+```
+
+首次部署时，在 VPS 上创建 venv 并安装远控依赖。Ubuntu 如果缺 `ensurepip`，先装对应的 `python3.12-venv`：
+
+```bash
+ssh "$(cat ~/vps_addr.txt)" '
+  cd /root/dd_agent_tui &&
+  (python3 -m venv .venv || (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3.12-venv && python3 -m venv .venv)) &&
+  . .venv/bin/activate &&
+  python -m pip install -U pip &&
+  python -m pip install -e ".[remote]"
+'
+```
+
+用 tmux 常驻启动 relay：
+
+```bash
+ssh "$(cat ~/vps_addr.txt)" '
+  if tmux has-session -t ddtui-remote 2>/dev/null; then
+    tmux kill-session -t ddtui-remote
+  fi
+  tmux new-session -d -s ddtui-remote "
+    cd /root/dd_agent_tui &&
+    . .venv/bin/activate &&
+    export DDTUI_REMOTE_TOKEN_FILE=/root/.ddtui/remote_token &&
+    ddtui-remote-server --host 0.0.0.0 --port 10000
+  "
+  sleep 1
+  tmux clear-history -t ddtui-remote || true
+  ss -ltnp | grep ":10000\b" || true
+'
+```
+
+检查服务：
+
+```bash
+curl -fsS http://<vps-host>:10000/healthz
+ssh "$(cat ~/vps_addr.txt)" 'tmux ls; tmux capture-pane -pt ddtui-remote -S -40'
+```
+
+常用运维命令：
+
+```bash
+# 看 relay 日志
+ssh "$(cat ~/vps_addr.txt)" 'tmux capture-pane -pt ddtui-remote -S -80'
+
+# 进入 tmux
+ssh "$(cat ~/vps_addr.txt)" 'tmux attach -t ddtui-remote'
+
+# 停止 relay
+ssh "$(cat ~/vps_addr.txt)" 'tmux kill-session -t ddtui-remote'
+```
+
+然后浏览器打开：
+
+```text
+http://<vps-host>:10000/
+```
+
+本地 session 连接 relay。可以显式传 URL：
+
+```text
+/remote on ws://<vps-host>:10000/ws/session
+```
+
+也可以让 ddtui 从 `~/vps_addr.txt` 推导默认地址；例如文件内容是 `root@<vps-host>` 时，默认会推导成 `ws://<vps-host>:10000/ws/session`：
+
+```text
+/remote on
+```
+
+常用环境变量：
+
+```bash
+export DDTUI_REMOTE_URL='ws://<vps-host>:10000/ws/session'
+export DDTUI_REMOTE_TOKEN='replace-with-a-long-random-token'
+export DDTUI_REMOTE_AUTO=1
+export DDTUI_REMOTE_PORT=10000
+export DDTUI_REMOTE_TLS=0
+```
+
+网页前端第一版支持：
+
+- 登录 token。
+- 查看在线 session 列表、cwd、model、busy/idle、queue/steer 数。
+- 订阅 transcript/status/streaming delta/tool started/terminal tail。
+- 发送普通输入、steer 实时插话、interrupt。
+- 读取 terminal 输出。
+
+远程 `terminal_send` 和 `terminal_interrupt` 默认关闭，因为它相当于远程向交互 shell 输入命令。确实需要时，在本地 ddtui 进程设置：
+
+```bash
+export DDTUI_REMOTE_ALLOW_TERMINAL_SEND=1
+```
+
+安全建议：relay 前面最好放 HTTPS/WSS（Caddy/Nginx 均可），token 使用长随机串；不需要远控时用 `/remote off` 断开。
 
 ## 工具能力
 

@@ -17,6 +17,7 @@ dependencies = [
     "httpx>=0.27",
     "textual>=0.80",
 ]
+
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -29,15 +30,26 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 
+[project.optional-dependencies]
+remote = [
+    "websockets>=12",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+
 [project.urls]
 Homepage = "https://github.com/ddddwee1/dd_agent_tui"
 Repository = "https://github.com/ddddwee1/dd_agent_tui"
 
 [project.scripts]
 ddtui = "ddtui.app:main"
+ddtui-remote-server = "ddtui.remote_server:main"
 
 [tool.setuptools]
 py-modules = ["agent"]
 
 [tool.setuptools.packages.find]
 include = ["ddtui*"]
+
+[tool.setuptools.package-data]
+ddtui = ["remote_web/*"]

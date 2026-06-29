@@ -20,6 +20,7 @@ from .app_confirm import ToolConfirmHook, always_allow
 from .app_explore import AppExploreMixin
 from .app_history import AppHistoryMixin
 from .app_input import AppInputMixin
+from .app_remote import AppRemoteMixin
 from .app_subagents import AppSubagentMixin
 from .app_support import load_agents_md
 from .app_ui import AppUiMixin
@@ -42,6 +43,7 @@ from .widgets import (
 
 
 class AgentApp(
+    AppRemoteMixin,
     AppInputMixin,
     AppHistoryMixin,
     AppExploreMixin,
@@ -240,6 +242,7 @@ class AgentApp(
         # timer auto-resets the armed flag if no second press lands.
         self._esc_armed = False
         self._esc_disarm_timer = None
+        self._init_remote_state()
 
     # ─ compose ─
 

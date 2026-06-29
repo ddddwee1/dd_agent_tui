@@ -583,6 +583,8 @@ class AppHistoryMixin:
         # the live context window.
         self.counter = TokenCounter()
         self._refresh_status()
+        if hasattr(self, "_remote_on_session_reset"):
+            self._remote_on_session_reset()
 
         saved_at = payload.get("saved_at", "?")
         saved_model = payload.get("model", "?")
@@ -725,6 +727,7 @@ class AppHistoryMixin:
             "- `/load <name>` 读回保存的对话\n"
             "- `/resume [name]` 恢复对话；不带 name 时打开选择窗口\n"
             "- 断线后启动会提示可恢复会话；用 `/resume <name>` 接回\n"
+            "- `/remote [status|on [url]|off|snapshot]` 管理 VPS 远控连接\n"
             "- `/list-history` 列出已保存对话\n"
             "- `/provider [deepseek|codex]` 查看 / 切换 provider\n"
             "- `/model [<id>]` 查看 / 切换模型（下一轮请求生效）\n"

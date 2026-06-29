@@ -94,6 +94,33 @@ class AppInputMixin:
             else:
                 await self._resume_conversation_picker()
             return
+        if text == "/remote" or text.startswith("/remote "):
+            inp.text = ""
+            arg = text[len("/remote"):].strip()
+            parts = arg.split(maxsplit=1)
+            cmd = parts[0].lower() if parts else "status"
+            rest = parts[1] if len(parts) > 1 else ""
+            if cmd in ("", "status"):
+                await self._remote_status_notice()
+                return
+            if cmd == "on":
+                await self._remote_start(rest)
+                return
+            if cmd == "off":
+                await self._remote_stop()
+                return
+            if cmd == "snapshot":
+                self._remote_emit_snapshot("slash_command")
+                await self._mount_widget(Static(Text(
+                    "已向远端推送当前 session snapshot。",
+                    style="bold #66d9ef",
+                )))
+                return
+            await self._mount_widget(Static(Text(
+                "用法：/remote [status|on [url]|off|snapshot]",
+                style="dim",
+            )))
+            return
         if text in ("/list-history", "/history", "/list_history"):
             inp.text = ""
             await self._list_history()

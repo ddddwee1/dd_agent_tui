@@ -82,6 +82,16 @@ class AppAgentLoopMixin:
                     tool_started=False,
                 )
                 self.messages.append({"role": "user", "content": pending})
+                try:
+                    self._remote_emit(
+                        "message.append",
+                        {
+                            "message": {"role": "user", "content": pending},
+                            "source": "turn",
+                        },
+                    )
+                except Exception:
+                    pass
                 await self._autosave_conversation()
                 ok = await self._run_one_turn()
                 if not ok:
@@ -142,6 +152,10 @@ class AppAgentLoopMixin:
             except Exception:
                 pass
             await self._autosave_conversation()
+            try:
+                self._remote_emit_snapshot("turn_finished")
+            except Exception:
+                pass
 
     async def _run_one_turn(self) -> bool:
         """Inner loop: one user→assistant→(tools→assistant)+ turn.
@@ -171,6 +185,19 @@ class AppAgentLoopMixin:
                                 "content": f"[实时插话] {s}",
                             }
                         )
+                        try:
+                            self._remote_emit(
+                                "message.append",
+                                {
+                                    "message": {
+                                        "role": "user",
+                                        "content": f"[实时插话] {s}",
+                                    },
+                                    "source": "steer",
+                                },
+                            )
+                        except Exception:
+                            pass
                         # Move the bubble out of the pending tray and
                         # into the conversation so the user can scroll
                         # back through their interjections later.
@@ -187,6 +214,13 @@ class AppAgentLoopMixin:
                 )
                 assistant_msg = await self._stream_one()
                 self.messages.append(assistant_msg)
+                try:
+                    self._remote_emit(
+                        "message.append",
+                        {"message": assistant_msg, "source": "assistant"},
+                    )
+                except Exception:
+                    pass
                 await self._autosave_conversation()
                 tool_calls = assistant_msg.get("tool_calls") or []
                 if not tool_calls:
@@ -194,6 +228,17 @@ class AppAgentLoopMixin:
                 for tc in tool_calls:
                     name = tc["function"]["name"]
                     raw = tc["function"].get("arguments") or "{}"
+                    try:
+                        self._remote_emit(
+                            "tool.started",
+                            {
+                                "tool_call_id": tc.get("id"),
+                                "name": name,
+                                "arguments": raw,
+                            },
+                        )
+                    except Exception:
+                        pass
                     self._write_turn_journal(
                         phase="tool",
                         tool_started=True,
@@ -499,6 +544,13 @@ class AppAgentLoopMixin:
                         thinking = ThinkingBlock()
                         await self._mount_widget(thinking)
                     thinking.append_text(event.reasoning)
+                    try:
+                        self._remote_emit(
+                            "assistant.delta",
+                            {"kind": "reasoning", "text": event.reasoning},
+                        )
+                    except Exception:
+                        pass
                     if self._follow_bottom:
                         view.scroll_end(animate=False)
 
@@ -507,6 +559,13 @@ class AppAgentLoopMixin:
                         answer = AssistantMessage()
                         await self._mount_widget(answer)
                     answer.append_text(event.content)
+                    try:
+                        self._remote_emit(
+                            "assistant.delta",
+                            {"kind": "content", "text": event.content},
+                        )
+                    except Exception:
+                        pass
                     if self._follow_bottom:
                         view.scroll_end(animate=False)
 

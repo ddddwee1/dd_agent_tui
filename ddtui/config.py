@@ -20,6 +20,16 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_int(name: str, *, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
 # ───────── API / model providers ─────────
 
 API_KEY_PATH = os.environ.get(
@@ -128,6 +138,33 @@ PROJECT_NOTE_DEFAULT_LIST_LIMIT = 20
 HISTORY_DIR = Path.home() / ".ddtui" / "history"
 RUNTIME_DIR = Path.home() / ".ddtui" / "runtime"
 EXPLORE_ARCHIVE_DIR = Path.home() / ".ddtui" / "explorations"
+
+
+# ───────── remote control ─────────
+
+# Local sessions connect OUT to this relay URL. If unset, /remote on can
+# derive a default from REMOTE_ADDR_FILE, e.g. root@vps.example.com ->
+# ws://vps.example.com:10000/ws/session.
+REMOTE_URL = os.environ.get("DDTUI_REMOTE_URL", "").strip()
+REMOTE_ADDR_FILE = Path(
+    os.environ.get("DDTUI_REMOTE_ADDR_FILE", str(Path.home() / "vps_addr.txt"))
+)
+REMOTE_TOKEN = os.environ.get("DDTUI_REMOTE_TOKEN", "").strip()
+REMOTE_TOKEN_FILE = Path(
+    os.environ.get(
+        "DDTUI_REMOTE_TOKEN_FILE",
+        str(Path.home() / ".ddtui" / "remote_token"),
+    )
+)
+REMOTE_AUTO_CONNECT = _env_flag("DDTUI_REMOTE_AUTO", default=False)
+REMOTE_USE_TLS = _env_flag("DDTUI_REMOTE_TLS", default=False)
+REMOTE_PORT = _env_int("DDTUI_REMOTE_PORT", default=10000)
+REMOTE_SNAPSHOT_MAX_MESSAGES = _env_int(
+    "DDTUI_REMOTE_SNAPSHOT_MAX_MESSAGES", default=200
+)
+REMOTE_ALLOW_TERMINAL_SEND = _env_flag(
+    "DDTUI_REMOTE_ALLOW_TERMINAL_SEND", default=False
+)
 
 
 # ───────── status-bar gradient ─────────
