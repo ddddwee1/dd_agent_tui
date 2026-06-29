@@ -121,7 +121,7 @@ class AppInputMixin:
                 await self._mount_widget(Static(Text(
                     f"❌ provider 切换失败：{e}\n"
                     f"当前仍使用 {self.provider_name} · {self.model}。",
-                    style="bold red",
+                    style="bold #f92672",
                 )))
                 return
             old = self.provider_name
@@ -138,7 +138,7 @@ class AppInputMixin:
             await self._mount_widget(Static(Text(
                 f"⚙ provider: {old} → {self.provider_name}; "
                 f"model={self.model}, effort={self.effort}{limit_note}",
-                style="bold cyan",
+                style="bold #66d9ef",
             )))
             return
         if text == "/model" or text.startswith("/model "):
@@ -161,7 +161,7 @@ class AppInputMixin:
                     limit_note = f"；ctx={limit:,}"
                 await self._mount_widget(Static(Text(
                     f"⚙ model: {old} → {self.model}（下一轮请求生效{limit_note}）",
-                    style="bold cyan",
+                    style="bold #66d9ef",
                 )))
             return
         if text == "/effort" or text.startswith("/effort "):
@@ -179,7 +179,7 @@ class AppInputMixin:
                 self._update_subtitle()
                 await self._mount_widget(Static(Text(
                     f"⚙ effort: {old} → {self.effort}（下一轮请求生效）",
-                    style="bold cyan",
+                    style="bold #66d9ef",
                 )))
             return
         if text == "/rewind":

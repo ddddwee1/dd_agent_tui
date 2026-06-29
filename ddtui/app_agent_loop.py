@@ -41,7 +41,7 @@ class AppAgentLoopMixin:
         return "\n\n".join(events)
 
     async def _mount_task_event_notice(self, text: str) -> None:
-        await self._mount_widget(Static(Text(text, style="bold #94e2d5")))
+        await self._mount_widget(Static(Text(text, style="bold #66d9ef")))
 
     async def _drain_task_events_to_messages(self) -> None:
         text = self._pop_task_event_text()

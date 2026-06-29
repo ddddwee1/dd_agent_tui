@@ -80,7 +80,7 @@ def _format_exception_for_ui(exc: BaseException) -> tuple[str, str]:
 def _exception_block(title: str, exc: BaseException) -> Collapsible:
     summary, detail = _format_exception_for_ui(exc)
     return Collapsible(
-        Static(Text(detail, style="red"), markup=False),
+        Static(Text(detail, style="#f92672"), markup=False),
         title=f"❌ {title} · {summary}",
         collapsed=False,
     )

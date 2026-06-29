@@ -51,8 +51,8 @@ class AgentApp(
     App,
 ):
     CSS = """
-    Screen { layout: vertical; background: #300A24; }
-    Header { height: 1; }
+    Screen { layout: vertical; background: #272822; color: #f8f8f2; }
+    Header { height: 1; background: #3e3d32; color: #f8f8f2; }
     #body { height: 1fr; layout: horizontal; }
     #main { width: 1fr; layout: vertical; }
     #sidebar {
@@ -60,19 +60,19 @@ class AgentApp(
         min-width: 30;
         max-width: 60;
         layout: vertical;
-        border-left: solid #cba6f7;
+        border-left: solid #ae81ff;
         padding: 0 1;
-        background: #300A24;
+        background: #272822;
         display: none;
     }
     #sidebar.visible { display: block; }
-    #conversation { height: 1fr; padding: 0 1; background: #300A24; }
+    #conversation { height: 1fr; padding: 0 1; background: #272822; }
     /* TabbedContent host: take all remaining vertical space inside
        #main, and let each TabPane occupy its full area without an
        inner padding (the panes themselves set their own padding). */
     #tabs { height: 1fr; }
     #tabs TabPane { padding: 0; }
-    #hint { height: 1; padding: 0 1; color: $text-muted; background: #300A24; }
+    #hint { height: 1; padding: 0 1; color: #a59f85; background: #272822; }
     /* Pending tray: parks queued/steer bubbles above the input box
        until the turn consumes them. height: auto + max-height keeps
        it invisible when empty. */
@@ -80,7 +80,7 @@ class AgentApp(
         height: auto;
         max-height: 8;
         padding: 0 1;
-        background: #4a2a52;
+        background: #2d2e27;
         overflow-y: auto;
     }
     """

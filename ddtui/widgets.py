@@ -41,13 +41,13 @@ class UserBubble(Static):
     UserBubble {
         margin: 1 0 0 0;
         padding: 0 1;
-        border-left: thick #89b4fa;
+        border-left: thick #66d9ef;
     }
     UserBubble.pending {
-        border-left: thick #74c7ec;
+        border-left: thick #ae81ff;
     }
     UserBubble.pending:hover {
-        background: #45324d;
+        background: #3e3d32;
     }
     """
 
@@ -67,7 +67,7 @@ class UserBubble(Static):
     @staticmethod
     def _render_label(text: str) -> Text:
         t = Text()
-        t.append("you  ", style="bold blue")
+        t.append("you  ", style="bold #66d9ef")
         t.append(text)
         return t
 
@@ -97,10 +97,10 @@ class SteerBubble(Static):
     SteerBubble {
         margin: 1 0 0 0;
         padding: 0 1;
-        border-left: thick #f9e2af;
+        border-left: thick #e6db74;
     }
     SteerBubble.pending:hover {
-        background: #45324d;
+        background: #3e3d32;
     }
     """
 
@@ -116,7 +116,7 @@ class SteerBubble(Static):
     @staticmethod
     def _render_label(text: str) -> Text:
         t = Text()
-        t.append("⚡ steer  ", style="bold #f9e2af")
+        t.append("⚡ steer  ", style="bold #e6db74")
         t.append(text)
         return t
 
@@ -162,11 +162,11 @@ class EditPendingScreen(ModalScreen[dict | None]):
         max-width: 100;
         height: auto;
         padding: 1 2;
-        background: #1e1e2e;
-        border: thick #74c7ec;
+        background: #2d2e27;
+        border: thick #66d9ef;
     }
     #edit-dialog.steer {
-        border: thick #f9e2af;
+        border: thick #e6db74;
     }
     #edit-title {
         height: auto;
@@ -198,9 +198,9 @@ class EditPendingScreen(ModalScreen[dict | None]):
         with Vertical(id="edit-dialog", classes=dialog_classes):
             title = Text()
             if self._kind == "steer":
-                title.append("⚡ 编辑 steer", style="bold #f9e2af")
+                title.append("⚡ 编辑 steer", style="bold #e6db74")
             else:
-                title.append("📋 编辑排队消息", style="bold #74c7ec")
+                title.append("📋 编辑排队消息", style="bold #66d9ef")
             convert_hint = "转排队" if self._kind == "steer" else "转 steer"
             title.append(
                 f"   ·   Ctrl+S 保存   Ctrl+D 删除   Ctrl+T {convert_hint}   Esc 取消",
@@ -277,8 +277,8 @@ class ResumeConversationScreen(ModalScreen[str | None]):
         height: 80%;
         max-height: 32;
         padding: 1 2;
-        background: #1e1e2e;
-        border: thick #94e2d5;
+        background: #2d2e27;
+        border: thick #66d9ef;
     }
     #resume-title {
         height: auto;
@@ -310,7 +310,7 @@ class ResumeConversationScreen(ModalScreen[str | None]):
     def compose(self):
         with Vertical(id="resume-dialog"):
             title = Text()
-            title.append("恢复会话", style="bold #94e2d5")
+            title.append("恢复会话", style="bold #66d9ef")
             title.append("   ·   Enter 选择   Esc 取消", style="dim")
             yield Static(title, id="resume-title")
             if not self._entries:
@@ -392,12 +392,12 @@ class CollapsedHistoryMarker(Static):
     CollapsedHistoryMarker {
         margin: 1 0;
         padding: 0 1;
-        color: #cdd6f4;
-        background: #2a1a32;
+        color: #a59f85;
+        background: #2d2e27;
         text-align: center;
     }
     CollapsedHistoryMarker:hover {
-        background: #45324d;
+        background: #3e3d32;
     }
     """
 
@@ -411,7 +411,7 @@ class CollapsedHistoryMarker(Static):
     def _render_label(self) -> Text:
         t = Text()
         t.append("── ", style="dim")
-        t.append(f"已折叠 {self._count} 条历史", style="bold #cdd6f4")
+        t.append(f"已折叠 {self._count} 条历史", style="bold #a59f85")
         t.append("  ·  点击展开 ──", style="dim")
         return t
 
@@ -429,7 +429,7 @@ class AssistantMessage(Static):
     AssistantMessage {
         margin: 0 0 1 0;
         padding: 0 1;
-        border-left: thick #a6e3a1;
+        border-left: thick #a6e22e;
     }
     """
 
@@ -452,9 +452,9 @@ class AssistantMessage(Static):
         # headings and have them render as such (instead of raw `| col |`
         # text).
         if not self._buffer:
-            return Text("assistant  ", style="bold green")
+            return Text("assistant  ", style="bold #a6e22e")
         return Group(
-            Text("assistant", style="bold green"),
+            Text("assistant", style="bold #a6e22e"),
             Markdown(self._buffer),
         )
 
@@ -468,9 +468,24 @@ class ThinkingBlock(Collapsible):
     """
 
     DEFAULT_CSS = """
-    ThinkingBlock { margin: 0 0 1 0; }
+    ThinkingBlock {
+        margin: 0 0 1 0;
+        background: #272822;
+        border-left: thick #75715e;
+        padding-bottom: 0;
+        padding-left: 0;
+    }
+    ThinkingBlock > CollapsibleTitle { color: #a59f85; }
+    ThinkingBlock > CollapsibleTitle:hover {
+        background: #3e3d32;
+        color: #cfc8b8;
+    }
+    ThinkingBlock > CollapsibleTitle:focus {
+        background: #49483e;
+        color: #f8f8f2;
+    }
     ThinkingBlock > Contents { padding: 0 0 0 2; }
-    ThinkingBlock #thinking-body { color: #585b70; }
+    ThinkingBlock #thinking-body { color: #b9b39f; }
     """
 
     def __init__(self) -> None:
@@ -500,9 +515,24 @@ class ToolCallBlock(Collapsible):
     """
 
     DEFAULT_CSS = """
-    ToolCallBlock { margin: 0 0 1 0; }
+    ToolCallBlock {
+        margin: 0 0 1 0;
+        background: #272822;
+        border-left: thick #fd971f;
+        padding-bottom: 0;
+        padding-left: 0;
+    }
+    ToolCallBlock > CollapsibleTitle { color: #a86612; }
+    ToolCallBlock > CollapsibleTitle:hover {
+        background: #3e3d32;
+        color: #ffb454;
+    }
+    ToolCallBlock > CollapsibleTitle:focus {
+        background: #49483e;
+        color: #ffd28a;
+    }
     ToolCallBlock > Contents { padding: 0 0 0 2; }
-    ToolCallBlock #toolcall-body { color: $text-muted; }
+    ToolCallBlock #toolcall-body { color: #b9b39f; }
     """
 
     def __init__(self, name: str, args: dict) -> None:
@@ -571,7 +601,22 @@ class DiffBlock(Collapsible):
     """
 
     DEFAULT_CSS = """
-    DiffBlock { margin: 0 0 1 0; }
+    DiffBlock {
+        margin: 0 0 1 0;
+        background: #272822;
+        border-left: thick #ae81ff;
+        padding-bottom: 0;
+        padding-left: 0;
+    }
+    DiffBlock > CollapsibleTitle { color: #ae81ff; }
+    DiffBlock > CollapsibleTitle:hover {
+        background: #3e3d32;
+        color: #c7a6ff;
+    }
+    DiffBlock > CollapsibleTitle:focus {
+        background: #49483e;
+        color: #f8f8f2;
+    }
     DiffBlock > Contents { padding: 0 0 0 2; }
     """
 
@@ -594,21 +639,19 @@ class DiffBlock(Collapsible):
 
     @staticmethod
     def _render_diff(diff_text: str) -> Text:
-        """Color a unified diff: + lines bright-white-fg on dark-green-bg,
-        - lines bright-white-fg on dark-red-bg. The dark backgrounds
-        (#0d3b18 / #3d0a0a) keep the bar low-key on Ubuntu's purple, while
-        bright_white keeps the text crisp against them."""
+        """Color a unified diff using Monokai-ish accents without turning
+        the whole block into a bright card."""
         t = Text()
         for line in diff_text.splitlines(keepends=True):
             head = line.rstrip("\n")
             if head.startswith("+++") or head.startswith("---"):
                 t.append(line, style="bold")
             elif head.startswith("@@"):
-                t.append(line, style="bold cyan")
+                t.append(line, style="bold #66d9ef")
             elif head.startswith("+"):
-                t.append(line, style="bright_white on #0d3b18")
+                t.append(line, style="bold #f8f8f2 on #314f2f")
             elif head.startswith("-"):
-                t.append(line, style="bright_white on #3d0a0a")
+                t.append(line, style="bold #f8f8f2 on #5a2130")
             else:
                 t.append(line)
         return t
@@ -618,7 +661,22 @@ class ExploreSummaryBlock(Collapsible):
     """Rendered summary of a completed exploration span."""
 
     DEFAULT_CSS = """
-    ExploreSummaryBlock { margin: 0 0 1 0; }
+    ExploreSummaryBlock {
+        margin: 0 0 1 0;
+        background: #272822;
+        border-left: thick #ae81ff;
+        padding-bottom: 0;
+        padding-left: 0;
+    }
+    ExploreSummaryBlock > CollapsibleTitle { color: #ae81ff; }
+    ExploreSummaryBlock > CollapsibleTitle:hover {
+        background: #3e3d32;
+        color: #c7a6ff;
+    }
+    ExploreSummaryBlock > CollapsibleTitle:focus {
+        background: #49483e;
+        color: #f8f8f2;
+    }
     ExploreSummaryBlock > Contents { padding: 0 0 0 2; }
     """
 
@@ -643,7 +701,7 @@ class CheckpointBlock(Static):
     CheckpointBlock {
         margin: 1 0;
         padding: 0 1;
-        border: round #94e2d5;
+        border: round #66d9ef;
     }
     """
 
@@ -667,7 +725,7 @@ class CheckpointBlock(Static):
     ) -> None:
         if not items:
             return
-        t.append(f"\n{label}", style="bold #94e2d5")
+        t.append(f"\n{label}", style="bold #66d9ef")
         extra = max(0, len(items) - limit)
         for item in items[:limit]:
             t.append("\n  - ", style="dim")
@@ -678,7 +736,7 @@ class CheckpointBlock(Static):
     def _build(self) -> Text:
         cp = self._checkpoint or {}
         t = Text()
-        t.append("Checkpoint", style="bold #94e2d5")
+        t.append("Checkpoint", style="bold #66d9ef")
         if not cp:
             t.append("\n  (empty)", style="dim italic")
             return t
@@ -719,9 +777,9 @@ class TodoBlock(Static):
     TodoBlock {
         margin: 1 0;
         padding: 0 1;
-        border: round #cba6f7;
+        border: round #ae81ff;
     }
-    TodoBlock.all-done { border: round #f9e2af; }
+    TodoBlock.all-done { border: round #e6db74; }
     """
 
     def __init__(self) -> None:
@@ -739,7 +797,7 @@ class TodoBlock(Static):
         n_pend = n - n_done - n_prog
 
         t = Text()
-        t.append("TODO  ", style="bold #cba6f7")
+        t.append("TODO  ", style="bold #ae81ff")
         t.append(
             f"({n_prog} 进行中 · {n_done} 完成 · {n_pend} 待办)",
             style="dim",
@@ -753,14 +811,14 @@ class TodoBlock(Static):
             t.append("\n")
             if status == "completed":
                 t.append("  [", style="dim")
-                t.append("✓", style="bold green")
+                t.append("✓", style="bold #a6e22e")
                 t.append("] ", style="dim")
                 t.append(content, style="strike dim")
             elif status == "in_progress":
                 t.append("  [", style="bold")
-                t.append("▶", style="bold cyan")
+                t.append("▶", style="bold #66d9ef")
                 t.append("] ", style="bold")
-                t.append(content, style="bold cyan")
+                t.append(content, style="bold #66d9ef")
             else:  # pending
                 t.append("  [ ] ", style="dim")
                 t.append(content, style="dim")
@@ -780,7 +838,7 @@ class SubagentsBlock(Static):
     SubagentsBlock {
         margin: 1 0;
         padding: 0 1;
-        border: round #f5c2e7;
+        border: round #f92672;
     }
     """
 
@@ -789,18 +847,18 @@ class SubagentsBlock(Static):
     # answering), burning wallclock on a tool, has an answer waiting
     # for await_agent (ready), or is between rounds (idle).
     _PHASE_GLYPH = {
-        "thinking":  ("◐", "bold #cba6f7"),  # mauve
-        "answering": ("▶", "bold cyan"),
-        "tool":      ("⚙", "bold #fab387"),  # peach
-        "ready":     ("▣", "bold #a6e3a1"),  # green — answer waiting
-        "idle":      ("○", "bold #6c7086"),  # surface2 gray
-        "done":      ("✓", "bold green"),
-        "error":     ("✗", "bold red"),
+        "thinking":  ("◐", "bold #ae81ff"),
+        "answering": ("▶", "bold #66d9ef"),
+        "tool":      ("⚙", "bold #fd971f"),
+        "ready":     ("▣", "bold #a6e22e"),
+        "idle":      ("○", "bold #75715e"),
+        "done":      ("✓", "bold #a6e22e"),
+        "error":     ("✗", "bold #f92672"),
     }
 
     def render_sessions(self, sessions: list[SubagentSession]) -> None:
         t = Text()
-        t.append("Subagents  ", style="bold #f5c2e7")
+        t.append("Subagents  ", style="bold #f92672")
         n_busy = sum(
             1 for s in sessions
             if s.phase in ("thinking", "answering", "tool")
@@ -810,7 +868,7 @@ class SubagentsBlock(Static):
         t.append(f"({n_busy} 跑 · {n_ready} 待领 · {n_idle} 闲)", style="dim")
         if not sessions:
             t.append("\n  (empty)", style="dim italic")
-            self.update(t)
+            self._update_live_text(t)
             return
         now = time.monotonic()
         for s in sessions:
@@ -826,7 +884,7 @@ class SubagentsBlock(Static):
                 elapsed = now - s.started_at
                 t.append(f"  {elapsed:5.1f}s", style="dim")
             if s.last_tool and s.phase != "idle":
-                t.append(f"  · {s.last_tool}", style="#fab387")
+                t.append(f"  · {s.last_tool}", style="#fd971f")
             if s.tokens_in or s.tokens_out:
                 t.append(
                     f"\n    [{s.tokens_in:,}↓ / {s.tokens_out:,}↑]",
@@ -838,15 +896,21 @@ class SubagentsBlock(Static):
             if s.context_limit and s.last_prompt_tokens:
                 pct = s.last_prompt_tokens * 100.0 / s.context_limit
                 if pct >= 85:
-                    ctx_style = "bold red"
+                    ctx_style = "bold #f92672"
                 elif pct >= 70:
-                    ctx_style = "bold #f9e2af"
+                    ctx_style = "bold #e6db74"
                 else:
                     ctx_style = "dim"
                 t.append(f"  ctx {pct:.0f}%", style=ctx_style)
             if s.prompt_preview:
                 t.append(f'\n    "{s.prompt_preview}"', style="dim italic")
-        self.update(t)
+        self._update_live_text(t)
+
+    def _update_live_text(self, text: Text) -> None:
+        line_count = text.plain.count("\n") + 1
+        layout = line_count != getattr(self, "_last_line_count", None)
+        self._last_line_count = line_count
+        self.update(text, layout=layout)
 
 
 class TerminalTabPane(VerticalScroll):
@@ -869,12 +933,12 @@ class TerminalTabPane(VerticalScroll):
         rc = self.sess.proc.poll()
         if rc is None and not self.sess.closed:
             status = "running"
-            style = "bold #89b4fa"
+            style = "bold #66d9ef"
         else:
             status = f"exited {rc}"
-            style = "bold #a6e3a1" if rc == 0 else "bold #f38ba8"
+            style = "bold #a6e22e" if rc == 0 else "bold #f92672"
         header = Text()
-        header.append(f"{self.sess.id}  ", style="bold #89b4fa")
+        header.append(f"{self.sess.id}  ", style="bold #66d9ef")
         header.append(self.sess.name, style="bold")
         header.append(f"  {status}", style=style)
         header.append(f"\ncmd: {self.sess.command}", style="dim")
@@ -1043,7 +1107,7 @@ class SubagentTabPane(VerticalScroll):
         self._pending_mounts.clear()
 
     def mount_exception_notice(self, text: str) -> None:
-        block = Static(Text(text, style="bold red"), markup=False)
+        block = Static(Text(text, style="bold #f92672"), markup=False)
         if self.is_mounted:
             self.mount(block)
             self.scroll_end(animate=False)
@@ -1135,36 +1199,42 @@ class BgJobsBlock(Static):
     BgJobsBlock {
         margin: 1 0;
         padding: 0 1;
-        border: round #94e2d5;
+        border: round #66d9ef;
     }
     """
 
     def render_jobs(self, jobs: list[BgJob]) -> None:
         t = Text()
-        t.append("Background  ", style="bold #94e2d5")
+        t.append("Background  ", style="bold #66d9ef")
         n_run = sum(1 for j in jobs if j.proc.poll() is None)
         n_done = len(jobs) - n_run
         t.append(f"({n_run} 跑 · {n_done} 完)", style="dim")
         if not jobs:
             t.append("\n  (empty)", style="dim italic")
-            self.update(t)
+            self._update_live_text(t)
             return
         for j in jobs:
             status, rc, elapsed = bg_job_status(j)
             cmd = j.command if len(j.command) <= 26 else j.command[:23] + "…"
             t.append("\n  ")
             if status == "running":
-                t.append("▶ ", style="bold cyan")
-                t.append(f"{j.id}", style="bold cyan")
+                t.append("▶ ", style="bold #66d9ef")
+                t.append(f"{j.id}", style="bold #66d9ef")
             elif rc == 0:
-                t.append("✓ ", style="bold green")
-                t.append(f"{j.id}", style="green")
+                t.append("✓ ", style="bold #a6e22e")
+                t.append(f"{j.id}", style="#a6e22e")
             else:
-                t.append("✗ ", style="bold red")
-                t.append(f"{j.id}", style="red")
+                t.append("✗ ", style="bold #f92672")
+                t.append(f"{j.id}", style="#f92672")
             t.append(f"  {elapsed:5.1f}s ", style="dim")
             t.append(cmd)
-        self.update(t)
+        self._update_live_text(t)
+
+    def _update_live_text(self, text: Text) -> None:
+        line_count = text.plain.count("\n") + 1
+        layout = line_count != getattr(self, "_last_line_count", None)
+        self._last_line_count = line_count
+        self.update(text, layout=layout)
 
 
 class TasksBlock(Static):
@@ -1174,7 +1244,7 @@ class TasksBlock(Static):
     TasksBlock {
         margin: 1 0;
         padding: 0 1;
-        border: round #89b4fa;
+        border: round #ae81ff;
     }
     """
 
@@ -1187,26 +1257,32 @@ class TasksBlock(Static):
 
     def render_tasks(self, tasks: list[AsyncTask]) -> None:
         t = Text()
-        t.append("Tasks  ", style="bold #89b4fa")
+        t.append("Tasks  ", style="bold #ae81ff")
         t.append(f"({len(tasks)} 跑)", style="dim")
         if not tasks:
             t.append("\n  (empty)", style="dim italic")
-            self.update(t)
+            self._update_live_text(t)
             return
         for task in tasks:
             status, rc, elapsed = async_task_status(task)
             label = self._clip(task.name or task.command, 30)
             output = self._clip(str(task.output_path), 34)
             t.append("\n  ")
-            t.append("▶ ", style="bold cyan")
-            t.append(f"{task.id}", style="bold cyan")
+            t.append("▶ ", style="bold #66d9ef")
+            t.append(f"{task.id}", style="bold #66d9ef")
             t.append(f"  {elapsed:5.1f}s ", style="dim")
             t.append(label)
             if rc is not None:
                 t.append(f" rc={rc}", style="dim")
             t.append("\n     out: ", style="dim")
             t.append(output, style="dim")
-        self.update(t)
+        self._update_live_text(t)
+
+    def _update_live_text(self, text: Text) -> None:
+        line_count = text.plain.count("\n") + 1
+        layout = line_count != getattr(self, "_last_line_count", None)
+        self._last_line_count = line_count
+        self.update(text, layout=layout)
 
 
 # ───────── input ─────────
@@ -1226,8 +1302,8 @@ class SlashPopup(Static):
     SlashPopup {
         height: auto;
         padding: 0 1;
-        border: round #94e2d5;
-        background: #300A24;
+        border: round #66d9ef;
+        background: #272822;
         display: none;
     }
     """
@@ -1255,28 +1331,33 @@ class SlashPopup(Static):
     def update_for_text(self, text: str) -> None:
         """Show/hide and filter based on current input text."""
         if not text.startswith("/") or any(c.isspace() for c in text):
-            self.display = False
+            self._hide()
             return
         matches = [
             (cmd, desc) for cmd, desc in self.COMMANDS
             if cmd.split(" ", 1)[0].startswith(text)
         ]
         if not matches:
-            self.display = False
+            self._hide()
             return
         # Align descriptions on a single column so the list reads as a
         # table rather than a ragged left edge.
         width = max(len(cmd) for cmd, _ in matches)
         t = Text()
-        t.append("Slash 命令", style="bold #94e2d5")
+        t.append("Slash 命令", style="bold #66d9ef")
         t.append("  (继续输入过滤 · Enter 发送)", style="dim")
         for cmd, desc in matches:
             t.append("\n  ")
-            t.append(cmd.ljust(width), style="bold cyan")
+            t.append(cmd.ljust(width), style="bold #66d9ef")
             t.append("  ")
             t.append(desc, style="dim")
         self.update(t)
-        self.display = True
+        if not self.display:
+            self.display = True
+
+    def _hide(self) -> None:
+        if self.display:
+            self.display = False
 
 
 class MultilineInput(TextArea):
@@ -1378,7 +1459,9 @@ class MultilineInput(TextArea):
         except Exception:
             visible = self.document.line_count
         rows = max(self._MIN_ROWS, min(self._MAX_ROWS, visible + 2))
-        self.styles.height = rows
+        if getattr(self, "_fit_height_rows", None) != rows:
+            self.styles.height = rows
+            self._fit_height_rows = rows
 
     def on_resize(self, _event) -> None:
         # When the terminal (or surrounding layout) resizes, the soft-
@@ -1402,11 +1485,13 @@ class MultilineInput(TextArea):
             self._last_paste_at = now
         self._last_change_at = now
 
-    def _on_paste(self, event) -> None:
+    def on_paste(self, event) -> None:
         # Bracketed-paste path: terminal hands us the whole paste as
         # one event, no Enter keys ever fire — but stamp the timestamp
         # anyway so any trailing newline that might leak through is
-        # also caught by action_do_submit.
+        # also caught by action_do_submit. Textual will still dispatch
+        # TextArea's own paste handler later in the MRO; don't call
+        # super() here, or the paste text is inserted twice.
         self._last_paste_at = time.monotonic()
 
 
@@ -1439,6 +1524,16 @@ def _ctx_bg_color(ratio: float) -> str:
     else:
         rgb = _interp_rgb(AMBER, RED, (ratio - 0.5) / 0.5)
     return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+
+def _token_k(value: int) -> str:
+    """Compact token counts for the one-line status bar."""
+    k = max(0, value) / 1000
+    if k < 1:
+        return f"{k:.2f}k"
+    if k < 10:
+        return f"{k:.1f}k"
+    return f"{k:.0f}k"
 
 
 def _short_cwd(cwd: str) -> str:
@@ -1514,6 +1609,7 @@ class StatusBar(Static):
         super().__init__(*args, **kwargs)
         self._work_dir = work_dir
         self._frame = 0
+        self._last_bg_color: str | None = None
         # Cached at construction; refreshed by refresh_location() after
         # each turn so an agent-initiated `git checkout` shows up.
         self._cwd_short = _short_cwd(work_dir)
@@ -1549,15 +1645,16 @@ class StatusBar(Static):
         last_total = counter.last_prompt + counter.last_completion
         limit = context_limit if context_limit and context_limit > 0 else None
         ratio = (last_total / limit) if (counter.turns > 0 and limit) else 0.0
-        self.styles.background = _ctx_bg_color(ratio)
+        bg_color = _ctx_bg_color(ratio)
+        if bg_color != self._last_bg_color:
+            self.styles.background = bg_color
+            self._last_bg_color = bg_color
 
         if counter.turns == 0:
             body = f"{location} · 等待第一轮…"
         else:
-            total = counter.prompt_total + counter.completion_total
-            thinking = (
-                f" / Think {counter.reasoning_total:,}" if counter.reasoning_total else ""
-            )
+            out_total = counter.completion_total + counter.reasoning_total
+            total = counter.prompt_total + out_total
             # "Context" = prompt + completion of the most recent API call —
             # i.e. context-window usage, not cumulative billing. The
             # `(NN%)` suffix anchors the visual gradient to a number so
@@ -1569,8 +1666,8 @@ class StatusBar(Static):
                 context_text = f"Context {last_total:,}"
             body = (
                 f"{location} · {context_text} "
-                f"· 累计 {total:,} "
-                f"(in {counter.prompt_total:,} / out {counter.completion_total:,}{thinking}) "
+                f"· 累计 {_token_k(total)} "
+                f"(in {_token_k(counter.prompt_total)} / out {_token_k(out_total)}) "
                 f"· {counter.turns} 轮"
             )
 
@@ -1582,9 +1679,9 @@ class StatusBar(Static):
         if busy:
             t = Text()
             for ch in self.BAR_FRAMES[self._frame]:
-                t.append(ch, style="bold cyan" if ch == "▰" else "dim")
+                t.append(ch, style="bold #66d9ef" if ch == "▰" else "dim")
             t.append("  ")
             t.append(body)
-            self.update(t)
+            self.update(t, layout=False)
         else:
-            self.update(body)
+            self.update(body, layout=False)

@@ -197,7 +197,7 @@ class AppHistoryMixin:
             hint = f"发现未完成会话（断在 {phase} 阶段）。"
         await self._mount_widget(Static(Text(
             f"🔌 检测到上次可能异常断线。{hint}",
-            style="bold #f9e2af",
+            style="bold #e6db74",
         )))
 
     def _history_entries(self) -> list[dict]:
@@ -365,7 +365,7 @@ class AppHistoryMixin:
                 return
 
             await self._mount_widget(
-                Static(Text("📦 正在压缩历史…", style="bold cyan"))
+                Static(Text("📦 正在压缩历史…", style="bold #66d9ef"))
             )
 
             try:
@@ -381,7 +381,7 @@ class AppHistoryMixin:
                 await self._mount_widget(
                     Static(Text(
                         f"❌ 压缩失败：{e}\n请稍后再试 /compact。",
-                        style="bold red",
+                        style="bold #f92672",
                     ))
                 )
                 return
@@ -393,7 +393,7 @@ class AppHistoryMixin:
                     f"📦 已压缩：{stats['before_n']} → {stats['after_n']} 条消息，"
                     f"约 -{stats['saved']:,} 字符（保留最近 "
                     f"{COMPACT_KEEP_RECENT_TURNS} 轮原文）",
-                    style="bold cyan",
+                    style="bold #66d9ef",
                 ))
             )
         finally:
@@ -407,7 +407,7 @@ class AppHistoryMixin:
         target, error = self._history_path_for_name(raw_name)
         if error is not None or target is None:
             await self._mount_widget(Static(Text(
-                f"错误：{error}", style="bold red"
+                f"错误：{error}", style="bold #f92672"
             )))
             return
         try:
@@ -415,7 +415,7 @@ class AppHistoryMixin:
             size = self._write_conversation_snapshot(target)
         except Exception as e:
             await self._mount_widget(Static(Text(
-                f"❌ 保存失败:{e}", style="bold red"
+                f"❌ 保存失败:{e}", style="bold #f92672"
             )))
             return
 
@@ -427,7 +427,7 @@ class AppHistoryMixin:
         await self._mount_widget(Static(Text(
             f"💾 已保存 {len(self.messages)} 条消息（{size:,} 字节）"
             f"到 {display}{note}",
-            style="bold green",
+            style="bold #a6e22e",
         )))
 
     async def _list_history(self) -> None:
@@ -443,7 +443,7 @@ class AppHistoryMixin:
             entries = self._history_entries()
         except Exception as e:
             await self._mount_widget(Static(Text(
-                f"列出 {HISTORY_DIR} 失败：{e}", style="bold red"
+                f"列出 {HISTORY_DIR} 失败：{e}", style="bold #f92672"
             )))
             return
         if not entries:
@@ -454,7 +454,7 @@ class AppHistoryMixin:
         t = Text()
         t.append(f"📂 {HISTORY_DIR}（{len(entries)} 个对话）\n", style="bold")
         for entry in entries:
-            t.append(f"  {entry['name']}", style="bold green")
+            t.append(f"  {entry['name']}", style="bold #a6e22e")
             t.append(
                 f"  ({entry['size_label']}, 最后编辑 {entry['edited_at_label']})\n",
                 style="dim",
@@ -480,20 +480,20 @@ class AppHistoryMixin:
         target, error = self._history_path_for_name(raw_name)
         if error is not None or target is None:
             await self._mount_widget(Static(Text(
-                f"错误：{error}", style="bold red"
+                f"错误：{error}", style="bold #f92672"
             )))
             return
         if not target.exists():
             await self._mount_widget(Static(Text(
                 f"错误：找不到 {target}\n用 /list-history 看可用列表。",
-                style="bold red",
+                style="bold #f92672",
             )))
             return
         try:
             payload = json.loads(target.read_text(encoding="utf-8"))
         except Exception as e:
             await self._mount_widget(Static(Text(
-                f"❌ 读取失败：{e}", style="bold red"
+                f"❌ 读取失败：{e}", style="bold #f92672"
             )))
             return
         msgs = payload.get("messages")
@@ -502,7 +502,7 @@ class AppHistoryMixin:
         ):
             await self._mount_widget(Static(Text(
                 "❌ 文件格式不识别（缺少合法 messages 数组）",
-                style="bold red",
+                style="bold #f92672",
             )))
             return
         session_id = str(payload.get("session_id") or "") or new_session_id()
@@ -573,7 +573,7 @@ class AppHistoryMixin:
                 pass
         if recovery_notice:
             await self._mount_widget(Static(Text(
-                f"🔌 {recovery_notice}", style="bold #f9e2af"
+                f"🔌 {recovery_notice}", style="bold #e6db74"
             )))
         if recovered_modified:
             await self._autosave_conversation()
@@ -592,7 +592,7 @@ class AppHistoryMixin:
         await self._mount_widget(Static(Text(
             f"📂 已加载 {len(msgs)} 条消息（saved={saved_at}）{diff_note}\n"
             "Token 计数已重置；从此处续聊即可。",
-            style="bold green",
+            style="bold #a6e22e",
         )))
 
     async def _replay_messages_to_view(self) -> None:
