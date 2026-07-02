@@ -6,8 +6,11 @@ The large tool implementation set is split by domain:
   `tools_checkpoint`, `tools_notes`, `tools_tasks`, `tools_terminal`,
   `tools_todo` contain the concrete Python implementations.
 
-`execute_tool` remains the single public dispatch entry point used by
-`AgentApp` and subagents.
+`execute_tool` is the dispatch entry point for the stateless tool set
+(everything in `TOOL_FUNCS`). A handful of meta-tools that need the live
+LLM client / app state — the subagent tools, exploration-span tools, and
+`compact_self` (see `APP_DISPATCHED_TOOLS`) — are handled by `AgentApp`
+before dispatch and are intentionally absent from `TOOL_FUNCS`.
 """
 
 from __future__ import annotations
@@ -121,15 +124,32 @@ _PARAM_ALIASES: dict[str, str] = {
     "folder": "path",
 }
 
+# Only tools that actually take a `path` parameter should have the path
+# aliases applied. Applying them globally used to rewrite e.g. bash's
+# `directory` into `path`, turning a recoverable typo into a hard
+# TypeError. Derive the set from the schemas so it stays in sync.
+_PATH_PARAM_TOOLS: frozenset[str] = frozenset(
+    t["function"]["name"]
+    for t in TOOLS
+    if "path" in t.get("function", {}).get("parameters", {}).get("properties", {})
+)
 
-def _normalize_args(args: dict) -> dict:
+
+def _normalize_args(name: str, args: dict) -> dict:
     """Canonicalise common parameter-name variations in-place.
+
+    Path aliases are only applied to tools whose schema declares a
+    `path` parameter, so synonyms passed to unrelated tools are left
+    untouched rather than being rewritten into an argument that tool
+    does not accept.
 
     - If the canonical key is missing but an alias is present, the alias
       value is moved to the canonical key.
     - If both the canonical key and an alias are present, the alias is
       simply dropped (canonical wins).
     """
+    if name not in _PATH_PARAM_TOOLS:
+        return args
     for alias, canonical in _PARAM_ALIASES.items():
         if alias in args:
             if canonical not in args:
@@ -139,12 +159,42 @@ def _normalize_args(args: dict) -> dict:
     return args
 
 
+# Tools that are NOT dispatched here: they need the live LLM client and
+# AgentApp state, so AgentApp intercepts them before execute_tool is
+# reached (see app_agent_loop). Listed so a stray call that does reach
+# execute_tool gets a precise message instead of a generic "Unknown tool".
+APP_DISPATCHED_TOOLS: frozenset[str] = frozenset({
+    "spawn_agent",
+    "chat_agent",
+    "await_agent",
+    "end_agent",
+    "compact_self",
+    "explore_start",
+    "explore_end",
+    "explore_cancel",
+})
+
+
 def execute_tool(ctx: ToolContext, name: str, args: dict) -> str:
+    """Dispatch a tool call to its implementation in TOOL_FUNCS.
+
+    This is the dispatch entry point for the stateless tool set. The
+    subagent meta-tools, exploration-span tools, and compact_self
+    (see APP_DISPATCHED_TOOLS) need the live LLM client / app state and
+    are handled by AgentApp before they reach here, so they are not in
+    TOOL_FUNCS by design.
+    """
     fn = TOOL_FUNCS.get(name)
     if not fn:
+        if name in APP_DISPATCHED_TOOLS:
+            return (
+                f"Error: {name} is handled by the app layer, not execute_tool. "
+                "This indicates a dispatch bug — it should have been "
+                "intercepted before reaching generic tool dispatch."
+            )
         return f"Unknown tool: {name}"
     try:
-        return fn(ctx, **_normalize_args(args))
+        return fn(ctx, **_normalize_args(name, args))
     except TypeError as e:
         return f"Bad arguments for {name}: {e}"
     except Exception as e:

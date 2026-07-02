@@ -436,15 +436,14 @@ export DDTUI_ALLOW_UNSANDBOXED_BASH=1
 
 ### bash 危险命令拦截
 
-`bash`、`bash_start` 和 `task_start` 会拒绝一些明显危险模式，例如：
+ddtui 假设运行在可信的本地环境，**不**试图用黑名单去防御恶意 agent（黑名单也做不到）。
+`bash`、`bash_start`、`task_start`、`terminal_start` 只拦截极少数灾难性、不可逆、几乎不会
+是有意为之的命令，避免模型幻觉出的一条命令把机器抹掉或重新格式化。日常工具（curl、wget、
+sudo 等）不再拦截。当前只拒绝：
 
-- `sudo`
-- `curl`
-- `wget`
-- `chmod 777`
-- `mkfs`
-- `dd if=`
-- `rm -rf /`
+- `rm -rf /`（整盘清空）
+- `mkfs`（重新格式化文件系统）
+- `dd ... of=/dev/*`（直接写裸设备）
 
 ### 默认忽略缓存/构建目录
 

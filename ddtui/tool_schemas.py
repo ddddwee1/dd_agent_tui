@@ -13,7 +13,9 @@ TOOLS = [
                 "The command runs in the project working directory by default. "
                 "Output is truncated at 10 000 chars by default (override "
                 "with max_output_chars). "
-                "Dangerous patterns (sudo, curl, wget, chmod 777, mkfs, dd, rm -rf /) are blocked."
+                "Runs in a trusted local environment: only a few catastrophic "
+                "footguns (rm -rf /, mkfs, dd of=/dev/*) are refused; ordinary "
+                "tools like curl/wget/sudo are allowed."
             ),
             "parameters": {
                 "type": "object",
@@ -53,7 +55,7 @@ TOOLS = [
                 "or agent-visible done signals. For long-running validation, "
                 "build, test, download, training, profiling, or any operation "
                 "whose completion matters, prefer task_start. stdout+stderr "
-                "are merged into a log file. Same dangerous-pattern blacklist "
+                "are merged into a log file. Same footgun guard "
                 "as bash."
             ),
             "parameters": {
@@ -99,7 +101,7 @@ TOOLS = [
                 "the current output changes your next action. Use task_wait "
                 "normally for notify_on_complete=false tasks. "
                 "Use task_start for long-running work whose completion matters. "
-                "Same dangerous-pattern blacklist as bash."
+                "Same footgun guard as bash."
             ),
             "parameters": {
                 "type": "object",
@@ -157,8 +159,8 @@ TOOLS = [
                 "terminal_start such as ssh/tmux and then terminal_send "
                 "commands into it instead of repeatedly running ssh commands. "
                 "Do not use this for non-interactive long jobs whose completion "
-                "matters; use task_start for those. Same dangerous-pattern "
-                "blacklist as bash."
+                "matters; use task_start for those. Same footgun guard "
+                "as bash."
             ),
             "parameters": {
                 "type": "object",
@@ -323,7 +325,7 @@ TOOLS = [
                     },
                     "tail_lines": {
                         "type": "integer",
-                        "description": "How many trailing output lines to return. Default 80.",
+                        "description": "How many trailing output lines to return. Default 50.",
                     },
                     "max_output_chars": {
                         "type": "integer",
@@ -400,7 +402,7 @@ TOOLS = [
                     },
                     "tail_lines": {
                         "type": "integer",
-                        "description": "Trailing output lines to return. Default 80.",
+                        "description": "Trailing output lines to return. Default 50.",
                     },
                     "max_output_chars": {
                         "type": "integer",

@@ -112,12 +112,12 @@ TERMINAL_TAIL_CHARS = 80_000
 TASK_OUTPUT_DIR = Path("/tmp")
 TASK_MAX_CONCURRENT = 5
 TASK_RETENTION_SECONDS = 3600
-TASK_DEFAULT_TAIL_LINES = 80
+TASK_DEFAULT_TAIL_LINES = 50   # unified with BG_DEFAULT_TAIL_LINES
 TASK_DEFAULT_WAIT_TIMEOUT = 60
 TASK_MAX_WAIT_TIMEOUT = 600
 TASK_READ_DEFAULT_CHARS = 12_000
 TASK_READ_MAX_CHARS = 100_000
-TASK_EVENT_TAIL_LINES = 40
+TASK_EVENT_TAIL_LINES = 50
 TASK_EVENT_MAX_CHARS = 12_000
 
 # Project-local notes. By default each repo gets <repo>/.ddtui/notes,
@@ -229,18 +229,18 @@ COLLAPSED_HISTORY_KEEP = 40
 
 # ───────── safety ─────────
 
-# Dangerous shell patterns (blacklist). Matching commands are blocked
-# in tool_bash / tool_bash_start. This is defense-in-depth; the tool
-# layer also keeps shell workdirs inside the project by default.
+# Footgun guard (NOT a security boundary). ddtui assumes a trusted local
+# environment, so we deliberately do NOT try to sandbox a malicious agent
+# here — a blacklist can't do that anyway (it's trivially bypassable) and
+# blocking everyday tools like curl/wget/sudo just gets in the way. We keep
+# only a tiny set of catastrophic, irreversible, almost-never-intentional
+# commands so a hallucinated tool call can't wipe or reformat the machine.
+# Matching commands are refused in tool_bash / tool_bash_start /
+# tool_task_start / tool_terminal_start.
 DANGEROUS_SHELL_PATTERNS = [
-    r"\bsudo\b",
-    r"\bcurl\b",
-    r"\bwget\b",
-    r"\bchmod\s+777\b",
-    r"\bmkfs\b",
-    r"\bdd\s+if=",
-    r"\b>:/\w",
-    r"\brm\s+-rf\s+/",
+    r"\brm\s+-rf\s+/",   # whole-filesystem wipe (rm -rf /, rm -rf /*)
+    r"\bmkfs\b",          # reformatting a filesystem
+    r"\bdd\b[^\n]*\bof=/dev/",  # dd writing straight to a block device
 ]
 
 # Tool sandbox. File-writing tools may edit arbitrary paths by default
