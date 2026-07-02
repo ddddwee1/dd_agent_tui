@@ -59,7 +59,8 @@ class AppHistoryMixin:
             "model": self.model,
             "checkpoint": self.ctx.checkpoint,
             "active_explore": self._explore_payload(),
-            "messages": self.messages,
+            # list(): HistoryStore is deliberately not JSON-serializable.
+            "messages": list(self.messages),
         }
 
     def _turn_journal_path(self) -> Path:

@@ -25,6 +25,7 @@ from .app_remote import AppRemoteMixin
 from .app_subagents import AppSubagentMixin
 from .app_support import build_env_block, load_agents_md
 from .app_ui import AppUiMixin
+from .history_store import HistoryStore
 from .config import (
     CONFIRM_WRITES,
     DEFAULT_PROVIDER,
@@ -156,7 +157,10 @@ class AgentApp(
         # The framework prompt plus a startup snapshot of the
         # environment (OS, cwd, git state, date, provider/model) so the
         # model doesn't have to probe for basics or hallucinate them.
-        self.messages: list = [
+        # The store's identity never changes for the app's lifetime —
+        # see the `messages` property below.
+        self._history = HistoryStore()
+        self.messages = [
             {
                 "role": "system",
                 "content": SYSTEM_PROMPT
@@ -259,6 +263,21 @@ class AgentApp(
         self._esc_armed = False
         self._esc_disarm_timer = None
         self._init_remote_state()
+
+    # ─ conversation history ─
+
+    @property
+    def messages(self) -> HistoryStore:
+        return self._history
+
+    @messages.setter
+    def messages(self, value) -> None:
+        # Rebinding is the historical footgun: a running TurnEngine
+        # holds the object captured at construction, so a fresh list
+        # here would strand its subsequent appends (see HistoryStore's
+        # module docstring). Assignment therefore MEANS in-place
+        # replacement — the store's identity never changes.
+        self._history.replace_all(value)
 
     # ─ compose ─
 
