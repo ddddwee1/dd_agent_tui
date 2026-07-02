@@ -365,14 +365,11 @@ class SubagentSession:
 
 
 class TokenCounter:
-    """Cumulative + last-call token usage. AgentApp holds one and
-    feeds every API response's `usage` into `add()`. StatusBar reads
-    the counters to render context-usage gradient + breakdown."""
+    """Last-call token usage. AgentApp holds one and feeds every API
+    response's `usage` into `add()`. StatusBar reads the latest call to
+    render the context-usage gradient."""
 
     def __init__(self) -> None:
-        self.prompt_total = 0
-        self.completion_total = 0
-        self.reasoning_total = 0
         self.last_prompt = 0
         self.last_completion = 0
         self.last_reasoning = 0
@@ -387,7 +384,4 @@ class TokenCounter:
         self.last_reasoning = (
             (getattr(details, "reasoning_tokens", 0) or 0) if details else 0
         )
-        self.prompt_total += self.last_prompt
-        self.completion_total += self.last_completion
-        self.reasoning_total += self.last_reasoning
         self.turns += 1

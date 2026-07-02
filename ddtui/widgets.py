@@ -1527,16 +1527,6 @@ def _ctx_bg_color(ratio: float) -> str:
     return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
 
 
-def _token_k(value: int) -> str:
-    """Compact token counts for the one-line status bar."""
-    k = max(0, value) / 1000
-    if k < 1:
-        return f"{k:.2f}k"
-    if k < 10:
-        return f"{k:.1f}k"
-    return f"{k:.0f}k"
-
-
 def _short_cwd(cwd: str) -> str:
     """Compress $HOME to ~ for status-bar display."""
     home = str(Path.home())
@@ -1641,8 +1631,8 @@ class StatusBar(Static):
     ) -> None:
         location = self._location()
         # Drive the background gradient off last-call tokens (what
-        # matters is whether the *next* call still fits), not cumulative
-        # billing. Pre-first-turn we sit at the green baseline.
+        # matters is whether the *next* call still fits). Pre-first-turn
+        # we sit at the green baseline.
         last_total = counter.last_prompt + counter.last_completion
         limit = context_limit if context_limit and context_limit > 0 else None
         ratio = (last_total / limit) if (counter.turns > 0 and limit) else 0.0
@@ -1654,23 +1644,16 @@ class StatusBar(Static):
         if counter.turns == 0:
             body = f"{location} · 等待第一轮…"
         else:
-            out_total = counter.completion_total + counter.reasoning_total
-            total = counter.prompt_total + out_total
             # "Context" = prompt + completion of the most recent API call —
-            # i.e. context-window usage, not cumulative billing. The
-            # `(NN%)` suffix anchors the visual gradient to a number so
-            # the user can tell at a glance how alarming the color is.
+            # i.e. context-window usage. The `(NN%)` suffix anchors the
+            # visual gradient to a number so the user can tell at a
+            # glance how alarming the color is.
             pct = ratio * 100
             if limit:
                 context_text = f"Context {last_total:,}/{limit:,} ({pct:.0f}%)"
             else:
                 context_text = f"Context {last_total:,}"
-            body = (
-                f"{location} · {context_text} "
-                f"· 累计 {_token_k(total)} "
-                f"(in {_token_k(counter.prompt_total)} / out {_token_k(out_total)}) "
-                f"· {counter.turns} 轮"
-            )
+            body = f"{location} · {context_text} · {counter.turns} 轮"
 
         if queued:
             body += f" · 📋 排队 {queued}"

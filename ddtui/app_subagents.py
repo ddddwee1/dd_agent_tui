@@ -114,9 +114,9 @@ class AppSubagentMixin:
                             pass
                     return f"❌ subagent stream failed: {e}"
 
-                # Roll subagent usage into parent counter so the status
-                # bar reflects combined spend; also accumulate per-
-                # session counts for the sidebar widget.
+                # Record subagent usage in the parent counter so the
+                # status bar reflects the latest context pressure; also
+                # accumulate per-session counts for the sidebar widget.
                 self.counter.add(final_usage)
                 if final_usage is not None:
                     sess.tokens_in += getattr(final_usage, "prompt_tokens", 0) or 0

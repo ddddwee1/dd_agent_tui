@@ -326,6 +326,41 @@ export DDTUI_REMOTE_ALLOW_TERMINAL_SEND=1
 
 安全建议：relay 前面最好放 HTTPS/WSS（Caddy/Nginx 均可），token 使用长随机串；不需要远控时用 `/remote off` 断开。
 
+## 给其他大模型接入
+
+`ddtui-mcp` 是一个 MCP stdio bridge，让 Claude、Codex、其他支持 MCP 的 agent 或本地脚本通过现有 VPS relay 观察和控制活跃 ddtui session。它不直接运行新的 agent，也不绕过 ddtui 的会话状态机；所有写入都会走和远控网页一样的 `submit` / `steer` / `interrupt` 路径。
+
+先安装远控依赖：
+
+```bash
+pip install -e '.[remote]'
+```
+
+然后启动 MCP server。`--relay` 指向 relay 的 control socket，token 和本地 `/remote on` 使用同一个：
+
+```bash
+ddtui-mcp \
+  --relay ws://<vps-host>:10000/ws/control \
+  --token-file ~/.ddtui/remote_token
+```
+
+如果已经设置了 `DDTUI_REMOTE_URL`，或者 `~/vps_addr.txt` 可以推导出 relay 地址，也可以省略 `--relay`：
+
+```bash
+ddtui-mcp --token-file ~/.ddtui/remote_token
+```
+
+暴露给外部模型的 MCP tools：
+
+- `ddtui_list_sessions`：列出当前在线 session。
+- `ddtui_observe`：读取 session 状态、transcript tail 和最近 relay 事件。
+- `ddtui_submit`：发送普通下一轮输入；如果本地 session 正忙，会进入 ddtui 的 queued input。
+- `ddtui_steer`：发送忙碌中的实时插话。
+- `ddtui_interrupt`：请求中断当前回合。
+- `ddtui_terminal_read`：只读 persistent terminal 输出。
+
+MVP 默认不开放 `terminal_send`。它等价于让外部模型往交互 shell 里打字，后续会单独做 capability token 和审计日志后再考虑打开。
+
 ## 工具能力
 
 模型可以调用这些工具：

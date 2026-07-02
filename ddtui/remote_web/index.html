@@ -186,10 +186,10 @@
     .msg.assistant { border-color: #3f6f46; }
     .msg.tool { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     .msg.reasoning { color: var(--muted); border-style: dashed; }
-    details.msg.reasoning {
+    details.msg.foldable {
       padding: 0;
     }
-    details.msg.reasoning summary {
+    details.msg.foldable summary {
       cursor: pointer;
       display: flex;
       align-items: center;
@@ -198,27 +198,27 @@
       list-style: none;
       user-select: none;
     }
-    details.msg.reasoning summary::-webkit-details-marker {
+    details.msg.foldable summary::-webkit-details-marker {
       display: none;
     }
-    details.msg.reasoning summary::before {
+    details.msg.foldable summary::before {
       content: ">";
       color: var(--cyan);
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
-    details.msg.reasoning[open] summary::before {
+    details.msg.foldable[open] summary::before {
       content: "v";
     }
-    details.msg.reasoning[open] summary {
+    details.msg.foldable[open] summary {
       border-bottom: 1px dashed var(--line);
     }
-    details.msg.reasoning summary .role {
+    details.msg.foldable summary .role {
       margin-bottom: 0;
     }
-    details.msg.reasoning .msg-text {
+    details.msg.foldable .msg-text {
       padding: 10px 12px;
     }
-    .reasoning-count {
+    .fold-count {
       color: var(--muted);
     }
     .role {
@@ -872,10 +872,12 @@
         appendMessageBlock("reasoning", message.reasoning_content, "reasoning");
       }
       let content = message.content || "";
-      if (message.tool_calls) {
-        content += `\n\n${JSON.stringify(message.tool_calls, null, 2)}`;
+      if (content || !message.tool_calls) {
+        appendMessageBlock(role, content, role);
       }
-      appendMessageBlock(role, content, role);
+      if (message.tool_calls) {
+        appendMessageBlock("tool", JSON.stringify(message.tool_calls, null, 2), "tool");
+      }
     }
 
     function appendMessageBlock(role, content, className = role) {
@@ -885,8 +887,8 @@
     }
 
     function createMessageBlock(role, content = "", className = role) {
-      if (role === "reasoning") {
-        return createReasoningBlock(content || "", className);
+      if (role === "reasoning" || role === "tool") {
+        return createFoldableBlock(role, content || "", className);
       }
       const root = document.createElement("div");
       root.className = `msg ${className}`;
@@ -900,22 +902,22 @@
       return { root, text: textEl };
     }
 
-    function createReasoningBlock(content = "", className = "reasoning") {
+    function createFoldableBlock(role, content = "", className = role) {
       const root = document.createElement("details");
-      root.className = `msg ${className}`;
+      root.className = `msg ${className} foldable`;
       root.open = !isMobileComposer();
       const summary = document.createElement("summary");
       const label = document.createElement("span");
       label.className = "role";
-      label.textContent = "reasoning";
+      label.textContent = role;
       const count = document.createElement("span");
-      count.className = "reasoning-count";
+      count.className = "fold-count";
       summary.append(label, count);
       const textEl = document.createElement("div");
       textEl.className = "msg-text";
-      renderMessageText(textEl, content, "reasoning");
+      renderMessageText(textEl, content, role);
       root.append(summary, textEl);
-      updateReasoningCount(count, content);
+      updateFoldCount(count, content);
       return { root, text: textEl, count };
     }
 
@@ -929,7 +931,7 @@
       }
     }
 
-    function updateReasoningCount(target, content) {
+    function updateFoldCount(target, content) {
       if (!target) return;
       target.textContent = `${formatCount(charCount(content || ""))} chars`;
     }
@@ -1094,7 +1096,7 @@
           }
         }
         streamingNodes.reasoningText.append(document.createTextNode(text));
-        updateReasoningCount(streamingNodes.reasoningCount, streaming.reasoning_content);
+        updateFoldCount(streamingNodes.reasoningCount, streaming.reasoning_content);
       } else {
         if (!streamingNodes.contentText) {
           const block = createMessageBlock("assistant", "", "assistant");
