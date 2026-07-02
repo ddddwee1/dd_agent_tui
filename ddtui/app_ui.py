@@ -10,6 +10,10 @@ from textual.widgets import Static, TabbedContent, TabPane
 
 from .config import (
     COLLAPSED_HISTORY_KEEP,
+    CONFIG_FILE,
+    CONFIG_FILE_ERROR,
+    CONFIG_FILE_KEY_COUNT,
+    CONFIG_FILE_UNUSED_KEYS,
     MAX_VISIBLE_HISTORY,
     SUBAGENT_IDLE_TIMEOUT_SEC,
     SUBAGENT_REAP_INTERVAL_SEC,
@@ -49,6 +53,8 @@ class AppUiMixin:
         self.call_later(self._show_disconnect_recovery_notice)
         if self._startup_provider_error:
             self.call_later(self._show_startup_provider_error)
+        if CONFIG_FILE_ERROR or CONFIG_FILE_KEY_COUNT:
+            self.call_later(self._show_config_file_notice)
         # Watch the conversation's scroll position: scrolling up
         # disables auto-follow; scrolling back to the bottom re-enables
         # it. The watcher fires on every scroll_y change, including
@@ -126,6 +132,25 @@ class AppUiMixin:
             f"⚠ {self._startup_provider_error}",
             style="bold yellow",
         )))
+
+    async def _show_config_file_notice(self) -> None:
+        if CONFIG_FILE_ERROR:
+            await self._mount_widget(Static(Text(
+                f"⚠ 配置文件 {CONFIG_FILE} 解析失败：{CONFIG_FILE_ERROR}"
+                "（本次忽略，仅使用环境变量与内置默认）",
+                style="bold yellow",
+            )))
+            return
+        await self._mount_widget(Static(Text(
+            f"⚙ 已加载配置文件 {CONFIG_FILE}（{CONFIG_FILE_KEY_COUNT} 项）",
+            style="dim",
+        )))
+        if CONFIG_FILE_UNUSED_KEYS:
+            await self._mount_widget(Static(Text(
+                "⚠ 配置文件中有未识别的键（检查拼写或是否已废弃）："
+                + ", ".join(CONFIG_FILE_UNUSED_KEYS),
+                style="bold yellow",
+            )))
 
     def _tick_progress_bar(self) -> None:
         if not self._busy:

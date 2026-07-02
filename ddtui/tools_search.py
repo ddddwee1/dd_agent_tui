@@ -21,6 +21,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .config import NO_RIPGREP
 from .state import ToolContext
 from .tool_utils import (
     DEFAULT_IGNORED_DIRS,
@@ -37,9 +38,7 @@ GLOB_MAX_RESULTS = 1000
 _RG_TIMEOUT = 15
 
 _RG_PATH: str | None = shutil.which("rg")
-if os.environ.get("DDTUI_NO_RIPGREP", "").strip().lower() in (
-    "1", "true", "yes", "on",
-):
+if NO_RIPGREP:
     _RG_PATH = None
 
 

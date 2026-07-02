@@ -10,58 +10,113 @@ tool calls.
 from __future__ import annotations
 
 import os
+import tomllib
 from pathlib import Path
 
 
-def _env_flag(name: str, *, default: bool = False) -> bool:
+# ───────── config file ─────────
+
+# Persistent tunables live in ~/.ddtui/config.toml. Top-level keys are
+# the environment variable names verbatim (e.g. DDTUI_AUTO_COMPACT_THRESHOLD
+# = 0.05), so the env docs double as the file docs. Precedence:
+# environment > config.toml > built-in default. The file path itself can
+# only come from the environment — it decides where to look.
+CONFIG_FILE = Path(
+    os.environ.get(
+        "DDTUI_CONFIG_FILE", str(Path.home() / ".ddtui" / "config.toml")
+    )
+)
+
+
+def _load_config_file(path: Path) -> tuple[dict, str]:
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        return {}, ""
+    except Exception as e:
+        # A malformed file must never kill startup; the app surfaces
+        # CONFIG_FILE_ERROR as a visible warning instead.
+        return {}, f"{type(e).__name__}: {e}"
+    if not isinstance(data, dict):
+        return {}, "top-level structure is not a table"
+    return {str(k): v for k, v in data.items()}, ""
+
+
+_FILE_CONFIG, CONFIG_FILE_ERROR = _load_config_file(CONFIG_FILE)
+_USED_FILE_KEYS: set[str] = set()
+
+
+def _raw_setting(name: str):
+    """Environment wins; then config.toml; else None.
+
+    File keys are marked as consumed even when the env overrides them,
+    so CONFIG_FILE_UNUSED_KEYS ends up holding only typos/stale keys.
+    """
+    if name in _FILE_CONFIG:
+        _USED_FILE_KEYS.add(name)
     raw = os.environ.get(name)
-    if raw is None:
+    if raw is not None:
+        return raw
+    return _FILE_CONFIG.get(name)
+
+
+def _setting_str(name: str, default: str) -> str:
+    value = _raw_setting(name)
+    return default if value is None else str(value)
+
+
+def _setting_flag(name: str, *, default: bool = False) -> bool:
+    value = _raw_setting(name)
+    if value is None:
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _env_int(name: str, *, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
+def _setting_int(name: str, *, default: int) -> int:
+    value = _raw_setting(name)
+    if value is None or isinstance(value, bool):
         return default
     try:
-        return int(raw.strip())
+        return int(str(value).strip())
     except ValueError:
         return default
 
 
 # ───────── API / model providers ─────────
 
-API_KEY_PATH = os.environ.get(
+API_KEY_PATH = _setting_str(
     "DEEPSEEK_API_KEY_FILE", str(Path.home() / "deepseek_apikey.txt")
 )
 BASE_URL = "https://api.deepseek.com"
-MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
-REASONING_EFFORT = os.environ.get("DEEPSEEK_REASONING_EFFORT", "max")
+MODEL = _setting_str("DEEPSEEK_MODEL", "deepseek-v4-pro")
+REASONING_EFFORT = _setting_str("DEEPSEEK_REASONING_EFFORT", "max")
 
-DEFAULT_PROVIDER = os.environ.get("DDTUI_PROVIDER", "deepseek").strip().lower()
+DEFAULT_PROVIDER = _setting_str("DDTUI_PROVIDER", "deepseek").strip().lower()
 
 DEEPSEEK_API_KEY_PATH = Path(API_KEY_PATH)
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", BASE_URL)
+DEEPSEEK_BASE_URL = _setting_str("DEEPSEEK_BASE_URL", BASE_URL)
 DEEPSEEK_MODEL = MODEL
 DEEPSEEK_REASONING_EFFORT = REASONING_EFFORT
 
-CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+CODEX_HOME = Path(_setting_str("CODEX_HOME", str(Path.home() / ".codex")))
 CODEX_AUTH_PATH = Path(
-    os.environ.get("CODEX_AUTH_FILE", str(CODEX_HOME / "auth.json"))
+    _setting_str("CODEX_AUTH_FILE", str(CODEX_HOME / "auth.json"))
 )
 CODEX_MODELS_CACHE_PATH = Path(
-    os.environ.get("CODEX_MODELS_CACHE_FILE", str(CODEX_HOME / "models_cache.json"))
+    _setting_str("CODEX_MODELS_CACHE_FILE", str(CODEX_HOME / "models_cache.json"))
 )
-CODEX_BASE_URL = os.environ.get(
+CODEX_BASE_URL = _setting_str(
     "CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex"
 ).rstrip("/")
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5")
-CODEX_REASONING_EFFORT = os.environ.get("CODEX_REASONING_EFFORT", "xhigh")
-CODEX_REFRESH_TOKEN_URL = os.environ.get(
+CODEX_MODEL = _setting_str("CODEX_MODEL", "gpt-5.5")
+CODEX_REASONING_EFFORT = _setting_str("CODEX_REASONING_EFFORT", "xhigh")
+CODEX_REFRESH_TOKEN_URL = _setting_str(
     "CODEX_REFRESH_TOKEN_URL", "https://auth.openai.com/oauth/token"
 )
-CODEX_OAUTH_CLIENT_ID = os.environ.get(
+CODEX_OAUTH_CLIENT_ID = _setting_str(
     "CODEX_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann"
 )
 
@@ -82,6 +137,9 @@ READ_FILE_MAX_LINE_CHARS = 2000
 READ_FILE_MAX_TOTAL_CHARS = 64_000
 AGENTS_MD_FILENAME = "AGENTS.md"
 AGENTS_MD_MAX_CHARS = 16_000      # cap project guidelines so prompt stays sane
+# Force the pure-Python search/glob fallback even when a ripgrep binary
+# is on PATH (mainly for debugging parity between the two paths).
+NO_RIPGREP = _setting_flag("DDTUI_NO_RIPGREP", default=False)
 WEB_FETCH_TIMEOUT = 20
 WEB_FETCH_MAX_BYTES = 2_000_000   # cap raw download (~2 MB)
 WEB_FETCH_MAX_CHARS = 10_000      # cap returned text (matches bash output cap)
@@ -89,7 +147,7 @@ WEB_FETCH_HARD_CHAR_CAP = 50_000  # absolute upper bound when caller overrides
 
 # Web search (Brave). Key file is one line, ASCII; missing → web_search
 # returns a clear error rather than crashing.
-WEB_SEARCH_API_KEY_PATH = os.environ.get(
+WEB_SEARCH_API_KEY_PATH = _setting_str(
     "BRAVE_API_KEY_FILE", str(Path.home() / "brave_apikey.txt")
 )
 WEB_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -103,7 +161,7 @@ WEB_SEARCH_SNIPPET_MAX_CHARS = 240  # truncate per-result description
 # can be sensitive — and created with 0o700 (see tool_utils.ensure_private_dir).
 # Override with DDTUI_LOG_DIR.
 LOG_DIR = Path(
-    os.environ.get(
+    _setting_str(
         "DDTUI_LOG_DIR", str(Path.home() / ".ddtui" / "runtime" / "logs")
     )
 )
@@ -134,7 +192,7 @@ TASK_EVENT_MAX_CHARS = 12_000
 # Project-local notes. By default each repo gets <repo>/.ddtui/notes,
 # but users can point DDTUI_PROJECT_NOTES_DIR elsewhere for personal
 # notes that should not live in the checkout.
-PROJECT_NOTES_DIR = os.environ.get("DDTUI_PROJECT_NOTES_DIR", "").strip()
+PROJECT_NOTES_DIR = _setting_str("DDTUI_PROJECT_NOTES_DIR", "").strip()
 PROJECT_NOTE_BODY_MAX_CHARS = 20_000
 PROJECT_NOTE_SEARCH_SNIPPET_CHARS = 600
 PROJECT_NOTE_DEFAULT_SEARCH_LIMIT = 5
@@ -156,24 +214,24 @@ EXPLORE_ARCHIVE_DIR = Path.home() / ".ddtui" / "explorations"
 # Local sessions connect OUT to this relay URL. If unset, /remote on can
 # derive a default from REMOTE_ADDR_FILE, e.g. root@vps.example.com ->
 # ws://vps.example.com:10000/ws/session.
-REMOTE_URL = os.environ.get("DDTUI_REMOTE_URL", "").strip()
+REMOTE_URL = _setting_str("DDTUI_REMOTE_URL", "").strip()
 REMOTE_ADDR_FILE = Path(
-    os.environ.get("DDTUI_REMOTE_ADDR_FILE", str(Path.home() / "vps_addr.txt"))
+    _setting_str("DDTUI_REMOTE_ADDR_FILE", str(Path.home() / "vps_addr.txt"))
 )
-REMOTE_TOKEN = os.environ.get("DDTUI_REMOTE_TOKEN", "").strip()
+REMOTE_TOKEN = _setting_str("DDTUI_REMOTE_TOKEN", "").strip()
 REMOTE_TOKEN_FILE = Path(
-    os.environ.get(
+    _setting_str(
         "DDTUI_REMOTE_TOKEN_FILE",
         str(Path.home() / ".ddtui" / "remote_token"),
     )
 )
-REMOTE_AUTO_CONNECT = _env_flag("DDTUI_REMOTE_AUTO", default=False)
-REMOTE_USE_TLS = _env_flag("DDTUI_REMOTE_TLS", default=False)
-REMOTE_PORT = _env_int("DDTUI_REMOTE_PORT", default=10000)
-REMOTE_SNAPSHOT_MAX_MESSAGES = _env_int(
+REMOTE_AUTO_CONNECT = _setting_flag("DDTUI_REMOTE_AUTO", default=False)
+REMOTE_USE_TLS = _setting_flag("DDTUI_REMOTE_TLS", default=False)
+REMOTE_PORT = _setting_int("DDTUI_REMOTE_PORT", default=10000)
+REMOTE_SNAPSHOT_MAX_MESSAGES = _setting_int(
     "DDTUI_REMOTE_SNAPSHOT_MAX_MESSAGES", default=200
 )
-REMOTE_ALLOW_TERMINAL_SEND = _env_flag(
+REMOTE_ALLOW_TERMINAL_SEND = _setting_flag(
     "DDTUI_REMOTE_ALLOW_TERMINAL_SEND", default=False
 )
 
@@ -195,7 +253,7 @@ DEEPSEEK_CONTEXT_LIMIT = CTX_SAFE_LIMIT
 # /compact. The check runs inside the turn worker (busy still held), so
 # it never races user input. Set DDTUI_AUTO_COMPACT_THRESHOLD=0 to
 # disable, or any fraction in (0, 0.95].
-_raw_auto_compact = os.environ.get("DDTUI_AUTO_COMPACT_THRESHOLD", "").strip()
+_raw_auto_compact = str(_raw_setting("DDTUI_AUTO_COMPACT_THRESHOLD") or "").strip()
 try:
     AUTO_COMPACT_THRESHOLD = (
         min(0.95, max(0.0, float(_raw_auto_compact)))
@@ -285,17 +343,17 @@ DANGEROUS_SHELL_PATTERNS = [
 # Set DDTUI_CONFIRM_WRITES=0 for the fully-automatic trusted-environment
 # behavior. Note: writes triggered from a remote session also wait on
 # the LOCAL dialog.
-CONFIRM_WRITES = _env_flag("DDTUI_CONFIRM_WRITES", default=True)
+CONFIRM_WRITES = _setting_flag("DDTUI_CONFIRM_WRITES", default=True)
 
 # Tool sandbox. File-writing tools may edit arbitrary paths by default
 # so the agent can work across repos. Set
 # DDTUI_ALLOW_UNSANDBOXED_WRITES=0 to restore the old project-only
 # write/edit restriction. Bash workdirs remain under
 # ToolContext.work_dir unless DDTUI_ALLOW_UNSANDBOXED_BASH=1 is set.
-ALLOW_UNSANDBOXED_WRITES = _env_flag(
+ALLOW_UNSANDBOXED_WRITES = _setting_flag(
     "DDTUI_ALLOW_UNSANDBOXED_WRITES", default=True
 )
-ALLOW_UNSANDBOXED_BASH = _env_flag(
+ALLOW_UNSANDBOXED_BASH = _setting_flag(
     "DDTUI_ALLOW_UNSANDBOXED_BASH", default=False
 )
 
@@ -379,3 +437,12 @@ SUBAGENT_SYSTEM_PROMPT = f"""\
 - 对项目特定命令、环境不确定时先 project_note_search；多步骤任务可用 todo_tool 管理进度。
 - 你没有 checkpoint、explore，也不能再派生子 agent。
 """
+
+
+# ───────── config file audit ─────────
+
+# Computed after every _setting_* lookup above has run: whatever is
+# still unconsumed is a typo or a stale key name. The app shows these
+# (plus CONFIG_FILE_ERROR) as a startup notice.
+CONFIG_FILE_KEY_COUNT = len(_FILE_CONFIG)
+CONFIG_FILE_UNUSED_KEYS = tuple(sorted(set(_FILE_CONFIG) - _USED_FILE_KEYS))

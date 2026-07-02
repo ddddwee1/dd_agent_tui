@@ -58,6 +58,20 @@ python agent.py
 
 ## Provider 与配置
 
+### 配置文件
+
+所有下文提到的环境变量都可以持久化到 `~/.ddtui/config.toml`（路径可用 `DDTUI_CONFIG_FILE` 覆盖）。顶层键就是环境变量名本身，优先级为：**环境变量 > config.toml > 内置默认**，所以临时实验仍然可以用 env 前缀覆盖文件里的值：
+
+```toml
+# ~/.ddtui/config.toml
+DDTUI_AUTO_COMPACT_THRESHOLD = 0.85
+DDTUI_CONFIRM_WRITES = false
+DEEPSEEK_MODEL = "deepseek-v4-pro"
+DDTUI_REMOTE_AUTO = true
+```
+
+布尔和数字可以用 TOML 原生类型，也可以沿用 env 风格的字符串（`"1"`/`"on"`/`"off"`）。启动时会在对话区提示已加载的配置项数量；文件解析失败只会显示警告并回落到默认值，不会阻止启动；文件里出现不被识别的键（拼写错误、已废弃）也会点名提示。API key 之类的 secret 建议继续走 key 文件（`DEEPSEEK_API_KEY_FILE` 等），不要写进配置文件。
+
 ### DeepSeek（默认）
 
 默认 provider 是 DeepSeek：
