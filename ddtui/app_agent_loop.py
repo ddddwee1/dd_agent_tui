@@ -1,18 +1,31 @@
-"""Parent agent streaming and tool-loop mixin."""
+"""Parent agent turn driver: TurnEngine host + Textual observer.
+
+The actual LLM tool loop lives in `ddtui.engine.TurnEngine` (shared
+with subagents). This module owns the parent-specific glue:
+
+- `ParentTurnObserver` renders engine events into the main conversation
+  (thinking/answer bubbles, tool blocks, diffs), mirrors them to the
+  remote relay, and persists history (autosave + turn journal).
+- `_parent_meta_handler` serves the app-level meta tools that need live
+  app state: the subagent four, the explore span three, and the
+  compact_self redirect.
+- `_agent_turn` (outer loop) is unchanged: it commits user messages,
+  drains the queued-input tray between turns, and owns busy state,
+  cancellation, and rollback.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 
 from rich.text import Text
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Static
 
 from .app_errors import _exception_block
-from .app_support import _merge_tool_call_delta
 from .config import SUBAGENT_RESULT_MAX_CHARS
-from .tools import TOOLS, execute_tool
+from .engine import ToolOutcome, TurnEngine, TurnObserver
+from .tools import PARENT_TOOL_SCHEMAS
 from .widgets import (
     AssistantMessage,
     DiffBlock,
@@ -24,15 +37,129 @@ from .widgets import (
     UserBubble,
 )
 
-# compact_self is a subagent-only meta-tool: the parent has its own
-# /compact slash command and shouldn't see compact_self in the
-# advertised tool list. Filtered once at import.
-PARENT_TOOLS = [
-    t for t in TOOLS if t["function"]["name"] != "compact_self"
-]
+# Parent-visible schemas come straight from the registry (currently:
+# everything except the subagent-only compact_self).
+PARENT_TOOLS = PARENT_TOOL_SCHEMAS
+
+
+class ParentTurnObserver(TurnObserver):
+    """Bridges TurnEngine events to the main-conversation UI, the
+    remote relay, and history persistence (autosave + turn journal)."""
+
+    # Sidebar-rendered tools: no ToolCallBlock in the conversation flow,
+    # their UI lives in the sidebar (TodoBlock / CheckpointBlock).
+    NO_BLOCK_TOOLS = frozenset({
+        "todo_tool", "checkpoint_tool", "checkpoint_clear",
+    })
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self._thinking: ThinkingBlock | None = None
+        self._answer: AssistantMessage | None = None
+        self._blocks: dict[str, ToolCallBlock] = {}
+
+    def _scroll_view(self) -> VerticalScroll:
+        return self.app.query_one("#conversation", VerticalScroll)
+
+    def _emit(self, event: str, payload: dict) -> None:
+        try:
+            self.app._remote_emit(event, payload)
+        except Exception:
+            pass
+
+    # ── streaming ──
+
+    async def on_reasoning_delta(self, text: str) -> None:
+        if self._thinking is None:
+            self._thinking = ThinkingBlock()
+            await self.app._mount_widget(self._thinking)
+        self._thinking.append_text(text)
+        self._emit("assistant.delta", {"kind": "reasoning", "text": text})
+        if self.app._follow_bottom:
+            self._scroll_view().scroll_end(animate=False)
+
+    async def on_content_delta(self, text: str) -> None:
+        if self._answer is None:
+            self._answer = AssistantMessage()
+            await self.app._mount_widget(self._answer)
+        self._answer.append_text(text)
+        self._emit("assistant.delta", {"kind": "content", "text": text})
+        if self.app._follow_bottom:
+            self._scroll_view().scroll_end(animate=False)
+
+    def on_stream_aborted(self) -> None:
+        # Half-streamed widgets are not yet backed by any message in
+        # history (append happens after the stream finishes) — remove
+        # them so no ghost bubbles linger after ESC×2 / stream errors.
+        for w in (self._thinking, self._answer):
+            if w is not None:
+                try:
+                    w.remove()
+                except Exception:
+                    pass
+        self._thinking = None
+        self._answer = None
+
+    async def on_usage(self, usage) -> None:
+        self.app.counter.add(usage)
+
+    async def on_assistant_message(self, msg: dict) -> None:
+        if self._thinking is not None:
+            self._thinking.finalize(self.app.counter.last_reasoning)
+        self.app._refresh_status()
+        if self.app._follow_bottom:
+            view = self._scroll_view()
+            view.call_after_refresh(view.scroll_end, animate=False)
+        self._emit("message.append", {"message": msg, "source": "assistant"})
+        self._thinking = None
+        self._answer = None
+
+    # ── tools ──
+
+    async def on_tool_started(self, tc_id: str, name: str, args: dict) -> None:
+        self._emit(
+            "tool.started",
+            {"tool_call_id": tc_id, "name": name, "arguments": args},
+        )
+        self.app._write_turn_journal(
+            phase="tool",
+            tool_started=True,
+            active_tool_name=name,
+            active_tool_call_id=tc_id,
+            message_len_current=len(self.app.messages),
+        )
+        if name not in self.NO_BLOCK_TOOLS:
+            block = ToolCallBlock(name, args)
+            await self.app._mount_widget(block)
+            self._blocks[tc_id or name] = block
+
+    async def on_tool_result(
+        self, tc_id: str, name: str, args: dict, outcome: ToolOutcome
+    ) -> None:
+        block = self._blocks.pop(tc_id or name, None)
+        if block is not None:
+            block.set_result(outcome.content, blocked=not outcome.ok)
+        if outcome.diff:
+            await self.app._mount_widget(
+                DiffBlock(args.get("path", "?"), outcome.diff)
+            )
+        if name == "todo_tool":
+            await self.app._update_todo_sidebar(args)
+        elif name in ("checkpoint_tool", "checkpoint_clear") and outcome.ok:
+            await self.app._sync_checkpoint_block()
+
+    async def on_history_appended(self, msg: dict, kind: str) -> None:
+        await self.app._autosave_conversation()
+        if kind == "tool":
+            self.app._write_turn_journal(
+                phase="after_tool",
+                message_len_current=len(self.app.messages),
+            )
 
 
 class AppAgentLoopMixin:
+    # ── async-task completion events ──
+
     def _pop_task_event_text(self) -> str | None:
         if not self._task_events:
             return None
@@ -62,6 +189,8 @@ class AppAgentLoopMixin:
         self._agent_worker = self.run_worker(
             self._agent_turn(text), exclusive=True
         )
+
+    # ── outer loop: one or more user turns ──
 
     async def _agent_turn(self, user_text: str) -> None:
         """Outer loop: drives one or more user turns end-to-end.
@@ -121,14 +250,10 @@ class AppAgentLoopMixin:
         except asyncio.CancelledError:
             # ESC×2 cancellation: keep `self.messages` and the user's
             # bubble so the next submission picks up with full context.
-            # The half-streamed thinking/answer for a stream-time cancel
-            # is already gone (`_stream_one` removed those widgets and
-            # never appended the assistant turn). But a tool-time cancel
-            # leaves `messages` ending in `assistant(tool_calls=[...])`
-            # with some/all tool results missing — the OpenAI/DeepSeek
-            # protocol then rejects the next request. Pair every orphan
-            # tool_call with a stub `tool` result before re-raising so
-            # the history stays protocol-valid.
+            # The engine appends a "⛔ cancelled" stub for a tool that
+            # was cancelled mid-execution; a cancel mid-parallel-batch
+            # or mid-stream can still leave orphan tool_calls, so the
+            # pairing fallback below keeps history protocol-valid.
             self._pair_orphan_tool_calls()
             self._clear_turn_journal()
             raise
@@ -157,354 +282,70 @@ class AppAgentLoopMixin:
             except Exception:
                 pass
 
+    # ── inner loop: TurnEngine host ──
+
+    async def _before_round(self) -> None:
+        """Pre-round hook: deliver managed-task completions and steer
+        interjections at model-call boundaries, then journal."""
+        await self._drain_task_events_to_messages()
+
+        if self._steer:
+            pending_steer = self._steer
+            self._steer = []
+            for s, parked in pending_steer:
+                self.messages.append(
+                    {"role": "user", "content": f"[实时插话] {s}"}
+                )
+                try:
+                    self._remote_emit(
+                        "message.append",
+                        {
+                            "message": {
+                                "role": "user",
+                                "content": f"[实时插话] {s}",
+                            },
+                            "source": "steer",
+                        },
+                    )
+                except Exception:
+                    pass
+                # Move the bubble out of the pending tray and into the
+                # conversation so the user can scroll back through
+                # their interjections later.
+                try:
+                    parked.remove()
+                except Exception:
+                    pass
+                await self._mount_widget(SteerBubble(s))
+            self._refresh_status()
+
+        self._write_turn_journal(
+            phase="streaming",
+            message_len_current=len(self.messages),
+        )
+
     async def _run_one_turn(self) -> bool:
-        """Inner loop: one user→assistant→(tools→assistant)+ turn.
+        """One user→assistant→(tools→assistant)+ turn via TurnEngine.
 
         Returns True if the turn completed normally, False if an API
         error was caught (the error is shown to the UI and the trailing
         user/tool messages are rolled back so the user can retry).
         """
+        engine = TurnEngine(
+            provider=self.provider,
+            ctx=self.ctx,
+            messages=self.messages,
+            tools=PARENT_TOOLS,
+            model=self.model,
+            effort=self.effort,
+            observer=ParentTurnObserver(self),
+            tool_confirm=self.tool_confirm,
+            meta_handler=self._parent_meta_handler,
+            before_round=self._before_round,
+        )
         try:
-            while True:
-                # Managed task completions are delivered at model-call
-                # boundaries, never by fabricating tool results.
-                await self._drain_task_events_to_messages()
-
-                # Drain any steer messages submitted since the last
-                # round. Tagged with [实时插话] so the model can tell
-                # this is a mid-turn interjection from the user (and
-                # reconsider its plan accordingly), not a fresh user
-                # request.
-                if self._steer:
-                    pending_steer = self._steer
-                    self._steer = []
-                    for s, parked in pending_steer:
-                        self.messages.append(
-                            {
-                                "role": "user",
-                                "content": f"[实时插话] {s}",
-                            }
-                        )
-                        try:
-                            self._remote_emit(
-                                "message.append",
-                                {
-                                    "message": {
-                                        "role": "user",
-                                        "content": f"[实时插话] {s}",
-                                    },
-                                    "source": "steer",
-                                },
-                            )
-                        except Exception:
-                            pass
-                        # Move the bubble out of the pending tray and
-                        # into the conversation so the user can scroll
-                        # back through their interjections later.
-                        try:
-                            parked.remove()
-                        except Exception:
-                            pass
-                        await self._mount_widget(SteerBubble(s))
-                    self._refresh_status()
-
-                self._write_turn_journal(
-                    phase="streaming",
-                    message_len_current=len(self.messages),
-                )
-                assistant_msg = await self._stream_one()
-                self.messages.append(assistant_msg)
-                try:
-                    self._remote_emit(
-                        "message.append",
-                        {"message": assistant_msg, "source": "assistant"},
-                    )
-                except Exception:
-                    pass
-                await self._autosave_conversation()
-                tool_calls = assistant_msg.get("tool_calls") or []
-                if not tool_calls:
-                    return True
-                for tc in tool_calls:
-                    name = tc["function"]["name"]
-                    raw = tc["function"].get("arguments") or "{}"
-                    try:
-                        self._remote_emit(
-                            "tool.started",
-                            {
-                                "tool_call_id": tc.get("id"),
-                                "name": name,
-                                "arguments": raw,
-                            },
-                        )
-                    except Exception:
-                        pass
-                    self._write_turn_journal(
-                        phase="tool",
-                        tool_started=True,
-                        active_tool_name=name,
-                        active_tool_call_id=tc.get("id"),
-                        message_len_current=len(self.messages),
-                    )
-                    try:
-                        args = json.loads(raw)
-                    except json.JSONDecodeError:
-                        block = ToolCallBlock(name, {"_raw": raw})
-                        await self._mount_widget(block)
-                        result = f"Error: could not parse arguments JSON: {raw}"
-                        block.set_result(result, blocked=True)
-                    else:
-                        # Special-case todo_tool: maintain a single
-                        # TodoBlock widget in the right-hand sidebar.
-                        # Fade out + unmount when every item is completed.
-                        if name == "todo_tool":
-                            items = (
-                                args.get("items", [])
-                                if isinstance(args, dict)
-                                else []
-                            )
-                            sidebar = self.query_one("#sidebar", Vertical)
-                            self._cancel_dismiss()
-                            if (
-                                self._todo_block is None
-                                or not self._todo_block.is_mounted
-                            ):
-                                self._todo_block = TodoBlock()
-                                await sidebar.mount(self._todo_block)
-                            self._todo_block.set_items(items)
-                            sidebar.add_class("visible")
-                            if items and all(
-                                i.get("status") == "completed" for i in items
-                            ):
-                                self._start_dismiss()
-                            result = await asyncio.to_thread(
-                                execute_tool, self.ctx, name, args
-                            )
-                            self.messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tc["id"],
-                                    "content": result,
-                                }
-                            )
-                            await self._autosave_conversation()
-                            self._write_turn_journal(
-                                phase="after_tool",
-                                message_len_current=len(self.messages),
-                            )
-                            continue
-
-                        if name in ("checkpoint_tool", "checkpoint_clear"):
-                            result = await asyncio.to_thread(
-                                execute_tool, self.ctx, name, args
-                            )
-                            if not result.startswith("Error:"):
-                                await self._sync_checkpoint_block()
-                            self.messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tc["id"],
-                                    "content": result,
-                                }
-                            )
-                            await self._autosave_conversation()
-                            self._write_turn_journal(
-                                phase="after_tool",
-                                message_len_current=len(self.messages),
-                            )
-                            continue
-
-                        if name == "compact_self":
-                            # Defense in depth — PARENT_TOOLS already
-                            # hides this from the parent, but a model
-                            # may recall it from elsewhere. Redirect
-                            # to the user-facing /compact command
-                            # rather than silently failing.
-                            block = ToolCallBlock(name, args)
-                            await self._mount_widget(block)
-                            result = (
-                                "Error: compact_self is a subagent-only "
-                                "tool. The main agent should compress "
-                                "history via the /compact slash command "
-                                "(user-triggered), not as a tool call."
-                            )
-                            block.set_result(result, blocked=True)
-                            self.messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": result,
-                            })
-                            await self._autosave_conversation()
-                            self._write_turn_journal(
-                                phase="after_tool",
-                                message_len_current=len(self.messages),
-                            )
-                            continue
-
-                        if name in (
-                            "explore_start",
-                            "explore_end",
-                            "explore_cancel",
-                        ):
-                            block = ToolCallBlock(name, args)
-                            await self._mount_widget(block)
-                            try:
-                                tool_call_count = len(tool_calls)
-                                if name == "explore_start":
-                                    result = await self._explore_start_tool(
-                                        args, tool_call_count
-                                    )
-                                elif name == "explore_end":
-                                    result = await self._explore_end_tool(
-                                        args, tool_call_count
-                                    )
-                                else:
-                                    result = await self._explore_cancel_tool(
-                                        args, tool_call_count
-                                    )
-                            except asyncio.CancelledError:
-                                result = f"⛔ {name} cancelled (parent ESC×2)"
-                                block.set_result(result, blocked=True)
-                                self.messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tc["id"],
-                                    "content": result,
-                                })
-                                await self._autosave_conversation()
-                                self._write_turn_journal(
-                                    phase="after_tool",
-                                    message_len_current=len(self.messages),
-                                )
-                                raise
-                            except Exception as e:
-                                result = (
-                                    f"Error: {name} failed: "
-                                    f"{type(e).__name__}: {e}"
-                                )
-                            blocked = result.startswith("Error:")
-                            block.set_result(result, blocked=blocked)
-                            self.messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": result,
-                            })
-                            await self._autosave_conversation()
-                            self._write_turn_journal(
-                                phase="after_tool",
-                                message_len_current=len(self.messages),
-                            )
-                            continue
-
-                        if name in (
-                            "spawn_agent", "chat_agent",
-                            "await_agent", "end_agent",
-                        ):
-                            # Subagent meta-tools need LLM client / app
-                            # state, so they bypass the generic tool
-                            # dispatch. spawn_agent and chat_agent are
-                            # fire-and-forget — they schedule a task
-                            # and return immediately. await_agent is
-                            # the only one that blocks; it's cancellable
-                            # via parent ESC×2 and will NOT cancel the
-                            # underlying subagent task on its own
-                            # timeout (use end_agent for that).
-                            block = ToolCallBlock(name, args)
-                            await self._mount_widget(block)
-                            try:
-                                if name == "spawn_agent":
-                                    prompt = args.get("prompt") or ""
-                                    sub_system = args.get("system") or ""
-                                    result = self._spawn_subagent(
-                                        prompt, sub_system
-                                    )
-                                elif name == "chat_agent":
-                                    sid = args.get("session_id") or ""
-                                    prompt = args.get("prompt") or ""
-                                    result = self._chat_subagent(
-                                        sid, prompt
-                                    )
-                                elif name == "await_agent":
-                                    sid = args.get("session_id") or ""
-                                    timeout = args.get("timeout")
-                                    result = await self._await_subagent(
-                                        sid, timeout
-                                    )
-                                else:
-                                    sid = args.get("session_id") or ""
-                                    result = self._end_subagent(sid)
-                            except asyncio.CancelledError:
-                                result = f"⛔ {name} cancelled (parent ESC×2)"
-                                block.set_result(result, blocked=True)
-                                self.messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tc["id"],
-                                    "content": result,
-                                })
-                                await self._autosave_conversation()
-                                self._write_turn_journal(
-                                    phase="after_tool",
-                                    message_len_current=len(self.messages),
-                                )
-                                raise
-                            if len(result) > SUBAGENT_RESULT_MAX_CHARS:
-                                result = (
-                                    result[:SUBAGENT_RESULT_MAX_CHARS]
-                                    + f"\n…[+{len(result) - SUBAGENT_RESULT_MAX_CHARS} chars truncated]"
-                                )
-                            blocked = result.startswith("Error:")
-                            block.set_result(result, blocked=blocked)
-                            self.messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": result,
-                            })
-                            await self._autosave_conversation()
-                            self._write_turn_journal(
-                                phase="after_tool",
-                                message_len_current=len(self.messages),
-                            )
-                            continue
-
-                        block = ToolCallBlock(name, args)
-                        await self._mount_widget(block)
-                        allowed = await self.tool_confirm(name, args)
-                        if allowed:
-                            result = await asyncio.to_thread(
-                                execute_tool, self.ctx, name, args
-                            )
-                            # For edit_*, peel the diff out of the result
-                            # before it goes into message history: the
-                            # diff is shown to the user as a DiffBlock,
-                            # but sending it back to the model wastes
-                            # tokens (the head summary already says
-                            # what changed).
-                            diff_text = None
-                            if name in (
-                                "apply_patch",
-                                "edit_file",
-                                "edit_lines",
-                                "multi_edit",
-                            ):
-                                head, sep, diff = result.partition("\n\n")
-                                if sep and "@@" in diff:
-                                    diff_text = diff
-                                    result = head
-                            block.set_result(result)
-                            if diff_text:
-                                await self._mount_widget(
-                                    DiffBlock(args.get("path", "?"), diff_text)
-                                )
-                        else:
-                            result = "Tool execution blocked by user policy / confirmation dialog."
-                            block.set_result(result, blocked=True)
-                    self.messages.append(
-                        {"role": "tool", "tool_call_id": tc["id"], "content": result}
-                    )
-                    await self._autosave_conversation()
-                    self._write_turn_journal(
-                        phase="after_tool",
-                        message_len_current=len(self.messages),
-                    )
+            await engine.run_turn()
+            return True
         except Exception as e:
             # Roll back the in-flight turn from history AND wipe its
             # widgets from the view, then surface the error in a fresh
@@ -518,90 +359,81 @@ class AppAgentLoopMixin:
             )
             return False
 
-    async def _stream_one(self) -> dict:
-        thinking: ThinkingBlock | None = None
-        answer: AssistantMessage | None = None
-        tool_calls: dict[int, dict] = {}
-        final_usage = None
+    async def _parent_meta_handler(
+        self, tc_id: str, name: str, args: dict, batch_size: int
+    ) -> str | None:
+        """App-level meta tools: subagents, explore spans, compact_self.
 
-        # `_mount_widget` scrolls to the end on mount, but widgets that
-        # grow via `update()` (the streaming case) don't trigger scroll
-        # on their own — so explicitly follow the bottom on every chunk.
-        view = self.query_one("#conversation", VerticalScroll)
+        Returns the result text, or None for anything that should go
+        down the generic dispatch path. Exceptions other than
+        CancelledError are converted to Error strings here so a broken
+        meta tool degrades to a failed call, not a failed turn.
+        """
+        if name == "compact_self":
+            # Defense in depth — PARENT_TOOLS already hides this from
+            # the parent, but a model may recall it from elsewhere.
+            return (
+                "Error: compact_self is a subagent-only tool. The main "
+                "agent should compress history via the /compact slash "
+                "command (user-triggered), not as a tool call."
+            )
 
-        try:
-            async for event in self.provider.stream(
-                self.messages,
-                PARENT_TOOLS,
-                self.model,
-                self.effort,
-            ):
-                if event.usage is not None:
-                    final_usage = event.usage
+        if name in ("explore_start", "explore_end", "explore_cancel"):
+            try:
+                if name == "explore_start":
+                    return await self._explore_start_tool(args, batch_size)
+                if name == "explore_end":
+                    return await self._explore_end_tool(args, batch_size)
+                return await self._explore_cancel_tool(args, batch_size)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                return f"Error: {name} failed: {type(e).__name__}: {e}"
 
-                if event.reasoning:
-                    if thinking is None:
-                        thinking = ThinkingBlock()
-                        await self._mount_widget(thinking)
-                    thinking.append_text(event.reasoning)
-                    try:
-                        self._remote_emit(
-                            "assistant.delta",
-                            {"kind": "reasoning", "text": event.reasoning},
-                        )
-                    except Exception:
-                        pass
-                    if self._follow_bottom:
-                        view.scroll_end(animate=False)
+        if name in ("spawn_agent", "chat_agent", "await_agent", "end_agent"):
+            # spawn_agent and chat_agent are fire-and-forget — they
+            # schedule a task and return immediately. await_agent is the
+            # only one that blocks; it's cancellable via parent ESC×2
+            # and will NOT cancel the underlying subagent on its own
+            # timeout (use end_agent for that).
+            if name == "spawn_agent":
+                result = self._spawn_subagent(
+                    args.get("prompt") or "",
+                    args.get("system") or "",
+                    model=args.get("model"),
+                    effort=args.get("effort"),
+                )
+            elif name == "chat_agent":
+                result = self._chat_subagent(
+                    args.get("session_id") or "", args.get("prompt") or ""
+                )
+            elif name == "await_agent":
+                result = await self._await_subagent(
+                    args.get("session_id") or "", args.get("timeout")
+                )
+            else:
+                result = self._end_subagent(args.get("session_id") or "")
+            if len(result) > SUBAGENT_RESULT_MAX_CHARS:
+                result = (
+                    result[:SUBAGENT_RESULT_MAX_CHARS]
+                    + f"\n…[+{len(result) - SUBAGENT_RESULT_MAX_CHARS} chars truncated]"
+                )
+            return result
 
-                if event.content:
-                    if answer is None:
-                        answer = AssistantMessage()
-                        await self._mount_widget(answer)
-                    answer.append_text(event.content)
-                    try:
-                        self._remote_emit(
-                            "assistant.delta",
-                            {"kind": "content", "text": event.content},
-                        )
-                    except Exception:
-                        pass
-                    if self._follow_bottom:
-                        view.scroll_end(animate=False)
+        return None
 
-                if event.tool_call is not None:
-                    _merge_tool_call_delta(tool_calls, event.tool_call)
-        except BaseException:
-            # ESC×2 cancellation or stream error: drop the half-streamed
-            # ThinkingBlock / AssistantMessage from the view. Neither is
-            # in `self.messages` yet (the append happens after the stream
-            # finishes), so removing the widgets keeps the view in sync —
-            # no ghost bubbles linger. Re-raise so the outer turn handler
-            # still sees the original exception.
-            if thinking is not None:
-                try:
-                    thinking.remove()
-                except Exception:
-                    pass
-            if answer is not None:
-                try:
-                    answer.remove()
-                except Exception:
-                    pass
-            raise
+    # ── sidebar side-effects ──
 
-        self.counter.add(final_usage)
-        if thinking is not None:
-            thinking.finalize(self.counter.last_reasoning)
-        self._refresh_status()
-        # After the last chunk, max_scroll_y may still grow in the next
-        # layout pass — defer a final scroll so we land on the real bottom.
-        if self._follow_bottom:
-            view.call_after_refresh(view.scroll_end, animate=False)
-
-        msg: dict = {"role": "assistant", "content": answer.text if answer else ""}
-        if thinking is not None and thinking.text:
-            msg["reasoning_content"] = thinking.text
-        if tool_calls:
-            msg["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
-        return msg
+    async def _update_todo_sidebar(self, args: dict) -> None:
+        """Mirror a todo_tool call into the sidebar TodoBlock; fade it
+        out once every item is completed."""
+        items = args.get("items", []) if isinstance(args, dict) else []
+        sidebar = self.query_one("#sidebar", Vertical)
+        self._cancel_dismiss()
+        if self._todo_block is None or not self._todo_block.is_mounted:
+            self._todo_block = TodoBlock()
+            await sidebar.mount(self._todo_block)
+        self._todo_block.set_items(items)
+        sidebar.add_class("visible")
+        if items and all(i.get("status") == "completed" for i in items):
+            self._start_dismiss()

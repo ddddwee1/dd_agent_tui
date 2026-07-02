@@ -9,10 +9,15 @@ TOOLS = [
         "function": {
             "name": "bash",
             "description": (
-                "Run a bash command and return stdout/stderr/exit code. "
-                "The command runs in the project working directory by default. "
-                "Output is truncated at 10 000 chars by default (override "
-                "with max_output_chars). "
+                "Run a synchronous bash command and return stdout/stderr/"
+                "exit code. Times out (errors) at 120 s, and blocks "
+                "everything else while it runs — for anything expected to "
+                "take more than ~30 s, or whose completion matters (test "
+                "suites, builds, downloads, training), use task_start "
+                "instead and keep working while it runs. "
+                "The command runs in the project working directory by "
+                "default. Output is truncated at 10 000 chars by default "
+                "(override with max_output_chars). "
                 "Runs in a trusted local environment: only a few catastrophic "
                 "footguns (rm -rf /, mkfs, dd of=/dev/*) are refused; ordinary "
                 "tools like curl/wget/sudo are allowed."
@@ -634,7 +639,13 @@ TOOLS = [
             "name": "read_file",
             "description": (
                 "Read the contents of a text file, with optional offset/limit for pagination. "
-                "Returns up to 2000 lines by default."
+                "Returns up to 2000 lines by default. Each output line is "
+                "prefixed with its 1-indexed line number followed by a tab "
+                "(cat -n style); these numbers match edit_lines and are NOT "
+                "part of the file — never include them in edit_file/"
+                "multi_edit old_string. Very long lines are clipped and very "
+                "large results are capped with a hint for which offset to "
+                "continue from."
             ),
             "parameters": {
                 "type": "object",
@@ -668,10 +679,11 @@ TOOLS = [
             "name": "write_file",
             "description": (
                 "Create a new file or intentionally overwrite a whole file. "
-                "For small or localized changes to an existing file, prefer "
-                "apply_patch, edit_file, edit_lines, or multi_edit so the edit "
-                "is incremental and reviewable. If force=False and the file "
-                "already exists, the operation is refused."
+                "Overwriting an EXISTING file is refused unless you have "
+                "read it with read_file in this session and it has not "
+                "changed on disk since — read first, then overwrite. For "
+                "small or localized changes prefer edit_file or multi_edit "
+                "so the edit is incremental and reviewable."
             ),
             "parameters": {
                 "type": "object",
@@ -687,10 +699,6 @@ TOOLS = [
                         "type": "string",
                         "description": "Full file content to write.",
                     },
-                    "force": {
-                        "type": "boolean",
-                        "description": "Overwrite without confirmation. Default true.",
-                    },
                 },
                 "required": ["path", "content"],
             },
@@ -701,14 +709,15 @@ TOOLS = [
         "function": {
             "name": "edit_file",
             "description": (
-                "Preferred tool for a small change in an existing file. Replace "
-                "ONE occurrence of old_string with new_string and return a diff. "
-                "Read or search the file first, then include enough surrounding "
-                "context in old_string for an exact unique match, including "
-                "whitespace and newlines. If there are multiple matches, either "
-                "provide more context or specify occurrence (1-indexed). When "
-                "multiple matches are found and no occurrence is given, the tool "
-                "returns line numbers and surrounding context for each match."
+                "Preferred tool for exact-match edits in an existing file. "
+                "Replace ONE occurrence of old_string with new_string (or "
+                "every occurrence with replace_all=true) and return a diff. "
+                "Read or search the file first, then include enough "
+                "surrounding context in old_string for an exact unique "
+                "match, including whitespace and newlines. When old_string "
+                "matches more than once and neither occurrence nor "
+                "replace_all is given, the tool returns line numbers and "
+                "surrounding context for each match so you can refine."
             ),
             "parameters": {
                 "type": "object",
@@ -722,7 +731,11 @@ TOOLS = [
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "Exact text to replace.",
+                        "description": (
+                            "Exact text to replace, as it appears in the "
+                            "file — do NOT include the line-number prefix "
+                            "shown by read_file."
+                        ),
                     },
                     "new_string": {
                         "type": "string",
@@ -735,87 +748,15 @@ TOOLS = [
                             "Only needed when old_string appears more than once."
                         ),
                     },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": (
+                            "Replace every occurrence. Default false. "
+                            "Mutually exclusive with occurrence."
+                        ),
+                    },
                 },
                 "required": ["path", "old_string", "new_string"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_patch",
-            "description": (
-                "Codex-friendly alias for incremental file edits. This is the "
-                "same editing capability as edit_file/multi_edit, not a unified "
-                "diff parser. Use path + old_string + new_string for one exact "
-                "replacement, or path + edits for multiple ordered replacements "
-                "in one file. Prefer this over write_file when modifying an "
-                "existing file."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "Absolute or relative path to the file. "
-                            "Parameter name is 'path' (not 'file_path')."
-                        ),
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "Exact text to replace for a single edit.",
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "Replacement text for a single edit.",
-                    },
-                    "occurrence": {
-                        "type": "integer",
-                        "description": (
-                            "Which occurrence to replace (1-indexed). "
-                            "Only needed when old_string appears more than once."
-                        ),
-                    },
-                    "edits": {
-                        "type": "array",
-                        "description": (
-                            "Optional ordered list of edit operations, using the "
-                            "same shape as multi_edit. Use this for several "
-                            "changes in the same file."
-                        ),
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "old_string": {
-                                    "type": "string",
-                                    "description": "Exact text to replace.",
-                                },
-                                "new_string": {
-                                    "type": "string",
-                                    "description": "Replacement text.",
-                                },
-                                "occurrence": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Which occurrence to replace (1-indexed). "
-                                        "Required when old_string matches multiple "
-                                        "times and replace_all is not set."
-                                    ),
-                                },
-                                "replace_all": {
-                                    "type": "boolean",
-                                    "description": (
-                                        "Replace every occurrence. Default false. "
-                                        "Mutually exclusive with occurrence."
-                                    ),
-                                },
-                            },
-                            "required": ["old_string", "new_string"],
-                        },
-                    },
-                },
-                "required": ["path"],
             },
         },
     },
@@ -901,7 +842,10 @@ TOOLS = [
                             "properties": {
                                 "old_string": {
                                     "type": "string",
-                                    "description": "Exact text to replace.",
+                                    "description": (
+                                        "Exact text to replace (without "
+                                        "read_file's line-number prefix)."
+                                    ),
                                 },
                                 "new_string": {
                                     "type": "string",
@@ -956,7 +900,12 @@ TOOLS = [
                     },
                     "file_filter": {
                         "type": "string",
-                        "description": "Optional glob pattern for files (e.g. '*.py').",
+                        "description": (
+                            "Optional glob pattern. Without '/' it matches "
+                            "file names at any depth (e.g. '*.py'); with "
+                            "'/' it matches the relative path ('**' spans "
+                            "directories, '*' does not)."
+                        ),
                     },
                 },
                 "required": [],
@@ -989,7 +938,12 @@ TOOLS = [
                     },
                     "file_filter": {
                         "type": "string",
-                        "description": "Optional glob to filter files (e.g. '*.py', '*.txt').",
+                        "description": (
+                            "Optional glob to filter files. Without '/' it "
+                            "matches file names at any depth (e.g. '*.py'); "
+                            "with '/' it matches the relative path ('**' "
+                            "spans directories, '*' does not)."
+                        ),
                     },
                     "case_sensitive": {
                         "type": "boolean",
@@ -1007,11 +961,14 @@ TOOLS = [
             "description": (
                 "Find files by glob pattern, recursively. Use this when you "
                 "need a multi-level pattern like '**/*.py' that list_files's "
-                "single-level file_filter can't express. '**' matches any "
-                "number of directories. Hidden files / directories (starting "
-                "with '.') are skipped unless the pattern names them "
-                "explicitly. Returns matching paths sorted by modification "
-                "time descending (most-recent first), capped at 1000 results."
+                "single-level file_filter can't express. Semantics: a "
+                "pattern without '/' matches file names at any depth "
+                "('*.py' finds every Python file); in a pattern with '/', "
+                "'*' stays within one path component and '**' spans "
+                "directories ('**/*.py' includes top-level files, "
+                "'src/*.py' does NOT match src/a/b.py). Returns matching "
+                "paths sorted by modification time descending (most-recent "
+                "first), capped at 1000 results."
             ),
             "parameters": {
                 "type": "object",
@@ -1103,16 +1060,19 @@ TOOLS = [
                 "Create a persistent subagent session, send it the "
                 "first prompt, and IMMEDIATELY return — the subagent "
                 "runs in the background. Returns a session_id and a "
-                "status hint; the actual answer must be fetched with "
-                "await_agent(session_id). The session keeps full "
-                "memory (messages + reasoning) across rounds, so for "
+                "status hint. Two ways to get the answer: call "
+                "await_agent(session_id) when you need it now, or keep "
+                "working / end your response — an unread result is "
+                "auto-delivered a moment later as a '[Subagent result]' "
+                "notification (same pipeline as task completions), so "
+                "you never need to poll. The session keeps full memory "
+                "(messages + reasoning) across rounds, so for "
                 "follow-ups use chat_agent, not another spawn_agent. "
                 "To run subagents in parallel, emit multiple "
-                "spawn_agent calls (in one tool-call batch is fine), "
-                "then await_agent each. Subagents have their own bash "
-                "job table and CANNOT nest subagents. Token usage is "
-                "billed here. Hit the live-session cap → end_agent an "
-                "old one first."
+                "spawn_agent calls (in one tool-call batch is fine). "
+                "Subagents have their own bash job table and CANNOT "
+                "nest subagents. Token usage is billed here. Hit the "
+                "live-session cap → end_agent an old one first."
             ),
             "parameters": {
                 "type": "object",
@@ -1135,6 +1095,24 @@ TOOLS = [
                             "a read-only investigator: report findings, "
                             "do not modify files.' Persists for the "
                             "lifetime of the session."
+                        ),
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Optional model id override for this "
+                            "subagent — must be a model of the CURRENT "
+                            "provider. Defaults to the parent's model. "
+                            "Consider a cheaper/faster model for "
+                            "search or read-only investigation tasks."
+                        ),
+                    },
+                    "effort": {
+                        "type": "string",
+                        "description": (
+                            "Optional reasoning-effort override for "
+                            "this subagent. Defaults to the parent's "
+                            "current setting."
                         ),
                     },
                 },
@@ -1179,15 +1157,16 @@ TOOLS = [
             "name": "await_agent",
             "description": (
                 "Wait for a subagent's most recent round to finish and "
-                "return its answer. Blocks for up to `timeout` seconds; "
-                "if the subagent is still running when the timeout "
-                "expires, returns a 'still running' notice and you can "
-                "call await_agent again. Pass timeout=0 to poll without "
-                "blocking. Once consumed, the answer is gone — call "
-                "chat_agent to ask another question, then await_agent "
-                "again. Errors if the session has no pending result "
-                "(e.g. you await_agent'd twice in a row without a "
-                "chat_agent in between)."
+                "return its answer. Use this when you need the answer "
+                "NOW to proceed; if you don't, just keep working or end "
+                "your response — unread results are auto-delivered as "
+                "'[Subagent result]' notifications. Blocks for up to "
+                "`timeout` seconds; if the subagent is still running "
+                "when the timeout expires, returns a 'still running' "
+                "notice and you can call await_agent again. Pass "
+                "timeout=0 to poll without blocking. Once consumed "
+                "(by await_agent OR by auto-delivery), the answer is "
+                "gone — errors if the session has no pending result."
             ),
             "parameters": {
                 "type": "object",
@@ -1522,7 +1501,11 @@ TOOLS = [
                 "so the user can see progress: list everything as 'pending' "
                 "first, mark exactly one item 'in_progress' while you work "
                 "on it, mark it 'completed' as soon as it's done, then "
-                "promote the next 'pending' to 'in_progress'."
+                "promote the next 'pending' to 'in_progress'. Before "
+                "delivering your final answer, reconcile the list: every "
+                "finished item must be marked 'completed' (including the "
+                "last one — a common miss); anything not done should be "
+                "removed or explicitly explained, never left dangling."
             ),
             "parameters": {
                 "type": "object",

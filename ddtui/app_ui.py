@@ -101,6 +101,16 @@ class AppUiMixin:
                 f"{len(events)} 个异步任务完成，已通知 agent",
                 timeout=4,
             )
+        # Unread subagent results ride the same delivery pipeline as
+        # task completions: injected at round boundaries while busy, or
+        # waking an idle parent via _start_task_event_turn below.
+        sub_events = self._collect_ready_subagent_events()
+        if sub_events:
+            self._task_events.extend(sub_events)
+            self.notify(
+                f"{len(sub_events)} 个子 agent 结果已投递给 agent",
+                timeout=4,
+            )
         if not self._task_events:
             return
         worker_alive = (

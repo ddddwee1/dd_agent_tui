@@ -263,12 +263,23 @@ def _format_task(task: AsyncTask, tail_lines: int) -> str:
         f"notify_on_complete: {task.notify_on_complete}"
     )
     if status == "running" and task.notify_on_complete:
-        head += (
-            "\nwaiting_rule: do not poll task_check/task_read just to wait. "
-            "Work on other useful tasks in parallel, or if nothing useful "
-            "remains, pause the session and wait for the completion "
-            "notification."
-        )
+        if task.check_count >= 2:
+            head += (
+                f"\nwaiting_rule: you have now checked this RUNNING task "
+                f"{task.check_count} times — this IS the polling loop you "
+                "were told to avoid. STOP. Ending your current response "
+                "is NOT abandoning the task: the completion notification "
+                "automatically starts a new turn where you pick up the "
+                "remaining steps. Record a checkpoint if helpful, then "
+                "END your response and let the notification wake you."
+            )
+        else:
+            head += (
+                "\nwaiting_rule: do not poll task_check/task_read just to wait. "
+                "Work on other useful tasks in parallel, or if nothing useful "
+                "remains, pause the session and wait for the completion "
+                "notification."
+            )
     tail = _tail(task.output_path, tail_lines)
     if not tail:
         return head + "\n(no output yet)"
@@ -325,6 +336,13 @@ def tool_task_start(
     err = _check_dangerous(command)
     if err:
         return f"Error: {err}"
+    # Subagents never receive completion notifications — the poller only
+    # scans the parent's ctx, and a subagent round has no "pause and get
+    # woken" mechanism anyway. Force pure-background mode so the whole
+    # notify/waiting-rule chain (guidance below, task_check's
+    # waiting_rule, collect_task_completion_events) stays consistent.
+    if ctx.is_subagent:
+        notify_on_complete = False
     _task_gc(ctx.tasks)
     if _task_count_running(ctx.tasks) >= TASK_MAX_CONCURRENT:
         running = [
@@ -427,6 +445,14 @@ def tool_task_start(
             "requested blocking, or for one short bounded wait for an "
             "almost-finished task."
         )
+    elif ctx.is_subagent:
+        wait_guidance = (
+            "You are a subagent: completion notifications are NOT "
+            "delivered to you (notify_on_complete was forced to False). "
+            "The parent-oriented waiting rule does not apply — use "
+            "task_wait to block until this task finishes, or "
+            "task_check/task_read to inspect progress."
+        )
     else:
         wait_guidance = (
             "No completion notification will be sent because "
@@ -456,6 +482,9 @@ def tool_task_check(
     task = ctx.tasks.get(task_id)
     if task is None:
         return f"Error: unknown task_id {task_id!r}. Use task_list to see tasks."
+    status, _rc, _elapsed = _task_status(task)
+    if status == "running" and task.notify_on_complete:
+        task.check_count += 1
     tail_lines = _clamp_int(tail_lines, TASK_DEFAULT_TAIL_LINES, 0, 500)
     return _truncate_output(_format_task(task, tail_lines), max_output_chars)
 
@@ -488,6 +517,18 @@ def tool_task_read(
     status, rc, elapsed = _task_status(task)
     _write_status(task)
     content = chunk.decode("utf-8", errors="replace")
+    warn = ""
+    if status == "running" and task.notify_on_complete:
+        task.check_count += 1
+        if task.check_count >= 2:
+            warn = (
+                f"waiting_rule: you have now inspected this RUNNING task "
+                f"{task.check_count} times — this IS the polling loop you "
+                "were told to avoid. STOP. Ending your current response is "
+                "NOT abandoning the task: the completion notification "
+                "automatically starts a new turn where you continue. END "
+                "your response and let the notification wake you.\n"
+            )
     return (
         f"Task {task.id}: {status}"
         + (f" (return_code {rc})" if rc is not None else "")
@@ -496,7 +537,8 @@ def tool_task_read(
         f"offset: {offset}\n"
         f"next_offset: {next_offset}\n"
         f"bytes_read: {len(chunk)}\n"
-        "--- content ---\n"
+        + warn
+        + "--- content ---\n"
         f"{content}"
     )
 

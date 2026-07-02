@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
+import functools
 import re
 from pathlib import Path
 
@@ -142,6 +143,75 @@ def _prune_ignored_dirs(root: str, dirs: list[str]) -> None:
     dirs[:] = [d for d in dirs if not _is_ignored_path(root_path / d)]
 
 
+def _translate_glob(pattern: str) -> str:
+    """Translate a glob pattern into a regex source string.
+
+    Proper glob semantics — unlike fnmatch, `*` and `?` never cross `/`,
+    and `**` is directory-aware: a leading or interior `**/` matches zero
+    or more whole directories (so `**/*.py` also matches a top-level
+    `mod.py`), and a trailing `/**` matches everything under a directory.
+    """
+    i, n = 0, len(pattern)
+    out: list[str] = []
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if pattern[i : i + 3] == "**/":
+                out.append("(?:[^/]+/)*")
+                i += 3
+            elif pattern[i : i + 2] == "**":
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = i + 1
+            if j < n and pattern[j] in "!^":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(re.escape(c))  # unterminated class → literal [
+                i += 1
+            else:
+                cls = pattern[i + 1 : j]
+                if cls.startswith("!"):
+                    cls = "^" + cls[1:]
+                out.append(f"[{cls}]")
+                i = j + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_glob(pattern: str) -> re.Pattern:
+    return re.compile(_translate_glob(pattern))
+
+
 def _matches_glob(path: str, pattern: str) -> bool:
-    """Match a POSIX-style relative path against a user glob pattern."""
-    return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(Path(path).name, pattern)
+    """Match a POSIX-style relative path against a user glob pattern.
+
+    A pattern without `/` matches against the basename (so `*.py` finds
+    Python files at any depth — ripgrep's -g convention). A pattern with
+    `/` matches against the full relative path with real glob semantics:
+    `*` stays within one path component, `**` spans directories.
+    """
+    try:
+        rx = _compile_glob(pattern)
+    except re.error:
+        # Malformed character class etc. — fall back to fnmatch rather
+        # than erroring out of a whole directory walk.
+        return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(
+            Path(path).name, pattern
+        )
+    if "/" not in pattern:
+        return rx.fullmatch(Path(path).name) is not None
+    return rx.fullmatch(path) is not None

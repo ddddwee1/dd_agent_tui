@@ -370,7 +370,7 @@ MVP 默认不开放 `terminal_send`。它等价于让外部模型往交互 shell
 - 临时探索：`explore_start`、`explore_end`、`explore_cancel`
 - 会话 checkpoint：`checkpoint_tool`、`checkpoint_get`、`checkpoint_clear`
 - 项目笔记：`project_note_add`、`project_note_search`、`project_note_list`、`project_note_read`、`project_note_update`、`project_note_delete`
-- 文件：`read_file`、`write_file`、`apply_patch`、`edit_file`、`edit_lines`、`multi_edit`
+- 文件：`read_file`、`write_file`、`edit_file`、`edit_lines`、`multi_edit`
 - 搜索：`list_files`、`glob_files`、`search_content`
 - Web：`web_fetch`、`web_search`
 - 任务进度：`todo_tool`
@@ -416,10 +416,15 @@ ssh -tt host 'tmux new -A -s ddtui-agent'
 
 子 agent 是异步的：
 
-- `spawn_agent` 创建会话并立即返回 `session_id`，后台继续跑。
+- `spawn_agent` 创建会话并立即返回 `session_id`，后台继续跑。可选 `model` / `effort` 参数按会话覆盖（仅限当前 provider 的模型），搜索/只读类任务可以指定更便宜的模型。
 - `chat_agent` 给已有会话发送下一轮消息，也立即返回。
-- `await_agent(session_id, timeout?)` 获取结果；超时不会取消子 agent。
+- `await_agent(session_id, timeout?)` 立刻获取结果；超时不会取消子 agent。
+- 不 await 也可以：子 agent 完成后，未读结果会像任务完成通知一样**自动投递**给父 agent（`[Subagent result]` 消息）——父 agent 忙时在下一次模型调用边界注入，空闲时自动唤醒新回合。
 - `end_agent(session_id)` 释放会话并清理后台 bash 任务。
+
+子 agent 使用独立的精简 system prompt——它知道自己是子 agent、结果会截断回传。项目级 `AGENTS.md` 和环境信息仍会注入，与父 agent 遵循同样的项目约定。
+
+子 agent 的工具面：有 bash、文件、搜索、web、todo、项目笔记、`compact_self`，**也有 `task_*` 和 `terminal_*`**——但任务完成通知只投递给父 agent，子 agent 的任务强制为纯后台模式（`notify_on_complete=false`），需要自己 `task_wait` / `task_check`；子 agent 的 terminal 没有顶部 tab 展示。没有 checkpoint（其展示/恢复/自动收回都只挂在父会话上）、没有 explore（其实现操作父对话历史）、不能嵌套子 agent。
 
 限制：
 
@@ -448,12 +453,25 @@ export BRAVE_API_KEY_FILE="$HOME/brave_apikey.txt"
 以下工具执行前会弹窗确认：
 
 - `write_file`
-- `apply_patch`
 - `edit_file`
 - `edit_lines`
 - `multi_edit`
 
-拒绝后，模型会收到“工具调用被用户策略/确认弹窗拦截”的结果。
+弹窗内可以选择：
+
+- `Y` 允许本次调用；
+- `A` 本会话内总是允许该工具（按工具名记忆，`/clear` 不重置，重启后失效）；
+- `N` / `Esc` 拒绝。拒绝后，模型会收到“工具调用被用户策略/确认弹窗拦截”的结果。
+
+父 agent 和子 agent 的写操作共用同一套确认；并发确认会排队逐个弹出，不会叠窗。注意：远程（`/remote`）会话触发的写操作也会等待**本地**弹窗确认。
+
+另外，`write_file` 覆盖**已存在**文件前要求模型本会话内先 `read_file` 读过该文件（或刚编辑过它），且文件此后未被外部修改；否则会被拒绝并提示先读。新建文件不受影响。这可以防止模型在没看过旧内容的情况下整文件覆盖掉你的东西。
+
+如果确认弹窗打扰到你（完全信任本机环境），可以关闭：
+
+```bash
+export DDTUI_CONFIRM_WRITES=0
+```
 
 ### 路径 sandbox
 
@@ -523,12 +541,14 @@ sudo 等）不再拦截。当前只拒绝：
 
 主要模块：
 
+- `ddtui/engine.py`：UI 无关的 `TurnEngine`——stream → append → dispatch 的 LLM 工具循环，父 agent 和子 agent 共用；宿主通过 `TurnObserver` 回调订阅渲染。相邻的只读工具调用会并发执行。
 - `ddtui/app.py`：Textual app shell、布局和入口。
-- `ddtui/app_*.py`：输入、历史、主 agent loop、subagent、UI 生命周期、确认弹窗等 mixin/helper。
-- `ddtui/tools.py`：工具 facade 和 dispatch。
+- `ddtui/app_agent_loop.py`：父 agent 的 engine 宿主（Textual observer、meta 工具 handler、外层回合驱动）。
+- `ddtui/app_*.py`：输入、历史、subagent、UI 生命周期、确认弹窗等 mixin/helper。
+- `ddtui/tools.py`：统一工具注册表（`ToolSpec`）+ dispatch。每个工具在注册表声明一次元数据（是否需要写确认、结果是否剥离 diff、是否并行安全、父/子 agent 可见性），所有派生清单自动生成。
 - `ddtui/tool_schemas.py`：发给模型看的 JSON schemas。
 - `ddtui/tools_*.py`：按领域拆分的工具实现。
-- `ddtui/providers.py`：DeepSeek / Codex provider adapter。
+- `ddtui/providers.py`：DeepSeek / Codex provider adapter；`attach_reasoning` 抽象各家 thinking 的消息格式。
 - `ddtui/widgets.py`：Textual widgets。
 - `ddtui/state.py`：运行时状态、token counter、后台 bash job 状态。
 - `ddtui/config.py`：默认值、路径、限制和 system prompt。

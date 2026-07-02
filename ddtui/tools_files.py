@@ -2,9 +2,59 @@
 
 from __future__ import annotations
 
-from .config import ALLOW_UNSANDBOXED_WRITES, READ_FILE_MAX_LINES
+from pathlib import Path
+
+from .config import (
+    ALLOW_UNSANDBOXED_WRITES,
+    READ_FILE_MAX_LINE_CHARS,
+    READ_FILE_MAX_LINES,
+    READ_FILE_MAX_TOTAL_CHARS,
+)
 from .state import ToolContext
 from .tool_utils import _safe_path, _sandbox_error, _unified_diff
+
+
+def _note_file_known(ctx: ToolContext, p: Path) -> None:
+    """Record that the model has current knowledge of *p*'s contents.
+
+    Called after a successful read_file AND after every successful
+    write/edit (the model knows what it just wrote), so the natural
+    read → edit → write_file flow never trips the overwrite guard.
+    """
+    try:
+        ctx.read_files[str(p)] = p.stat().st_mtime
+    except OSError:
+        pass
+
+
+def _overwrite_error(ctx: ToolContext, p: Path) -> str | None:
+    """Read-before-overwrite guard for whole-file writes.
+
+    An existing file may only be overwritten if the model read (or
+    wrote/edited) it this session and it hasn't changed on disk since.
+    """
+    if not p.exists():
+        return None
+    recorded = ctx.read_files.get(str(p))
+    if recorded is None:
+        return (
+            f"Error: {p} already exists and you have not read it in this "
+            "session. read_file it first so you know what you are "
+            "replacing, or use edit_file/multi_edit for incremental "
+            "changes."
+        )
+    try:
+        current = p.stat().st_mtime
+    except OSError:
+        # stat raced with deletion — fall through; the write itself
+        # will surface any real error.
+        return None
+    if current != recorded:
+        return (
+            f"Error: {p} changed on disk after you last read it. "
+            "read_file it again before overwriting."
+        )
+    return None
 
 
 def tool_read_file(
@@ -15,9 +65,14 @@ def tool_read_file(
 ) -> str:
     """Read a file with optional pagination.
 
-    Line numbers are 1-indexed to match edit_lines: offset=1 is the first
-    line, and the reported range uses the same base as edit_lines'
-    start_line/end_line.
+    Each output line is prefixed with its 1-indexed line number
+    (``   N\\tcontent``, cat -n style) so the model can reference and
+    edit by line without counting. The same base is used by edit_lines'
+    start_line/end_line and by offset here.
+
+    Two caps protect the context window: single lines are clipped at
+    READ_FILE_MAX_LINE_CHARS (minified JS/JSON), and the whole result is
+    capped at READ_FILE_MAX_TOTAL_CHARS with a resume hint.
     """
     p = _safe_path(ctx.work_dir, path)
     try:
@@ -40,27 +95,57 @@ def tool_read_file(
 
     start = offset - 1
     chunk = lines[start : start + limit]
-    header = f"[{p}] lines {offset}-{offset + len(chunk) - 1} of {total}"
-    return header + "\n" + "\n".join(chunk)
+
+    body_parts: list[str] = []
+    body_chars = 0
+    shown = 0
+    budget_hit = False
+    for i, line in enumerate(chunk):
+        if len(line) > READ_FILE_MAX_LINE_CHARS:
+            line = (
+                line[:READ_FILE_MAX_LINE_CHARS]
+                + f" …[line clipped; {len(line)} chars total]"
+            )
+        numbered = f"{offset + i:6d}\t{line}"
+        if body_chars + len(numbered) > READ_FILE_MAX_TOTAL_CHARS and shown > 0:
+            budget_hit = True
+            break
+        body_parts.append(numbered)
+        body_chars += len(numbered) + 1  # +1 for the joining newline
+        shown += 1
+
+    end_line = offset + shown - 1
+    header = f"[{p}] lines {offset}-{end_line} of {total}"
+    out = header + "\n" + "\n".join(body_parts)
+    if budget_hit:
+        out += (
+            f"\n…[output capped at {READ_FILE_MAX_TOTAL_CHARS} chars; "
+            f"continue with offset={end_line + 1}]"
+        )
+    _note_file_known(ctx, p)
+    return out
 
 
 def tool_write_file(
     ctx: ToolContext, path: str, content: str, force: bool = True
 ) -> str:
-    """Create or overwrite a file."""
+    """Create a new file, or overwrite one the model has read.
+
+    `force` is accepted for wire-compat with older conversations but has
+    no effect — the read-before-overwrite guard is unconditional.
+    """
     p = _safe_path(ctx.work_dir, path)
     if not ALLOW_UNSANDBOXED_WRITES:
         err = _sandbox_error(ctx.work_dir, p, kind="write file")
         if err:
             return err
-    if not force and p.exists():
-        return (
-            f"Error: {p} already exists. "
-            "Set force=True to overwrite, or use apply_patch/edit_file to modify it."
-        )
+    err = _overwrite_error(ctx, p)
+    if err:
+        return err
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
+        _note_file_known(ctx, p)
         return f"Wrote {len(content)} chars to {p}"
     except Exception as e:
         return f"Error writing {p}: {e}"
@@ -72,17 +157,21 @@ def tool_edit_file(
     old_string: str,
     new_string: str,
     occurrence: int | None = None,
+    replace_all: bool = False,
 ) -> str:
-    """Replace one occurrence of old_string with new_string.
+    """Replace one occurrence of old_string with new_string, or every
+    occurrence when *replace_all* is set.
 
-    When *occurrence* is omitted and old_string matches more than once,
-    return contextual information about every match so the caller can
-    refine the request.
+    When neither *occurrence* nor *replace_all* is given and old_string
+    matches more than once, return contextual information about every
+    match so the caller can refine the request.
     """
     if not isinstance(old_string, str) or not isinstance(new_string, str):
         return "Error: old_string and new_string must be strings"
     if old_string == "":
         return "Error: old_string must be non-empty"
+    if replace_all and occurrence is not None:
+        return "Error: replace_all and occurrence are mutually exclusive — pick one"
 
     p = _safe_path(ctx.work_dir, path)
     if not ALLOW_UNSANDBOXED_WRITES:
@@ -112,6 +201,19 @@ def tool_edit_file(
 
     if not positions:
         return f"Error: old_string not found in {p}"
+
+    if replace_all:
+        new_text = text.replace(old_string, new_string)
+        try:
+            p.write_text(new_text)
+        except Exception as e:
+            return f"Error writing {p}: {e}"
+        _note_file_known(ctx, p)
+        diff = _unified_diff(text, new_text, p)
+        return (
+            f"Edited {p} (replaced all {len(positions)} occurrence(s))\n\n"
+            f"{diff}"
+        )
 
     if len(positions) > 1 and occurrence is None:
         # Build context for each match
@@ -155,6 +257,7 @@ def tool_edit_file(
         p.write_text(new_text)
     except Exception as e:
         return f"Error writing {p}: {e}"
+    _note_file_known(ctx, p)
     diff = _unified_diff(text, new_text, p)
     return (
         f"Edited {p} (replaced occurrence {occurrence or 1} of {len(positions)})\n\n"
@@ -162,43 +265,21 @@ def tool_edit_file(
     )
 
 
-def tool_apply_patch(
-    ctx: ToolContext,
-    path: str,
-    old_string: str | None = None,
-    new_string: str | None = None,
-    occurrence: int | None = None,
-    edits: list | None = None,
-    patch: str | None = None,
-) -> str:
-    """Codex-friendly alias for exact text replacement edits.
+def tool_apply_patch(ctx: ToolContext, **_kwargs) -> str:
+    """Removed tool, kept as a redirect stub.
 
-    This intentionally reuses edit_file/multi_edit semantics. It is not
-    a unified-diff parser; the schema steers models to pass structured
-    exact replacements instead.
+    apply_patch was a pure forwarding alias over edit_file/multi_edit,
+    giving models three interchangeable entry points for the same exact
+    replacement. It is gone from the advertised schema; this stub
+    catches calls from models with an apply_patch prior (Codex) or from
+    replayed old conversations and points them at the real tools.
     """
-    if patch is not None:
-        return (
-            "Error: this apply_patch alias does not parse unified diff text. "
-            "Call it with path + old_string + new_string, or path + edits."
-        )
-
-    if edits is not None:
-        if old_string is not None or new_string is not None or occurrence is not None:
-            return (
-                "Error: apply_patch accepts either 'edits' or "
-                "'old_string'/'new_string', not both"
-            )
-        return tool_multi_edit(ctx, path, edits)
-
-    if old_string is None or new_string is None:
-        return (
-            "Error: apply_patch requires either 'edits' or both "
-            "'old_string' and 'new_string'. This alias does not parse "
-            "unified diff text."
-        )
-
-    return tool_edit_file(ctx, path, old_string, new_string, occurrence)
+    return (
+        "Error: apply_patch has been removed. Use edit_file for one exact "
+        "replacement (replace_all=true replaces every occurrence), "
+        "multi_edit for several replacements in one file, or write_file "
+        "to create/overwrite a whole file."
+    )
 
 
 def tool_edit_lines(
@@ -285,6 +366,7 @@ def tool_edit_lines(
         p.write_text(new_text)
     except Exception as e:
         return f"Error writing {p}: {e}"
+    _note_file_known(ctx, p)
     diff = _unified_diff(text, new_text, p)
     return (
         f"Edited {p}: {action}; file now has {len(result_lines)} line(s)\n\n"
@@ -396,6 +478,7 @@ def tool_multi_edit(ctx: ToolContext, path: str, edits: list | None = None) -> s
         p.write_text(buffer)
     except Exception as e:
         return f"Error writing {p}: {e}"
+    _note_file_known(ctx, p)
 
     diff = _unified_diff(before, buffer, p)
     head = (

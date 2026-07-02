@@ -83,7 +83,9 @@ def tool_search_content(
         return f"Error: invalid regex pattern: {e}"
 
     MAX_MATCHES = 500
+    MAX_FILES = 2000
     matches: list[str] = []
+    file_scan_truncated = False
 
     if p.is_file():
         files_to_search = [p]
@@ -98,8 +100,11 @@ def tool_search_content(
                 rel = fpath.relative_to(p).as_posix()
                 if _matches_glob(rel, file_filter):
                     files_to_search.append(fpath)
-            if len(files_to_search) > 2000:
-                break  # don't scan massive trees
+            if len(files_to_search) > MAX_FILES:
+                # Don't scan massive trees — but say so instead of
+                # silently reporting a partial result as complete.
+                file_scan_truncated = True
+                break
 
     for fpath in files_to_search:
         try:
@@ -114,6 +119,13 @@ def tool_search_content(
         except Exception:
             continue
 
+    if file_scan_truncated:
+        matches.append(
+            f"…[only the first {MAX_FILES} candidate files were searched; "
+            "results may be incomplete — narrow path or file_filter to "
+            "cover the rest]"
+        )
+        return "\n".join(matches)
     return "\n".join(matches) if matches else "(no matches)"
 
 

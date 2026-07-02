@@ -31,6 +31,7 @@ from .runtime_state import (
     turn_journal_path,
 )
 from .state import TokenCounter
+from .tools import DIFF_STRIP_TOOLS
 from .tools_tasks import recover_tasks_for_session
 from .tools_checkpoint import tool_checkpoint_clear, tool_checkpoint_tool
 from .widgets import (
@@ -702,12 +703,7 @@ class AppHistoryMixin:
                 if result is None:
                     continue
                 diff_text = None
-                if name in (
-                    "apply_patch",
-                    "edit_file",
-                    "edit_lines",
-                    "multi_edit",
-                ):
+                if name in DIFF_STRIP_TOOLS:
                     head, sep, diff = result.partition("\n\n")
                     if sep and "@@" in diff:
                         diff_text = diff
@@ -755,7 +751,7 @@ class AppHistoryMixin:
             "`explore_start/end/cancel` "
             "`checkpoint_tool/get/clear` "
             "`project_note_add/search/list/read/update/delete` "
-            "`read_file` `write_file` `apply_patch` `edit_file` `edit_lines` `multi_edit` "
+            "`read_file` `write_file` `edit_file` `edit_lines` `multi_edit` "
             "`list_files` `glob_files` `search_content` `web_fetch` `web_search` "
             "`todo_tool` `spawn_agent` `chat_agent` `await_agent` `end_agent`\n"
             "\n"

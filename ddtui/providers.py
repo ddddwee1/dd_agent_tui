@@ -85,6 +85,17 @@ class LLMProvider:
         """
         return self.default_context_limit
 
+    def attach_reasoning(self, msg: dict, reasoning: str) -> None:
+        """Attach streamed reasoning to an assistant message in this
+        provider's wire format.
+
+        Default is the flat DeepSeek-style `reasoning_content` string —
+        also what the Codex responses translator consumes. A provider
+        whose thinking is structured (e.g. Anthropic signed thinking
+        blocks) overrides this instead of the app hard-coding one shape.
+        """
+        msg["reasoning_content"] = reasoning
+
     async def complete_text(
         self, messages: list[dict], model: str, effort: str
     ) -> str:

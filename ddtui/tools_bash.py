@@ -9,11 +9,13 @@ or whose completion matters.
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
 from .config import (
     ALLOW_UNSANDBOXED_BASH,
     BASH_OUTPUT_MAX_CHARS,
+    BASH_SLOW_COMMAND_SECONDS,
     BASH_TIMEOUT,
 )
 from .state import ToolContext
@@ -50,6 +52,7 @@ def tool_bash(
         if err:
             return err
     cwd = str(cwd_path)
+    started = time.monotonic()
     try:
         result = subprocess.run(
             command,
@@ -60,7 +63,12 @@ def tool_bash(
             cwd=cwd,
         )
     except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {BASH_TIMEOUT}s"
+        return (
+            f"Error: command timed out after {BASH_TIMEOUT}s. "
+            "For long-running work use task_start (managed background "
+            "task) instead of bash."
+        )
+    elapsed = time.monotonic() - started
 
     parts = []
     if result.stdout:
@@ -68,4 +76,12 @@ def tool_bash(
     if result.stderr:
         parts.append(f"STDERR:\n{_truncate_output(result.stderr, cap)}")
     parts.append(f"Exit code: {result.returncode}")
+    if elapsed >= BASH_SLOW_COMMAND_SECONDS:
+        # Teach at the moment of the mistake: the model just blocked the
+        # whole session on a slow foreground command.
+        parts.append(
+            f"[note] This command ran {elapsed:.0f}s in the foreground and "
+            "blocked everything else. Next time, run commands in this "
+            "range with task_start so you can keep working while they run."
+        )
     return "\n".join(parts)

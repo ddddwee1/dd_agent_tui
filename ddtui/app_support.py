@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import platform
+import subprocess
+import time
 from pathlib import Path
 
 from .config import (
@@ -10,6 +13,47 @@ from .config import (
     COMPACT_TOOL_SNIPPET_CHARS,
 )
 from .providers import ToolCallDelta
+
+
+def _git_snapshot(work_dir: str) -> str | None:
+    """Current branch name for the env block, or None outside a repo.
+
+    Best-effort with a short timeout — a hung/absent git must not delay
+    startup. Branch only, no dirty state: the agent can always run
+    `git status` itself for the live picture.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    branch = r.stdout.strip()
+    return f"分支 {branch}" if branch else None
+
+
+def build_env_block(work_dir: str, provider_label: str, model: str) -> str:
+    """Render the "# 环境" system-prompt section at session start.
+
+    Gives the model the facts it would otherwise have to probe for (or
+    hallucinate): OS, cwd, git state, date, and what model it is running
+    as. Values are a startup snapshot, not live state.
+    """
+    lines = [
+        f"- 操作系统：{platform.system()} {platform.release()}（{platform.machine()}）",
+        f"- 当前目录（后续命令的默认 workdir）：{work_dir}",
+    ]
+    git = _git_snapshot(work_dir)
+    lines.append(f"- Git：{git}" if git else "- Git：当前目录不是 git 仓库")
+    lines.append(f"- 今天日期：{time.strftime('%Y-%m-%d')}")
+    lines.append(f"- Provider / 模型：{provider_label} / {model}")
+    return "# 环境（会话启动时的快照）\n" + "\n".join(lines)
 
 
 def _render_history_for_summary(messages: list) -> str:

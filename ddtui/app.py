@@ -8,6 +8,7 @@ sidebar/UI lifecycle. Tool implementations and pure UI widgets live in
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 from textual.app import App, ComposeResult
@@ -16,15 +17,20 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Header, Static, TabbedContent, TabPane
 
 from .app_agent_loop import AppAgentLoopMixin
-from .app_confirm import ToolConfirmHook, always_allow
+from .app_confirm import AppConfirmMixin, ToolConfirmHook, always_allow
 from .app_explore import AppExploreMixin
 from .app_history import AppHistoryMixin
 from .app_input import AppInputMixin
 from .app_remote import AppRemoteMixin
 from .app_subagents import AppSubagentMixin
-from .app_support import load_agents_md
+from .app_support import build_env_block, load_agents_md
 from .app_ui import AppUiMixin
-from .config import DEFAULT_PROVIDER, POST_SYSTEM_PROMPT, SYSTEM_PROMPT
+from .config import (
+    CONFIRM_WRITES,
+    DEFAULT_PROVIDER,
+    POST_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+)
 from .providers import ProviderConfigError, build_provider
 from .runtime_state import new_session_id
 from .state import TokenCounter, ToolContext
@@ -48,6 +54,7 @@ class AgentApp(
     AppExploreMixin,
     AppAgentLoopMixin,
     AppSubagentMixin,
+    AppConfirmMixin,
     AppUiMixin,
     App,
 ):
@@ -146,10 +153,18 @@ class AgentApp(
             work_dir=os.getcwd(),
             session_id=self._session_id,
         )
-        # SYSTEM_PROMPT ends with "当前路径为：" — append cwd at startup
-        # so the model knows where it's operating.
+        # The framework prompt plus a startup snapshot of the
+        # environment (OS, cwd, git state, date, provider/model) so the
+        # model doesn't have to probe for basics or hallucinate them.
         self.messages: list = [
-            {"role": "system", "content": SYSTEM_PROMPT + self.ctx.work_dir},
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+                + "\n"
+                + build_env_block(
+                    self.ctx.work_dir, self.provider.label, self.model
+                ),
+            },
         ]
         # If <cwd>/AGENTS.md exists, append it as a SECOND system
         # message so the framework's identity/tools/language rules stay
@@ -172,10 +187,15 @@ class AgentApp(
         self._active_explore: dict | None = None
         self._explore_next_id = 1
         self.counter = TokenCounter()
-        # Hook: replace this attribute (or override) to gate tools.
-        # Default policy allows every tool call; embedders can swap in
-        # a stricter hook (allowlist, modal, per-tool rules, etc.).
-        self.tool_confirm: ToolConfirmHook = always_allow
+        # Hook: gates every tool call before execution. Default policy
+        # confirms file-writing tools via a modal (AppConfirmMixin);
+        # DDTUI_CONFIRM_WRITES=0 swaps in always_allow. Embedders can
+        # replace the attribute with their own hook.
+        self._confirm_always: set[str] = set()
+        self._confirm_lock = asyncio.Lock()
+        self.tool_confirm: ToolConfirmHook = (
+            self._confirm_tool_call if CONFIRM_WRITES else always_allow
+        )
         self._busy = False
         # Follow-bottom state: when True, every mount/chunk-update
         # auto-scrolls the conversation to the end. Toggled by

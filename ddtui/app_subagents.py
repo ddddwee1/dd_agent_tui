@@ -1,294 +1,252 @@
-"""Persistent subagent session mixin for AgentApp."""
+"""Persistent subagent session mixin for AgentApp.
+
+The subagent's LLM tool loop is the shared `ddtui.engine.TurnEngine`;
+this module owns the subagent-specific glue: `SubagentTurnObserver`
+renders engine events into the session's tab pane and tracks phase /
+token stats, and the round's meta handler blocks unavailable tools and
+serves compact_self.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 
-from .app_support import _merge_tool_call_delta, load_agents_md
+from .app_support import build_env_block, load_agents_md
 from .config import (
     COMPACT_KEEP_RECENT_TURNS,
     MAX_LIVE_SUBAGENTS,
     POST_SYSTEM_PROMPT,
     SUBAGENT_DEFAULT_AWAIT_TIMEOUT,
     SUBAGENT_MAX_AWAIT_TIMEOUT,
-    SYSTEM_PROMPT,
+    SUBAGENT_READY_NOTIFY_DELAY,
+    SUBAGENT_RESULT_MAX_CHARS,
+    SUBAGENT_SYSTEM_PROMPT,
 )
+from .engine import ToolOutcome, TurnEngine, TurnObserver
 from .state import (
     SubagentSession,
     ToolContext,
     kill_all_tasks,
     kill_all_terminals,
 )
-from .tools import TOOLS, execute_tool
+from .tools import SUBAGENT_BLOCKED_TOOLS, SUBAGENT_TOOL_SCHEMAS
 from .widgets import SubagentTabPane
+
+
+class SubagentTurnObserver(TurnObserver):
+    """Bridges TurnEngine events into a SubagentSession: live pane
+    rendering, phase transitions, and token accounting. Every pane call
+    is defensive — the pane may be None (headless) or mid-teardown."""
+
+    def __init__(self, app, sess: SubagentSession) -> None:
+        self.app = app
+        self.sess = sess
+        self._thinking_started = False
+        self._answer_started = False
+
+    async def on_reasoning_delta(self, text: str) -> None:
+        pane = self.sess.pane
+        if pane is not None:
+            try:
+                if not self._thinking_started:
+                    pane.start_thinking()
+                    self._thinking_started = True
+                pane.append_thinking(text)
+            except Exception:
+                pass
+
+    async def on_content_delta(self, text: str) -> None:
+        self.sess.phase = "answering"
+        pane = self.sess.pane
+        if pane is not None:
+            try:
+                if not self._answer_started:
+                    pane.start_answer()
+                    self._answer_started = True
+                pane.append_answer(text)
+            except Exception:
+                pass
+
+    def on_stream_aborted(self) -> None:
+        pane = self.sess.pane
+        if pane is not None:
+            try:
+                pane.remove_live_blocks()
+            except Exception:
+                pass
+        self._thinking_started = False
+        self._answer_started = False
+
+    async def on_usage(self, usage) -> None:
+        # Roll subagent usage into the parent counter so the status bar
+        # reflects the latest context pressure; also accumulate
+        # per-session counts for the sidebar widget.
+        self.app.counter.add(usage)
+        if usage is not None:
+            self.sess.tokens_in += getattr(usage, "prompt_tokens", 0) or 0
+            self.sess.tokens_out += (
+                getattr(usage, "completion_tokens", 0) or 0
+            )
+            # THIS call's prompt tokens (not cumulative) so the sidebar
+            # + await_agent gauge reflect how full the next request is.
+            self.sess.last_prompt_tokens = (
+                getattr(usage, "prompt_tokens", 0) or 0
+            )
+        self.app._refresh_status()
+
+    async def on_assistant_message(self, msg: dict) -> None:
+        pane = self.sess.pane
+        if pane is not None:
+            try:
+                pane.finalize_thinking(self.app.counter.last_reasoning)
+                pane.finalize_answer()
+                pane.mark_round_committed()
+            except Exception:
+                pass
+        self._thinking_started = False
+        self._answer_started = False
+
+    async def on_tool_started(self, tc_id: str, name: str, args: dict) -> None:
+        self.sess.phase = "tool"
+        self.sess.last_tool = name
+        pane = self.sess.pane
+        if pane is not None:
+            try:
+                pane.add_tool_block(tc_id, name, args)
+            except Exception:
+                pass
+
+    async def on_tool_result(
+        self, tc_id: str, name: str, args: dict, outcome: ToolOutcome
+    ) -> None:
+        pane = self.sess.pane
+        if pane is not None:
+            try:
+                pane.set_tool_result(
+                    tc_id, outcome.content, blocked=not outcome.ok
+                )
+            except Exception:
+                pass
+
+    async def on_history_appended(self, msg: dict, kind: str) -> None:
+        if kind == "tool" and self.sess.pane is not None:
+            try:
+                self.sess.pane.mark_round_committed()
+            except Exception:
+                pass
 
 
 class AppSubagentMixin:
     async def _run_subagent_round(self, sess: SubagentSession) -> str:
-        """Pump the LLM tool-loop until the subagent emits a final
+        """Pump the shared TurnEngine until the subagent emits a final
         answer (assistant message with no tool_calls), and return that
         text.
 
         Caller is responsible for having appended the user message to
-        sess.messages before calling. No internal turn cap — a wedged
-        or looping subagent will keep burning tokens until the user
-        cancels via end_agent / /clear (or ESC×2 on the parent if the
-        parent is currently awaiting). The idle reaper, MAX_LIVE_SUB-
-        AGENTS, and SUBAGENT_RESULT_MAX_CHARS still apply as soft
+        sess.messages before calling. The engine owns streaming, tool
+        dispatch, confirmation, diff peeling, and parallel read
+        batching; this wrapper owns the subagent-specific bits — pane
+        rendering (via SubagentTurnObserver), phase transitions, the
+        blocked-tool / compact_self meta handler, and terminal phase
+        bookkeeping. No internal turn cap — the idle reaper,
+        MAX_LIVE_SUBAGENTS, and SUBAGENT_RESULT_MAX_CHARS are the soft
         guards.
-
-        Phase transitions: thinking → (answering | tool)* → idle on
-        success, error on stream failure. last_active_at is bumped in
-        `finally` so the idle reaper sees the right time even on the
-        cancelled / errored paths.
-
-        Streams reasoning/content tokens into `sess.pane` as they
-        arrive (mirroring the main `_stream_one` UX), and mounts the
-        ToolCallBlock for each tool call live so the user sees
-        execution start without waiting for the 1 Hz fallback refresh.
-        `reasoning_content` is preserved on every assistant message —
-        DeepSeek thinking-mode 400s if it's missing on the next call.
         """
-        pane = sess.pane
-        try:
-            while True:
-                sess.turn += 1
-                sess.phase = "thinking"
-                sess.last_tool = None
-                content = ""
-                reasoning = ""
-                tool_calls: dict[int, dict] = {}
-                final_usage = None
-                thinking_started = False
-                answer_started = False
 
-                # Render any newly-appended user message (spawn prompt
-                # or chat_agent follow-up) BEFORE live thinking mounts,
-                # so DOM order in the pane stays user → thinking →
-                # answer → tools.
-                if pane is not None:
-                    try:
-                        pane.refresh_from_session()
-                    except Exception:
-                        pass
-
+        async def before_round() -> None:
+            sess.turn += 1
+            sess.phase = "thinking"
+            sess.last_tool = None
+            # Render any newly-appended user message (spawn prompt or
+            # chat_agent follow-up) BEFORE live thinking mounts, so DOM
+            # order in the pane stays user → thinking → answer → tools.
+            if sess.pane is not None:
                 try:
-                    async for event in self.provider.stream(
-                        sess.messages,
-                        sess.sub_tools,
-                        self.model,
-                        self.effort,
-                    ):
-                        if event.usage is not None:
-                            final_usage = event.usage
-                        if event.reasoning:
-                            reasoning += event.reasoning
-                            if pane is not None:
-                                if not thinking_started:
-                                    pane.start_thinking()
-                                    thinking_started = True
-                                pane.append_thinking(event.reasoning)
-                        if event.content:
-                            content += event.content
-                            sess.phase = "answering"
-                            if pane is not None:
-                                if not answer_started:
-                                    pane.start_answer()
-                                    answer_started = True
-                                pane.append_answer(event.content)
-                        if event.tool_call is not None:
-                            _merge_tool_call_delta(tool_calls, event.tool_call)
-                            sess.phase = "answering"
-                except Exception as e:
-                    sess.phase = "error"
-                    if pane is not None:
-                        try:
-                            pane.remove_live_blocks()
-                            pane.mount_exception_notice(
-                                f"⛔ stream failed: {type(e).__name__}: {e}"
-                            )
-                        except Exception:
-                            pass
-                    return f"❌ subagent stream failed: {e}"
-
-                # Record subagent usage in the parent counter so the
-                # status bar reflects the latest context pressure; also
-                # accumulate per-session counts for the sidebar widget.
-                self.counter.add(final_usage)
-                if final_usage is not None:
-                    sess.tokens_in += getattr(final_usage, "prompt_tokens", 0) or 0
-                    sess.tokens_out += getattr(final_usage, "completion_tokens", 0) or 0
-                    # Track THIS call's prompt tokens (not cumulative) so
-                    # the sidebar + await_agent gauge reflects how full
-                    # the next request would be.
-                    sess.last_prompt_tokens = (
-                        getattr(final_usage, "prompt_tokens", 0) or 0
-                    )
-                self._refresh_status()
-
-                # Finalize the live widgets — counter.last_reasoning was
-                # just bumped by counter.add(final_usage) above, so it
-                # carries THIS round's reasoning token count.
-                if pane is not None:
-                    try:
-                        pane.finalize_thinking(self.counter.last_reasoning)
-                        pane.finalize_answer()
-                    except Exception:
-                        pass
-
-                msg: dict = {"role": "assistant", "content": content}
-                if reasoning:
-                    # Mandatory for DeepSeek thinking mode on the next
-                    # request — preserved verbatim.
-                    msg["reasoning_content"] = reasoning
-                if tool_calls:
-                    msg["tool_calls"] = [
-                        tool_calls[i] for i in sorted(tool_calls)
-                    ]
-                sess.messages.append(msg)
-                if pane is not None:
-                    pane.mark_round_committed()
-
-                if not tool_calls:
-                    # Final answer for THIS round. Session stays alive
-                    # at "idle" — the parent can chat_agent again later.
-                    sess.phase = "idle"
-                    return content or "(subagent returned no answer)"
-
-                for tc in msg["tool_calls"]:
-                    name = tc["function"]["name"]
-                    sess.phase = "tool"
-                    sess.last_tool = name
-                    raw = tc["function"].get("arguments") or "{}"
-                    try:
-                        args = json.loads(raw)
-                    except json.JSONDecodeError:
-                        if pane is not None:
-                            try:
-                                pane.add_tool_block(
-                                    tc["id"], name, {"_raw": raw}
-                                )
-                            except Exception:
-                                pass
-                        result = f"Error: bad JSON args: {raw}"
-                        if pane is not None:
-                            try:
-                                pane.set_tool_result(
-                                    tc["id"], result, blocked=True
-                                )
-                            except Exception:
-                                pass
-                    else:
-                        if pane is not None:
-                            try:
-                                pane.add_tool_block(tc["id"], name, args)
-                            except Exception:
-                                pass
-                        if name in (
-                            "spawn_agent", "chat_agent",
-                            "await_agent", "end_agent",
-                        ):
-                            # Defense in depth — schemas are filtered
-                            # but models sometimes try anyway.
-                            result = (
-                                f"Error: subagents cannot call {name} "
-                                "(no nested subagents)."
-                            )
-                            if pane is not None:
-                                try:
-                                    pane.set_tool_result(
-                                        tc["id"], result, blocked=True
-                                    )
-                                except Exception:
-                                    pass
-                        elif name == "compact_self":
-                            # Subagent-only meta-tool: rewrite the
-                            # session's own messages with a summary.
-                            # Reuses _compact_messages from
-                            # AppHistoryMixin so /compact and
-                            # compact_self share the exact same prompt
-                            # / cut policy. No tool_confirm — this only
-                            # mutates in-process memory, no files /
-                            # shell side effects.
-                            try:
-                                new_messages, stats = (
-                                    await self._compact_messages(
-                                        sess.messages
-                                    )
-                                )
-                            except ValueError as e:
-                                result = f"Error: {e}"
-                            except Exception as e:
-                                result = (
-                                    f"Error: compact_self failed: "
-                                    f"{type(e).__name__}: {e}"
-                                )
-                            else:
-                                sess.messages = new_messages
-                                result = (
-                                    f"已压缩：{stats['before_n']} → "
-                                    f"{stats['after_n']} 条消息，约 "
-                                    f"-{stats['saved']:,} 字符（保留最近 "
-                                    f"{COMPACT_KEEP_RECENT_TURNS} 轮原文）。"
-                                )
-                            if pane is not None:
-                                try:
-                                    pane.set_tool_result(
-                                        tc["id"], result,
-                                        blocked=result.startswith("Error"),
-                                    )
-                                except Exception:
-                                    pass
-                        else:
-                            allowed = await self.tool_confirm(name, args)
-                            if allowed:
-                                result = await asyncio.to_thread(
-                                    execute_tool, sess.ctx, name, args
-                                )
-                                # Strip the diff so a 1000-line patch
-                                # doesn't eat the subagent's context.
-                                if name in (
-                                    "apply_patch",
-                                    "edit_file",
-                                    "edit_lines",
-                                    "multi_edit",
-                                ):
-                                    head, sep, diff = result.partition("\n\n")
-                                    if sep and "@@" in diff:
-                                        result = head
-                                if pane is not None:
-                                    try:
-                                        pane.set_tool_result(tc["id"], result)
-                                    except Exception:
-                                        pass
-                            else:
-                                result = "Tool execution blocked by user policy / confirmation dialog."
-                                if pane is not None:
-                                    try:
-                                        pane.set_tool_result(
-                                            tc["id"], result, blocked=True
-                                        )
-                                    except Exception:
-                                        pass
-                    sess.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": result,
-                    })
-                    if pane is not None:
-                        pane.mark_round_committed()
-        except asyncio.CancelledError:
-            # Pane is usually being torn down (/clear, end_agent), but
-            # clean up live widgets defensively so a survivor pane
-            # doesn't show a forever-streaming ThinkingBlock.
-            if pane is not None:
-                try:
-                    pane.remove_live_blocks()
+                    sess.pane.refresh_from_session()
                 except Exception:
                     pass
-            raise
+
+        async def meta(
+            tc_id: str, name: str, args: dict, batch_size: int
+        ) -> str | None:
+            if name in SUBAGENT_BLOCKED_TOOLS:
+                # Defense in depth — schemas are filtered but models
+                # sometimes try anyway. spawn_* would nest; explore_*
+                # would compact the PARENT's history; checkpoint_* has
+                # no consumer for a subagent.
+                return f"Error: {name} is not available to subagents."
+            if name == "compact_self":
+                # Subagent-only meta-tool: rewrite the session's own
+                # messages with a summary. Reuses _compact_messages so
+                # /compact and compact_self share the same prompt / cut
+                # policy. No tool_confirm — memory-only, no side effects.
+                try:
+                    new_messages, stats = await self._compact_messages(
+                        sess.messages
+                    )
+                except ValueError as e:
+                    return f"Error: {e}"
+                except Exception as e:
+                    return (
+                        f"Error: compact_self failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                # Slice-assign, NOT rebind: the engine holds a reference
+                # to this exact list object.
+                sess.messages[:] = new_messages
+                return (
+                    f"已压缩：{stats['before_n']} → "
+                    f"{stats['after_n']} 条消息，约 "
+                    f"-{stats['saved']:,} 字符（保留最近 "
+                    f"{COMPACT_KEEP_RECENT_TURNS} 轮原文）。"
+                )
+            return None
+
+        engine = TurnEngine(
+            provider=self.provider,
+            ctx=sess.ctx,
+            messages=sess.messages,
+            tools=sess.sub_tools,
+            model=sess.model or self.model,
+            effort=sess.effort or self.effort,
+            observer=SubagentTurnObserver(self, sess),
+            tool_confirm=self.tool_confirm,
+            meta_handler=meta,
+            never_parallel=SUBAGENT_BLOCKED_TOOLS,
+            before_round=before_round,
+        )
+        try:
+            try:
+                await engine.run_turn()
+            except asyncio.CancelledError:
+                # Pane is usually being torn down (/clear, end_agent),
+                # but clean up live widgets defensively so a survivor
+                # pane doesn't show a forever-streaming ThinkingBlock.
+                if sess.pane is not None:
+                    try:
+                        sess.pane.remove_live_blocks()
+                    except Exception:
+                        pass
+                raise
+            except Exception as e:
+                sess.phase = "error"
+                if sess.pane is not None:
+                    try:
+                        sess.pane.remove_live_blocks()
+                        sess.pane.mount_exception_notice(
+                            f"⛔ stream failed: {type(e).__name__}: {e}"
+                        )
+                    except Exception:
+                        pass
+                return f"❌ subagent stream failed: {e}"
+            # Final answer for THIS round. Session stays alive at
+            # "idle" — the parent can chat_agent again later.
+            sess.phase = "idle"
+            answer = ""
+            if sess.messages and sess.messages[-1].get("role") == "assistant":
+                answer = sess.messages[-1].get("content") or ""
+            return answer or "(subagent returned no answer)"
         finally:
             # Idle / error are terminal-for-this-round; anything else
             # (cancelled, unexpected exit) becomes "error" so the panel
@@ -327,14 +285,22 @@ class AppSubagentMixin:
         finally:
             sess.task = None
 
-    def _spawn_subagent(self, prompt: str, system: str) -> str:
+    def _spawn_subagent(
+        self,
+        prompt: str,
+        system: str,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> str:
         """Create a fresh SubagentSession and schedule its first round
         as a background task. Returns immediately with the assigned
         session_id; the parent calls `await_agent` to fetch the answer.
 
         Each session gets its own ToolContext (independent task/terminal
-        tables) but inherits the parent's work_dir, OpenAI client, and
-        model / effort settings. Token usage rolls up into the parent
+        tables) and the parent's work_dir and provider. Model / effort
+        default to the parent's current values but can be overridden per
+        spawn (same provider only) — cheap search tasks don't need the
+        parent's full model. Token usage rolls up into the parent
         counter; the cap is MAX_LIVE_SUBAGENTS so a runaway parent
         can't fork unbounded sessions.
         """
@@ -347,9 +313,24 @@ class AppSubagentMixin:
                 "Call end_agent on an existing session first."
             )
 
-        sub_ctx = ToolContext(work_dir=self.ctx.work_dir)
+        sub_model = (model or "").strip() or self.model
+        sub_effort = (effort or "").strip() or self.effort
+        # is_subagent=True switches task_start into pure-background mode
+        # (no completion notifications — those only reach the parent).
+        sub_ctx = ToolContext(work_dir=self.ctx.work_dir, is_subagent=True)
+        # Subagents get their OWN framework prompt — they must know they
+        # are subagents (output returns to the parent, truncated) and
+        # must not be taught the meta tools they can't call. AGENTS.md
+        # below still applies: same repo, same project conventions.
         sub_messages: list = [
-            {"role": "system", "content": SYSTEM_PROMPT + sub_ctx.work_dir},
+            {
+                "role": "system",
+                "content": SUBAGENT_SYSTEM_PROMPT
+                + "\n"
+                + build_env_block(
+                    sub_ctx.work_dir, self.provider.label, sub_model
+                ),
+            },
         ]
         # Project-level guidance (AGENTS.md) applies to subagents too —
         # they're working in the same repo as the parent and should
@@ -373,34 +354,13 @@ class AppSubagentMixin:
             })
         sub_messages.append({"role": "user", "content": prompt})
 
-        # Hide every meta-tool so the subagent can't recurse.
-        sub_tools = [
-            t for t in TOOLS
-            if t["function"]["name"] not in (
-                "spawn_agent",
-                "chat_agent",
-                "await_agent",
-                "end_agent",
-                "explore_start",
-                "explore_end",
-                "explore_cancel",
-                "checkpoint_tool",
-                "checkpoint_get",
-                "checkpoint_clear",
-                "task_start",
-                "task_check",
-                "task_read",
-                "task_wait",
-                "task_kill",
-                "task_list",
-                "terminal_start",
-                "terminal_send",
-                "terminal_read",
-                "terminal_interrupt",
-                "terminal_close",
-                "terminal_list",
-            )
-        ]
+        # Subagent-visible schemas come straight from the registry:
+        # no spawn_* (no recursive forking), no explore_* (the impl
+        # compacts the PARENT's history), no checkpoint_* (no consumer
+        # for a subagent). task_* and terminal_* ARE available (own ctx
+        # tables, cleaned up by end_agent/reaper); task notifications
+        # are disabled via ctx.is_subagent, so subagents task_wait.
+        sub_tools = list(SUBAGENT_TOOL_SCHEMAS)
 
         sub_id = f"sub-{self._subagent_next_id}"
         self._subagent_next_id += 1
@@ -416,13 +376,15 @@ class AppSubagentMixin:
             messages=sub_messages,
             ctx=sub_ctx,
             sub_tools=sub_tools,
+            model=sub_model,
+            effort=sub_effort,
         )
         # Resolve the model's context window once so the sidebar +
         # await_agent return can render a ctx% gauge. None if the
         # provider doesn't know (we just skip the gauge in that case).
         try:
             sess.context_limit = self.provider.context_limit_for_model(
-                self.model
+                sub_model
             )
         except Exception:
             sess.context_limit = None
@@ -540,14 +502,58 @@ class AppSubagentMixin:
         # can decide whether to chat_agent the subagent into a
         # compact_self call before the next round. Skipped when the
         # provider doesn't expose a context_limit.
+        header = self._subagent_ctx_gauge(sess)
+        return header + result if header else result
+
+    @staticmethod
+    def _subagent_ctx_gauge(sess: SubagentSession) -> str:
+        """Context-pressure header shared by await_agent returns and
+        auto-delivered result notifications. Empty when the provider
+        doesn't expose a context_limit."""
         if sess.context_limit and sess.last_prompt_tokens:
             pct = sess.last_prompt_tokens * 100.0 / sess.context_limit
-            header = (
-                f"[session_id={sid}, ctx={pct:.0f}% "
+            return (
+                f"[session_id={sess.id}, ctx={pct:.0f}% "
                 f"({sess.last_prompt_tokens:,}/{sess.context_limit:,})]\n"
             )
-            return header + result
-        return result
+        return ""
+
+    def _collect_ready_subagent_events(self) -> list[str]:
+        """Package idle-ready subagent results as notification events,
+        consuming them (ready → idle) — task-completion-style delivery.
+
+        Called by the 1 Hz notification poller. Results younger than
+        SUBAGENT_READY_NOTIFY_DELAY are skipped so an in-flight
+        await_agent (which consumes within milliseconds of the round
+        ending) always wins; only results the parent left unread get
+        pushed. The session stays alive for chat_agent follow-ups.
+        """
+        events: list[str] = []
+        now = time.monotonic()
+        for sess in self._live_subagents.values():
+            if sess.phase != "ready" or sess.last_result is None:
+                continue
+            if now - sess.last_active_at < SUBAGENT_READY_NOTIFY_DELAY:
+                continue
+            result = sess.last_result
+            sess.last_result = None
+            sess.phase = "idle"
+            sess.last_active_at = now
+            if len(result) > SUBAGENT_RESULT_MAX_CHARS:
+                result = (
+                    result[:SUBAGENT_RESULT_MAX_CHARS]
+                    + f"\n…[+{len(result) - SUBAGENT_RESULT_MAX_CHARS} chars truncated]"
+                )
+            gauge = self._subagent_ctx_gauge(sess)
+            events.append(
+                f"[Subagent result] session_id={sess.id} (turn "
+                f"{sess.turn}) finished; its answer is delivered below — "
+                "do NOT call await_agent for it (already consumed). The "
+                "session stays alive for chat_agent follow-ups; end_agent "
+                "it when no longer needed.\n"
+                f"{gauge}{result}"
+            )
+        return events
 
     def _end_subagent(self, sid: str) -> str:
         """Tear down a session: cancel any in-flight round, kill its

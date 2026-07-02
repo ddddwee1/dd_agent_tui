@@ -84,6 +84,11 @@ class AsyncTask:
     return_code: int | None = None
     killed: bool = False
     notified: bool = False
+    # How many times the model has task_check/task_read-ed this task
+    # while it was still running with notifications on. Drives the
+    # escalating anti-polling guidance in _format_task — teach at the
+    # moment of the mistake instead of only stating the rule upfront.
+    check_count: int = 0
 
 
 @dataclass
@@ -219,6 +224,18 @@ class ToolContext:
     checkpoint: dict | None = None
     terminal_next_id: int = 1
     task_next_id: int = 1
+    # True for a subagent's ToolContext. Task completion notifications
+    # are only ever collected from the PARENT ctx (app_ui polls it), so
+    # tool_task_start forces notify_on_complete=False here and returns
+    # subagent-appropriate wait guidance (task_wait IS correct for them).
+    is_subagent: bool = False
+    # Read-before-overwrite ledger: resolved path -> mtime at the moment
+    # the model last read (or wrote/edited) the file. write_file refuses
+    # to overwrite an existing file that isn't here or whose mtime has
+    # drifted (changed on disk since). Not persisted across /resume — a
+    # restored session must re-read before overwriting, which is the
+    # safe default.
+    read_files: dict[str, float] = field(default_factory=dict)
 
     def alloc_terminal_id(self) -> str:
         """Reserve and return the next terminal id ('term-N')."""
@@ -263,6 +280,11 @@ class SubagentSession:
     messages: list[dict]     # full subagent conversation, system msg at [0]
     ctx: "ToolContext"       # subagent's own tool context (its own task/terminal tables)
     sub_tools: list[dict]    # tool schemas the subagent sees (no meta tools)
+    # Model / effort this session streams with. Fixed at spawn time —
+    # defaults to the parent's current values, overridable per spawn so
+    # cheap search tasks can run on a cheaper model. Same provider only.
+    model: str = ""
+    effort: str = ""
     turn: int = 0            # cumulative round count across all chat calls
     # phase ∈ {"thinking","answering","tool","ready","idle","done","error"}
     # ready  = round finished, result waiting in last_result

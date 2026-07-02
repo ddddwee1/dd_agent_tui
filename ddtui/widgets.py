@@ -257,6 +257,92 @@ class EditPendingScreen(ModalScreen[dict | None]):
         self.dismiss(None)
 
 
+class ToolConfirmScreen(ModalScreen[str]):
+    """Confirmation modal for file-writing tool calls.
+
+    Dismiss payload: ``"allow"`` (this call), ``"always"`` (whitelist the
+    tool for the rest of the session), or ``"deny"``. The summary text is
+    built by the caller — this screen stays pure presentation.
+    """
+
+    BINDINGS = [
+        Binding("y", "do_allow", show=False),
+        Binding("a", "do_always", show=False),
+        Binding("n", "do_deny", show=False),
+        Binding("escape", "do_deny", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ToolConfirmScreen {
+        align: center middle;
+    }
+    #confirm-dialog {
+        width: 80%;
+        max-width: 100;
+        height: auto;
+        max-height: 80%;
+        padding: 1 2;
+        background: #2d2e27;
+        border: thick #fd971f;
+    }
+    #confirm-title {
+        height: auto;
+        margin: 0 0 1 0;
+    }
+    #confirm-body {
+        height: auto;
+        max-height: 20;
+        margin: 0 0 1 0;
+        overflow-y: auto;
+    }
+    #confirm-buttons {
+        height: 3;
+        align-horizontal: right;
+    }
+    #confirm-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, tool_name: str, summary: str) -> None:
+        self._tool_name = tool_name
+        self._summary = summary
+        super().__init__()
+
+    def compose(self):
+        with Vertical(id="confirm-dialog"):
+            title = Text()
+            title.append(f"⚠ 写操作确认 · {self._tool_name}", style="bold #fd971f")
+            title.append(
+                "   ·   Y 允许   A 本会话总是允许   N/Esc 拒绝",
+                style="dim",
+            )
+            yield Static(title, id="confirm-title")
+            yield VerticalScroll(Static(Text(self._summary)), id="confirm-body")
+            with Horizontal(id="confirm-buttons"):
+                yield Button("拒绝", variant="error", id="btn-deny")
+                yield Button("本会话总是允许", id="btn-always")
+                yield Button("允许", variant="primary", id="btn-allow")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "btn-allow":
+            self.dismiss("allow")
+        elif bid == "btn-always":
+            self.dismiss("always")
+        elif bid == "btn-deny":
+            self.dismiss("deny")
+
+    def action_do_allow(self) -> None:
+        self.dismiss("allow")
+
+    def action_do_always(self) -> None:
+        self.dismiss("always")
+
+    def action_do_deny(self) -> None:
+        self.dismiss("deny")
+
+
 class ResumeConversationScreen(ModalScreen[str | None]):
     """Modal picker for `/resume` when the user doesn't pass a name."""
 
