@@ -447,7 +447,11 @@ class AppHistoryMixin:
                 ))
             )
             return
-        self.messages = new_messages
+        # In-place: same rule as explore_end/compact_self — never rebind
+        # self.messages anywhere a TurnEngine might share the list. The
+        # current call site sits after the engine loop exits, but slice
+        # assignment keeps this safe if that ever changes.
+        self.messages[:] = new_messages
         await self._autosave_conversation()
         await self._mount_widget(
             Static(Text(
