@@ -511,9 +511,9 @@ class AppHistoryMixin:
         )
 
         # Wipe the current view + buffers; then drop in the loaded
-        # messages and replay them as widgets. Background bash jobs
-        # are NOT killed — they belong to the wall-clock-current shell,
-        # not the conversation that just got swapped in.
+        # messages and replay them as widgets. Managed tasks are NOT
+        # killed — they belong to the wall-clock-current runtime, not
+        # the conversation that just got swapped in.
         self._clear_turn_journal()
         self._session_id = session_id
         self.ctx.session_id = session_id
@@ -749,7 +749,7 @@ class AppHistoryMixin:
             "- `Ctrl+L` 清空对话\n"
             "- `Ctrl+C` 退出\n\n"
             "### 工具(模型可调用)\n"
-            "`bash` `bash_start/check/wait/kill/list` "
+            "`bash` "
             "`terminal_start/send/read/interrupt/close/list` "
             "`task_start/check/read/wait/kill/list` "
             "`explore_start/end/cancel` "

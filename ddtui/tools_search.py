@@ -25,6 +25,7 @@ def tool_list_files(
         return str(p)
 
     entries: list[str] = []
+    depth_truncated = False
     for root, dirs, files in os.walk(p):
         rel = os.path.relpath(root, p)
         if rel == ".":
@@ -33,6 +34,8 @@ def tool_list_files(
             current_depth = rel.count(os.sep) + 1
 
         if current_depth > depth:
+            if dirs or files:
+                depth_truncated = True
             dirs[:] = []  # prune deeper dirs
             continue
 
@@ -52,7 +55,13 @@ def tool_list_files(
 
     if not entries:
         return f"{p} (empty or no files matching filter)"
-    return "\n".join(entries)
+    out = "\n".join(entries)
+    if depth_truncated:
+        out += (
+            f"\n…[depth limit {depth} reached; deeper entries hidden — "
+            f"increase depth or list a subdirectory to see more]"
+        )
+    return out
 
 
 def tool_search_content(

@@ -15,8 +15,7 @@
 - 流式展示思考过程和最终回答。
 - 内置工具调用：bash、文件读写/编辑、搜索/glob、网页抓取、Brave Search、TODO、子 agent。
 - 写文件/编辑文件前弹窗确认。
-- bash 后台任务面板：长任务可以 `bash_start` 后用 `bash_check` / `bash_wait` / `bash_kill` 管理。
-- 托管异步任务：`task_start` 会写临时输出文件，并在任务完成后通知 agent。
+- 托管异步任务：后台/长任务用 `task_start`（写临时输出文件、任务完成后通知 agent），用 `task_check` / `task_read` / `task_wait` / `task_kill` / `task_list` 管理；侧栏有任务面板。
 - 会话 checkpoint：记录当前目标、证据、决策、blocker、active refs 和下一步。
 - 项目笔记：记录 repo-local runbook、坑点、验证过的命令和约定。
 - 子 agent 异步并发：可 spawn 多个子会话，在侧边栏和 tab 中观察状态。
@@ -365,7 +364,7 @@ MVP 默认不开放 `terminal_send`。它等价于让外部模型往交互 shell
 
 模型可以调用这些工具：
 
-- shell：`bash`、`bash_start`、`bash_check`、`bash_wait`、`bash_kill`、`bash_list`
+- shell（同步一次性）：`bash`
 - 交互式 Terminal：`terminal_start`、`terminal_send`、`terminal_read`、`terminal_interrupt`、`terminal_close`、`terminal_list`
 - 托管异步任务：`task_start`、`task_check`、`task_read`、`task_wait`、`task_kill`、`task_list`
 - 临时探索：`explore_start`、`explore_end`、`explore_cancel`
@@ -391,9 +390,9 @@ ssh -tt host 'tmux new -A -s ddtui-agent'
 
 ### 托管异步任务
 
-`bash_start` 是原始后台 shell，适合简单后台进程；如果是测试、构建、下载、训练、profile 等完成状态很重要的长任务，优先用 `task_start`。
+命令执行只有两种形态：同步快命令用 `bash`（前台跑完直接返回，≤120s）；需要放后台或耗时较长（测试、构建、下载、训练、profile 等完成状态很重要的工作）一律用 `task_start`。是否收完成通知由 `notify_on_complete` 决定——`true`（默认）在结束时推送异步通知，`false` 则是纯后台、由你自己 `task_check` / `task_wait`。
 
-`task_start` 会返回 `task_id`、`output_path` 和 `status_path`。agent 可以用 `task_check` 看 tail、用 `task_read` 按 offset 增量读输出，但它们只用于一次性检查当前输出是否会改变下一步行动。默认 `notify_on_complete=true`，任务完成后会向 agent 发送异步完成通知。严格规则：agent 可以在等待期间继续做别的事；做完其他事后不要调用 `task_wait`，也不要用反复 `task_check` / `task_read` 轮询来替代等待，而是记录 checkpoint（如有帮助）并暂停当前回复，等待通知自动唤醒。`task_wait` 正常用于 `notify_on_complete=false` 的任务；对 `notify_on_complete=true` 只应在用户明确要求阻塞，或任务明显快结束且只做一次短暂有界等待时使用。
+`task_start` 会返回 `task_id`、`output_path` 和 `status_path`。任务与 terminal 的输出/状态文件写在 `~/.ddtui/runtime/logs/`（目录 `chmod 700`，不再放世界可读的 `/tmp`；可用 `DDTUI_LOG_DIR` 覆盖）。agent 可以用 `task_check` 看 tail、用 `task_read` 按 offset 增量读输出，但它们只用于一次性检查当前输出是否会改变下一步行动。默认 `notify_on_complete=true`，任务完成后会向 agent 发送异步完成通知。严格规则：agent 可以在等待期间继续做别的事；做完其他事后不要调用 `task_wait`，也不要用反复 `task_check` / `task_read` 轮询来替代等待，而是记录 checkpoint（如有帮助）并暂停当前回复，等待通知自动唤醒。`task_wait` 正常用于 `notify_on_complete=false` 的任务；对 `notify_on_complete=true` 只应在用户明确要求阻塞，或任务明显快结束且只做一次短暂有界等待时使用。
 
 ### 会话 checkpoint
 
@@ -461,7 +460,7 @@ export BRAVE_API_KEY_FILE="$HOME/brave_apikey.txt"
 默认情况下：
 
 - 写文件/编辑文件可以作用在任意路径（包括项目外）。
-- `bash` / `bash_start` / `task_start` 的 workdir 也必须在项目目录内。
+- `bash` / `task_start` / `terminal_start` 的 workdir 也必须在项目目录内。
 
 如果你想恢复旧行为，只允许项目目录内写入/编辑：
 
@@ -477,15 +476,14 @@ export DDTUI_ALLOW_UNSANDBOXED_BASH=1
 
 ### bash 危险命令拦截
 
-`bash`、`bash_start` 和 `task_start` 会拒绝一些明显危险模式，例如：
+ddtui 假设运行在可信的本地环境，**不**试图用黑名单去防御恶意 agent（黑名单也做不到）。
+`bash`、`task_start`、`terminal_start` 只拦截极少数灾难性、不可逆、几乎不会
+是有意为之的命令，避免模型幻觉出的一条命令把机器抹掉或重新格式化。日常工具（curl、wget、
+sudo 等）不再拦截。当前只拒绝：
 
-- `sudo`
-- `curl`
-- `wget`
-- `chmod 777`
-- `mkfs`
-- `dd if=`
-- `rm -rf /`
+- `rm -rf /`（整盘清空）
+- `mkfs`（重新格式化文件系统）
+- `dd ... of=/dev/*`（直接写裸设备）
 
 ### 默认忽略缓存/构建目录
 

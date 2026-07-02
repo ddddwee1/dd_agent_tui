@@ -13,7 +13,9 @@ TOOLS = [
                 "The command runs in the project working directory by default. "
                 "Output is truncated at 10 000 chars by default (override "
                 "with max_output_chars). "
-                "Dangerous patterns (sudo, curl, wget, chmod 777, mkfs, dd, rm -rf /) are blocked."
+                "Runs in a trusted local environment: only a few catastrophic "
+                "footguns (rm -rf /, mkfs, dd of=/dev/*) are refused; ordinary "
+                "tools like curl/wget/sudo are allowed."
             ),
             "parameters": {
                 "type": "object",
@@ -34,40 +36,6 @@ TOOLS = [
                         "description": (
                             "Override the default 10 000-char output cap. "
                             "Hard upper bound is 100 000."
-                        ),
-                    },
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "bash_start",
-            "description": (
-                "Start a raw background shell command and return "
-                "immediately with a job id (e.g. 'bg-3'). Use this only "
-                "for simple background shell processes where you do NOT "
-                "need structured task lifecycle, completion notifications, "
-                "or agent-visible done signals. For long-running validation, "
-                "build, test, download, training, profiling, or any operation "
-                "whose completion matters, prefer task_start. stdout+stderr "
-                "are merged into a log file. Same dangerous-pattern blacklist "
-                "as bash."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Bash command to run.",
-                    },
-                    "workdir": {
-                        "type": "string",
-                        "description": (
-                            "Optional working directory. Defaults to "
-                            "the project directory."
                         ),
                     },
                 },
@@ -99,7 +67,7 @@ TOOLS = [
                 "the current output changes your next action. Use task_wait "
                 "normally for notify_on_complete=false tasks. "
                 "Use task_start for long-running work whose completion matters. "
-                "Same dangerous-pattern blacklist as bash."
+                "Same footgun guard as bash."
             ),
             "parameters": {
                 "type": "object",
@@ -157,8 +125,8 @@ TOOLS = [
                 "terminal_start such as ssh/tmux and then terminal_send "
                 "commands into it instead of repeatedly running ssh commands. "
                 "Do not use this for non-interactive long jobs whose completion "
-                "matters; use task_start for those. Same dangerous-pattern "
-                "blacklist as bash."
+                "matters; use task_start for those. Same footgun guard "
+                "as bash."
             ),
             "parameters": {
                 "type": "object",
@@ -323,7 +291,7 @@ TOOLS = [
                     },
                     "tail_lines": {
                         "type": "integer",
-                        "description": "How many trailing output lines to return. Default 80.",
+                        "description": "How many trailing output lines to return. Default 50.",
                     },
                     "max_output_chars": {
                         "type": "integer",
@@ -400,7 +368,7 @@ TOOLS = [
                     },
                     "tail_lines": {
                         "type": "integer",
-                        "description": "Trailing output lines to return. Default 80.",
+                        "description": "Trailing output lines to return. Default 50.",
                     },
                     "max_output_chars": {
                         "type": "integer",
@@ -457,117 +425,6 @@ TOOLS = [
                 },
                 "required": [],
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "bash_check",
-            "description": (
-                "Peek at a background job: returns current status "
-                "(running / exited <code>) and the last N lines of "
-                "merged stdout+stderr. Non-blocking — returns immediately."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "Job id from bash_start (e.g. 'bg-3').",
-                    },
-                    "tail_lines": {
-                        "type": "integer",
-                        "description": "How many trailing lines of log to return. Default 50.",
-                    },
-                    "max_output_chars": {
-                        "type": "integer",
-                        "description": (
-                            "Override the default 10 000-char output cap "
-                            "for the returned log tail. Hard upper bound "
-                            "is 100 000."
-                        ),
-                    },
-                },
-                "required": ["job_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "bash_wait",
-            "description": (
-                "BLOCK until a background job finishes or *timeout* "
-                "seconds elapse. Returns final status + log tail. Use "
-                "this when you have nothing else to do but wait for a "
-                "long task to finish. Default timeout 60s; max 600s. "
-                "If the timeout fires while the job is still running, "
-                "the job KEEPS RUNNING — call bash_wait again or "
-                "bash_check to follow up."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "Job id from bash_start.",
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Max seconds to block. Default 60, max 600.",
-                    },
-                    "tail_lines": {
-                        "type": "integer",
-                        "description": "Trailing log lines to return. Default 50.",
-                    },
-                    "max_output_chars": {
-                        "type": "integer",
-                        "description": (
-                            "Override the default 10 000-char output cap "
-                            "for the returned log tail. Hard upper bound "
-                            "is 100 000."
-                        ),
-                    },
-                },
-                "required": ["job_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "bash_kill",
-            "description": (
-                "Terminate a running background job. Sends SIGTERM by "
-                "default (graceful); set force=true to send SIGKILL. "
-                "No-op if the job has already exited."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "Job id from bash_start.",
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "description": "Send SIGKILL instead of SIGTERM. Default false.",
-                    },
-                },
-                "required": ["job_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "bash_list",
-            "description": (
-                "List all known background jobs (running and recently "
-                "finished) with id, command, status, runtime, and log "
-                "path. Finished jobs are kept around for 5 minutes."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -791,7 +648,10 @@ TOOLS = [
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Line number to start reading from (0-indexed). Default 0.",
+                        "description": (
+                            "Line number to start reading from (1-indexed, "
+                            "matching edit_lines). Default 1 (first line)."
+                        ),
                     },
                     "limit": {
                         "type": "integer",
@@ -1192,11 +1052,11 @@ TOOLS = [
                         "type": "string",
                         "description": "Absolute http(s) URL to fetch.",
                     },
-                    "max_chars": {
+                    "max_output_chars": {
                         "type": "integer",
                         "description": (
                             "Override the 10 000-char output cap. "
-                            "Hard upper bound is 50 000."
+                            "Hard upper bound is 50 000. (Alias: max_chars.)"
                         ),
                     },
                 },
@@ -1356,7 +1216,7 @@ TOOLS = [
             "name": "end_agent",
             "description": (
                 "Release a subagent session: cancel any in-flight "
-                "round, kill its background bash jobs, drop its "
+                "round, kill its background tasks and terminals, drop its "
                 "conversation. Call this as soon as you no longer need "
                 "the session, to free a slot and stop the idle timer."
             ),

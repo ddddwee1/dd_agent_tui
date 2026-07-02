@@ -29,7 +29,6 @@ from .providers import ProviderConfigError, build_provider
 from .runtime_state import new_session_id
 from .state import TokenCounter, ToolContext
 from .widgets import (
-    BgJobsBlock,
     CheckpointBlock,
     CollapsedHistoryMarker,
     MultilineInput,
@@ -139,8 +138,8 @@ class AgentApp(
         # can switch without restarting.
         self.model = self.provider.default_model
         self.effort = self.provider.default_effort
-        # Per-conversation runtime state: work_dir + bash job table +
-        # id allocator. Threaded explicitly through every execute_tool
+        # Per-conversation runtime state: work_dir + task/terminal tables
+        # + id allocators. Threaded explicitly through every execute_tool
         # call so a future subagent can be handed its own ctx.
         self._session_id = new_session_id()
         self.ctx = ToolContext(
@@ -191,9 +190,6 @@ class AgentApp(
         # /clear; restored on /resume replay from the latest
         # checkpoint_tool call.
         self._checkpoint_block: CheckpointBlock | None = None
-        # Single BgJobsBlock that mirrors ctx.bash_jobs into the sidebar.
-        # Driven by a 1-second timer started in on_mount.
-        self._bg_jobs_block: BgJobsBlock | None = None
         # Single TasksBlock that mirrors ctx.tasks into the sidebar.
         self._tasks_block: TasksBlock | None = None
         # Live subagent sessions, keyed by id. spawn_agent inserts one;

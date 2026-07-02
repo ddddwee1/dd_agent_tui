@@ -18,7 +18,6 @@ from .config import (
 from .state import (
     SubagentSession,
     ToolContext,
-    kill_all_bash_jobs,
     kill_all_tasks,
     kill_all_terminals,
 )
@@ -333,8 +332,8 @@ class AppSubagentMixin:
         as a background task. Returns immediately with the assigned
         session_id; the parent calls `await_agent` to fetch the answer.
 
-        Each session gets its own ToolContext (independent bash job
-        table) but inherits the parent's work_dir, OpenAI client, and
+        Each session gets its own ToolContext (independent task/terminal
+        tables) but inherits the parent's work_dir, OpenAI client, and
         model / effort settings. Token usage rolls up into the parent
         counter; the cap is MAX_LIVE_SUBAGENTS so a runaway parent
         can't fork unbounded sessions.
@@ -552,7 +551,7 @@ class AppSubagentMixin:
 
     def _end_subagent(self, sid: str) -> str:
         """Tear down a session: cancel any in-flight round, kill its
-        bash jobs, drop it from the live registry. Idempotent (returns
+        tasks/terminals, drop it from the live registry. Idempotent (returns
         an Error string if the id is unknown — easier for the model to
         spot than a silent no-op)."""
         sess = self._live_subagents.pop(sid, None)
@@ -563,7 +562,6 @@ class AppSubagentMixin:
             )
         if sess.task is not None and not sess.task.done():
             sess.task.cancel()
-        kill_all_bash_jobs(sess.ctx.bash_jobs)
         kill_all_terminals(sess.ctx.terminals)
         kill_all_tasks(sess.ctx.tasks)
         self.call_later(self._remove_sub_tab, sid)

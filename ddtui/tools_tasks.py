@@ -44,6 +44,7 @@ from .tool_utils import (
     _safe_path,
     _sandbox_error,
     _truncate_output,
+    ensure_private_dir,
 )
 
 
@@ -283,7 +284,7 @@ def _completion_event(task: AsyncTask) -> str:
     else:
         tail = "(no output)"
     return (
-        "[异步任务完成]\n"
+        "[Async task complete]\n"
         f"task_id: {task.id}\n"
         f"name: {task.name}\n"
         f"status: {status}\n"
@@ -355,7 +356,7 @@ def tool_task_start(
         task_name = task_id
     task_name = task_name[:80]
 
-    TASK_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(TASK_OUTPUT_DIR)
     file_token = f"{task_id}-{os.getpid()}-{int(time.time() * 1000)}"
     output_path = TASK_OUTPUT_DIR / f"ddtui-{file_token}.out"
     status_path = TASK_OUTPUT_DIR / f"ddtui-{file_token}.status.json"

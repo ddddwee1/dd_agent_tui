@@ -17,14 +17,12 @@ from .config import (
 from .runtime_state import new_session_id
 from .state import (
     SubagentSession,
-    kill_all_bash_jobs,
     kill_all_tasks,
     kill_all_terminals,
 )
 from .tools_tasks import collect_task_completion_events
 from .tools_terminal import drain_terminal_output
 from .widgets import (
-    BgJobsBlock,
     CheckpointBlock,
     CollapsedHistoryMarker,
     EditPendingScreen,
@@ -63,10 +61,6 @@ class AppUiMixin:
         # busy. ~80ms per frame; the bar has 12 frames so a full bounce
         # is ~1s.
         self.set_interval(0.08, self._tick_progress_bar)
-        # Mirror ctx.bash_jobs into the sidebar once a second. Cheap —
-        # just iterates the dict (≤ ~10 entries) and re-renders one
-        # widget.
-        self.set_interval(1.0, self._refresh_bg_panel)
         # Managed async task monitor. Completion notification delivery
         # is handled separately below; this is only the visual sidebar.
         self.set_interval(1.0, self._refresh_task_panel)
@@ -138,55 +132,6 @@ class AppUiMixin:
             queued=len(self._queued),
             steer=len(self._steer),
         )
-
-    def _refresh_bg_panel(self) -> None:
-        """Mirror ctx.bash_jobs into the sidebar widget. Called once
-        per second from on_mount's set_interval. Panel visibility is
-        gated on the presence of running jobs — finished jobs stay in
-        the dict for bash_check/bash_list to find, but they don't keep
-        the panel pinned in the sidebar."""
-        jobs = list(self.ctx.bash_jobs.values())
-        running = [j for j in jobs if j.proc.poll() is None]
-        try:
-            sidebar = self.query_one("#sidebar", Vertical)
-        except Exception:
-            return
-        if not running:
-            # Nothing in flight → drop the panel, then let the shared
-            # visibility helper account for todo/checkpoint/subagents.
-            if (
-                self._bg_jobs_block is not None
-                and self._bg_jobs_block.is_mounted
-            ):
-                self._bg_jobs_block.remove()
-            self._bg_jobs_block = None
-            self._refresh_sidebar_visibility()
-            return
-        if (
-            self._bg_jobs_block is None
-            or not self._bg_jobs_block.is_mounted
-        ):
-            self._bg_jobs_block = BgJobsBlock()
-            self.call_later(self._mount_bg_block)
-            return
-        # Render the running jobs plus any siblings that finished while
-        # this batch was in flight, so the user sees "3 of 5 done" in
-        # context. Once the *last* runner exits we'll unmount on the
-        # next tick.
-        self._bg_jobs_block.render_jobs(jobs)
-        sidebar.add_class("visible")
-
-    async def _mount_bg_block(self) -> None:
-        try:
-            sidebar = self.query_one("#sidebar", Vertical)
-        except Exception:
-            return
-        if self._bg_jobs_block is None:
-            return
-        if not self._bg_jobs_block.is_mounted:
-            await sidebar.mount(self._bg_jobs_block)
-        sidebar.add_class("visible")
-        self._bg_jobs_block.render_jobs(list(self.ctx.bash_jobs.values()))
 
     def _refresh_task_panel(self) -> None:
         """Mirror ctx.tasks into the sidebar widget.
@@ -440,8 +385,8 @@ class AppUiMixin:
         SUBAGENT_IDLE_TIMEOUT_SEC. Quiescent means phase ∈ {idle,
         ready, error} (i.e. no task in flight) and last_active_at
         hasn't been bumped recently. Reaping cancels any leftover
-        task and kills bash jobs so a forgotten subagent doesn't pin
-        background processes or context indefinitely. Sessions still
+        task and kills its tasks/terminals so a forgotten subagent
+        doesn't pin background processes or context indefinitely. Sessions still
         running (thinking/answering/tool) are never reaped — the user
         can ESC×2 / end_agent if they really want to stop them."""
         now = time.monotonic()
@@ -452,7 +397,6 @@ class AppUiMixin:
                 continue
             if sess.task is not None and not sess.task.done():
                 sess.task.cancel()
-            kill_all_bash_jobs(sess.ctx.bash_jobs)
             kill_all_terminals(sess.ctx.terminals)
             kill_all_tasks(sess.ctx.tasks)
             self._live_subagents.pop(sid, None)
@@ -503,16 +447,12 @@ class AppUiMixin:
         ):
             self._checkpoint_block.remove()
         self._checkpoint_block = None
-        # Background jobs are tied to the conversation that spawned
-        # them, so a /clear nukes them too. The helper SIGTERMs the
-        # whole process group, briefly waits, then SIGKILLs any
-        # stragglers — ~100 ms cap so /clear stays snappy.
-        kill_all_bash_jobs(self.ctx.bash_jobs)
+        # Terminals and managed tasks are tied to the conversation that
+        # spawned them, so a /clear tears them down too. The helper
+        # SIGTERMs the whole process group, briefly waits, then SIGKILLs
+        # any stragglers — ~100 ms cap so /clear stays snappy.
         kill_all_terminals(self.ctx.terminals)
         kill_all_tasks(self.ctx.tasks)
-        if self._bg_jobs_block is not None and self._bg_jobs_block.is_mounted:
-            self._bg_jobs_block.remove()
-        self._bg_jobs_block = None
         for tid in list(self._terminal_panes.keys()):
             self.call_later(self._remove_terminal_tab, tid)
         self._terminal_panes.clear()
@@ -520,13 +460,12 @@ class AppUiMixin:
             self._tasks_block.remove()
         self._tasks_block = None
         # Live subagent sessions: cancel any in-flight task, kill each
-        # one's bash jobs, drop them. Tied to the parent conversation,
+        # one's tasks/terminals, drop them. Tied to the parent conversation,
         # so /clear releases all. Tab removal scheduled for each id.
         sub_ids_to_drop = list(self._live_subagents.keys())
         for sess in list(self._live_subagents.values()):
             if sess.task is not None and not sess.task.done():
                 sess.task.cancel()
-            kill_all_bash_jobs(sess.ctx.bash_jobs)
             kill_all_terminals(sess.ctx.terminals)
             kill_all_tasks(sess.ctx.tasks)
         self._live_subagents.clear()

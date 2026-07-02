@@ -13,6 +13,20 @@ from .config import DANGEROUS_SHELL_PATTERNS
 _BASH_HARD_CHAR_CAP = 100_000
 
 
+def ensure_private_dir(path: Path) -> Path:
+    """Create *path* (and parents) and restrict it to the owner (0o700).
+
+    Used for the runtime log dir that holds task/terminal command output,
+    which can be sensitive and must not be world-readable the way /tmp is.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
 def _safe_path(work_dir: str, raw: str) -> Path:
     """Resolve a user-supplied path relative to *work_dir*.
 
