@@ -920,7 +920,9 @@ TOOLS = [
                 "Search for a regex pattern in files under a path. "
                 "Returns matching lines with file:line:content. "
                 "Supports file_filter glob (e.g. '*.py') and case-insensitive "
-                "matching by default. Results are truncated at 500 matches."
+                "matching by default. Results are truncated at 500 matches. "
+                "Fast (ripgrep-backed) and .gitignore-aware when rg is "
+                "installed."
             ),
             "parameters": {
                 "type": "object",
