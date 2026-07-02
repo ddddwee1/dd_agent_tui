@@ -556,6 +556,8 @@ sudo 等）不再拦截。当前只拒绝：
 基础校验：
 
 ```bash
+pip install -e '.[dev]'
+python -m pytest tests/ -q     # 回归测试（glob 语义、编辑守卫、engine、端到端等）
 python -m compileall ddtui agent.py
 ```
 

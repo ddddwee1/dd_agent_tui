@@ -36,6 +36,9 @@ remote = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
 ]
+dev = [
+    "pytest>=8",
+]
 
 [project.urls]
 Homepage = "https://github.com/ddddwee1/dd_agent_tui"
