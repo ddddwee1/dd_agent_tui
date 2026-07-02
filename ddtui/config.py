@@ -89,20 +89,29 @@ WEB_SEARCH_MAX_COUNT = 20         # Brave per-request cap
 WEB_SEARCH_TIMEOUT = 15
 WEB_SEARCH_SNIPPET_MAX_CHARS = 240  # truncate per-result description
 
+# Runtime log dir for task + terminal output/status files. Kept in the
+# per-user ~/.ddtui tree rather than world-readable /tmp — command output
+# can be sensitive — and created with 0o700 (see tool_utils.ensure_private_dir).
+# Override with DDTUI_LOG_DIR.
+LOG_DIR = Path(
+    os.environ.get(
+        "DDTUI_LOG_DIR", str(Path.home() / ".ddtui" / "runtime" / "logs")
+    )
+)
+
 # Interactive PTY terminals. These are for persistent ssh/tmux/repl
 # style sessions, not for managed completion notifications.
-TERMINAL_OUTPUT_DIR = Path("/tmp")
+TERMINAL_OUTPUT_DIR = LOG_DIR
 TERMINAL_MAX_CONCURRENT = 4
 TERMINAL_DEFAULT_READ_CHARS = 12_000
 TERMINAL_MAX_READ_CHARS = 100_000
 TERMINAL_TAIL_CHARS = 80_000
 
 # Managed async tasks — the single background/async command mechanism
-# (foreground one-shots go through `bash`). Task output/status files are
-# intentionally under /tmp: they are runtime artifacts, not repo state,
-# and are retained a while because a completion notification may arrive
-# after the agent has moved on.
-TASK_OUTPUT_DIR = Path("/tmp")
+# (foreground one-shots go through `bash`). Output/status files live in
+# LOG_DIR (runtime artifacts, not repo state) and are retained a while
+# because a completion notification may arrive after the agent moved on.
+TASK_OUTPUT_DIR = LOG_DIR
 TASK_MAX_CONCURRENT = 10
 TASK_RETENTION_SECONDS = 3600
 TASK_DEFAULT_TAIL_LINES = 50

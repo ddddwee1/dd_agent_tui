@@ -351,7 +351,7 @@ ssh -tt host 'tmux new -A -s ddtui-agent'
 
 命令执行只有两种形态：同步快命令用 `bash`（前台跑完直接返回，≤120s）；需要放后台或耗时较长（测试、构建、下载、训练、profile 等完成状态很重要的工作）一律用 `task_start`。是否收完成通知由 `notify_on_complete` 决定——`true`（默认）在结束时推送异步通知，`false` 则是纯后台、由你自己 `task_check` / `task_wait`。
 
-`task_start` 会返回 `task_id`、`output_path` 和 `status_path`。agent 可以用 `task_check` 看 tail、用 `task_read` 按 offset 增量读输出，但它们只用于一次性检查当前输出是否会改变下一步行动。默认 `notify_on_complete=true`，任务完成后会向 agent 发送异步完成通知。严格规则：agent 可以在等待期间继续做别的事；做完其他事后不要调用 `task_wait`，也不要用反复 `task_check` / `task_read` 轮询来替代等待，而是记录 checkpoint（如有帮助）并暂停当前回复，等待通知自动唤醒。`task_wait` 正常用于 `notify_on_complete=false` 的任务；对 `notify_on_complete=true` 只应在用户明确要求阻塞，或任务明显快结束且只做一次短暂有界等待时使用。
+`task_start` 会返回 `task_id`、`output_path` 和 `status_path`。任务与 terminal 的输出/状态文件写在 `~/.ddtui/runtime/logs/`（目录 `chmod 700`，不再放世界可读的 `/tmp`；可用 `DDTUI_LOG_DIR` 覆盖）。agent 可以用 `task_check` 看 tail、用 `task_read` 按 offset 增量读输出，但它们只用于一次性检查当前输出是否会改变下一步行动。默认 `notify_on_complete=true`，任务完成后会向 agent 发送异步完成通知。严格规则：agent 可以在等待期间继续做别的事；做完其他事后不要调用 `task_wait`，也不要用反复 `task_check` / `task_read` 轮询来替代等待，而是记录 checkpoint（如有帮助）并暂停当前回复，等待通知自动唤醒。`task_wait` 正常用于 `notify_on_complete=false` 的任务；对 `notify_on_complete=true` 只应在用户明确要求阻塞，或任务明显快结束且只做一次短暂有界等待时使用。
 
 ### 会话 checkpoint
 

@@ -22,7 +22,12 @@ from .config import (
     TERMINAL_TAIL_CHARS,
 )
 from .state import TerminalSession, ToolContext
-from .tool_utils import _check_dangerous, _safe_path, _sandbox_error
+from .tool_utils import (
+    _check_dangerous,
+    _safe_path,
+    _sandbox_error,
+    ensure_private_dir,
+)
 
 
 def _clamp_int(value, default: int, low: int, high: int) -> int:
@@ -135,7 +140,7 @@ def tool_terminal_start(
     term_id = ctx.alloc_terminal_id()
     term_name = (name or _short(command)).strip() or term_id
     term_name = term_name[:80]
-    TERMINAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(TERMINAL_OUTPUT_DIR)
     token = f"{term_id}-{os.getpid()}-{int(time.time() * 1000)}"
     log_path = TERMINAL_OUTPUT_DIR / f"ddtui-{token}.terminal.log"
 
