@@ -183,7 +183,7 @@ REMOTE_ALLOW_TERMINAL_SEND = _env_flag(
 # Status-bar context-usage gradient fallback: dark green → dark amber →
 # dark red. DeepSeek keeps the original fixed baseline; Codex providers
 # override this with the server-returned model catalog window when present.
-CTX_SAFE_LIMIT = 512_000
+CTX_SAFE_LIMIT = 700_000
 DEEPSEEK_CONTEXT_LIMIT = CTX_SAFE_LIMIT
 
 
