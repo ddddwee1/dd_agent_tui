@@ -141,6 +141,7 @@ class AppUiMixin:
             busy=True,
             queued=len(self._queued),
             steer=len(self._steer),
+            explore=self._active_explore is not None,
         )
 
     def _refresh_task_panel(self) -> None:
@@ -985,6 +986,7 @@ class AppUiMixin:
             busy=self._busy,
             queued=len(self._queued),
             steer=len(self._steer),
+            explore=self._active_explore is not None,
         )
         try:
             self._remote_emit_status("status")

@@ -136,6 +136,18 @@ def test_explore_end_archives_raw_span(tmp_path, monkeypatch):
     assert payload["raw_messages"][0]["tool_calls"][0]["id"] == "call_probe"
 
 
+def test_status_bar_shows_explore_flag(tmp_path):
+    from ddtui.state import TokenCounter
+    from ddtui.widgets import StatusBar
+
+    bar = StatusBar(str(tmp_path))
+    counter = TokenCounter()
+    bar.render_status(counter, explore=True)
+    assert "explore: on" in str(getattr(bar, "_Static__content", ""))
+    bar.render_status(counter, explore=False)
+    assert "explore: on" not in str(getattr(bar, "_Static__content", ""))
+
+
 def test_explore_cancel_keeps_history(tmp_path, monkeypatch):
     monkeypatch.setattr(ax, "EXPLORE_ARCHIVE_DIR", tmp_path)
     app = FakeApp()

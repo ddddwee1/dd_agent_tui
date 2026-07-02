@@ -1666,6 +1666,7 @@ class StatusBar(Static):
         busy: bool = False,
         queued: int = 0,
         steer: int = 0,
+        explore: bool = False,
     ) -> None:
         location = self._location()
         # Drive the background gradient off last-call tokens (what
@@ -1693,6 +1694,8 @@ class StatusBar(Static):
                 context_text = f"Context {last_total:,}"
             body = f"{location} · {context_text} · {counter.turns} 轮"
 
+        if explore:
+            body += " · 🔍 explore: on"
         if queued:
             body += f" · 📋 排队 {queued}"
         if steer:
