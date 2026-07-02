@@ -233,6 +233,10 @@ class AppAgentLoopMixin:
                     return
                 if not self._queued:
                     self._clear_turn_journal()
+                    # Quiet boundary: turn done, queue drained, busy
+                    # still held — the only safe moment to auto-compact
+                    # without racing user input.
+                    await self._auto_compact_if_needed()
                     return
                 self._clear_turn_journal()
                 pending, parked = self._queued.pop(0)

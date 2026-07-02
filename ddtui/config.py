@@ -187,6 +187,25 @@ CTX_SAFE_LIMIT = 512_000
 DEEPSEEK_CONTEXT_LIMIT = CTX_SAFE_LIMIT
 
 
+# ───────── auto compact ─────────
+
+# When a turn ends (queue drained, no error) and the last request's
+# prompt tokens exceeded this fraction of the model's context window,
+# history is compacted automatically with the same summarizer as
+# /compact. The check runs inside the turn worker (busy still held), so
+# it never races user input. Set DDTUI_AUTO_COMPACT_THRESHOLD=0 to
+# disable, or any fraction in (0, 0.95].
+_raw_auto_compact = os.environ.get("DDTUI_AUTO_COMPACT_THRESHOLD", "").strip()
+try:
+    AUTO_COMPACT_THRESHOLD = (
+        min(0.95, max(0.0, float(_raw_auto_compact)))
+        if _raw_auto_compact
+        else 0.75
+    )
+except ValueError:
+    AUTO_COMPACT_THRESHOLD = 0.75
+
+
 # ───────── /compact ─────────
 
 # How much of each tool result to keep when rendering history for the

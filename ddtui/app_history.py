@@ -14,6 +14,7 @@ from textual.widgets import Static
 
 from .app_support import _render_history_for_summary
 from .config import (
+    AUTO_COMPACT_THRESHOLD,
     COMPACT_KEEP_RECENT_TURNS,
     HISTORY_DIR,
     MAX_LIVE_SUBAGENTS,
@@ -400,6 +401,63 @@ class AppHistoryMixin:
         finally:
             self._set_busy(False)
             self._refresh_status()
+
+    async def _auto_compact_if_needed(self) -> None:
+        """Opportunistic compaction at quiet turn boundaries.
+
+        Called by `_agent_turn` right before its normal return — the
+        worker still holds busy, so user input queues instead of racing
+        the history swap. `counter.last_prompt` is the previous
+        request's measured prompt size; after a compaction the next
+        turn's request re-measures against the shrunken history, so
+        pressure drops well below the threshold and this cannot
+        re-trigger in a loop. Failures are cosmetic: the original
+        history is left untouched and the conversation continues.
+        """
+        if AUTO_COMPACT_THRESHOLD <= 0:
+            return
+        limit = self._context_limit()
+        if not limit or not self.counter.last_prompt:
+            return
+        pressure = self.counter.last_prompt / limit
+        if pressure < AUTO_COMPACT_THRESHOLD:
+            return
+        if self._active_explore is not None:
+            # An open explore span pins message indices — same reason
+            # /compact refuses; try again after explore_end/cancel.
+            return
+        user_count = sum(1 for m in self.messages if m.get("role") == "user")
+        if user_count <= COMPACT_KEEP_RECENT_TURNS:
+            return
+
+        await self._mount_widget(
+            Static(Text(
+                f"📦 上下文压力 {pressure:.0%} ≥ "
+                f"{AUTO_COMPACT_THRESHOLD:.0%}，自动压缩历史…",
+                style="bold #66d9ef",
+            ))
+        )
+        try:
+            new_messages, stats = await self._compact_messages(self.messages)
+        except Exception as e:
+            await self._mount_widget(
+                Static(Text(
+                    f"自动压缩失败（对话不受影响，可稍后手动 /compact）：{e}",
+                    style="dim",
+                ))
+            )
+            return
+        self.messages = new_messages
+        await self._autosave_conversation()
+        await self._mount_widget(
+            Static(Text(
+                f"📦 已自动压缩：{stats['before_n']} → "
+                f"{stats['after_n']} 条消息，约 -{stats['saved']:,} 字符"
+                f"（保留最近 {COMPACT_KEEP_RECENT_TURNS} 轮原文；"
+                "阈值可用 DDTUI_AUTO_COMPACT_THRESHOLD 调整，0 关闭）",
+                style="bold #66d9ef",
+            ))
+        )
 
     async def _save_conversation(self, raw_name: str) -> None:
         """Dump self.messages (plus a small metadata header) to
