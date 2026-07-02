@@ -323,11 +323,12 @@ class AppExploreMixin:
 
         before_chars = _message_chars(raw_messages)
         after_chars = len(summary_content)
-        self.messages = (
-            self.messages[:start_index]
-            + [summary_message]
-            + self.messages[end_index:]
-        )
+        # In-place slice assignment: the running TurnEngine holds a
+        # reference to this exact list, so rebinding self.messages here
+        # would strand the engine's subsequent appends (the explore_end
+        # tool response included) on the stale list, leaving an orphan
+        # assistant(tool_calls) in history and a 400 on the next request.
+        self.messages[start_index:end_index] = [summary_message]
         self._active_explore = None
 
         await self._mount_widget(ExploreSummaryBlock(summary_message))
