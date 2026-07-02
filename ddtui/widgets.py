@@ -3,7 +3,7 @@
 Pure presentation layer — every class here only depends on textual /
 rich, plus type / data classes from `ddtui.state`. They never reach
 into `ddtui.tools` or `ddtui.app`. State is pushed in via constructor
-arguments or method calls (e.g. `BgJobsBlock.render_jobs(jobs)`,
+arguments or method calls (e.g. `TasksBlock.render_tasks(tasks)`,
 `StatusBar.render_status(counter, ...)`).
 """
 
@@ -26,11 +26,9 @@ from textual.widgets import Button, Collapsible, DataTable, Static, TextArea
 
 from .state import (
     AsyncTask,
-    BgJob,
     SubagentSession,
     TokenCounter,
     async_task_status,
-    bg_job_status,
 )
 
 
@@ -1189,52 +1187,6 @@ class SubagentTabPane(VerticalScroll):
                 # standalone fallback rather than dropping the data.
                 self.mount(Static(Text(f"[orphan tool result] {content}")))
             return
-
-
-class BgJobsBlock(Static):
-    """Sidebar widget showing live & recently-finished background bash
-    jobs. Re-rendered on a 1-second timer driven by the App."""
-
-    DEFAULT_CSS = """
-    BgJobsBlock {
-        margin: 1 0;
-        padding: 0 1;
-        border: round #66d9ef;
-    }
-    """
-
-    def render_jobs(self, jobs: list[BgJob]) -> None:
-        t = Text()
-        t.append("Background  ", style="bold #66d9ef")
-        n_run = sum(1 for j in jobs if j.proc.poll() is None)
-        n_done = len(jobs) - n_run
-        t.append(f"({n_run} 跑 · {n_done} 完)", style="dim")
-        if not jobs:
-            t.append("\n  (empty)", style="dim italic")
-            self._update_live_text(t)
-            return
-        for j in jobs:
-            status, rc, elapsed = bg_job_status(j)
-            cmd = j.command if len(j.command) <= 26 else j.command[:23] + "…"
-            t.append("\n  ")
-            if status == "running":
-                t.append("▶ ", style="bold #66d9ef")
-                t.append(f"{j.id}", style="bold #66d9ef")
-            elif rc == 0:
-                t.append("✓ ", style="bold #a6e22e")
-                t.append(f"{j.id}", style="#a6e22e")
-            else:
-                t.append("✗ ", style="bold #f92672")
-                t.append(f"{j.id}", style="#f92672")
-            t.append(f"  {elapsed:5.1f}s ", style="dim")
-            t.append(cmd)
-        self._update_live_text(t)
-
-    def _update_live_text(self, text: Text) -> None:
-        line_count = text.plain.count("\n") + 1
-        layout = line_count != getattr(self, "_last_line_count", None)
-        self._last_line_count = line_count
-        self.update(text, layout=layout)
 
 
 class TasksBlock(Static):

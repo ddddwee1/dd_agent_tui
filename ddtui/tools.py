@@ -17,14 +17,7 @@ from __future__ import annotations
 
 from .state import ToolContext
 from .tool_schemas import TOOLS
-from .tools_bash import (
-    tool_bash,
-    tool_bash_check,
-    tool_bash_kill,
-    tool_bash_list,
-    tool_bash_start,
-    tool_bash_wait,
-)
+from .tools_bash import tool_bash
 from .tools_checkpoint import (
     tool_checkpoint_clear,
     tool_checkpoint_get,
@@ -72,11 +65,6 @@ __all__ = ["TOOLS", "TOOL_FUNCS", "execute_tool"]
 
 TOOL_FUNCS = {
     "bash": tool_bash,
-    "bash_start": tool_bash_start,
-    "bash_check": tool_bash_check,
-    "bash_wait": tool_bash_wait,
-    "bash_kill": tool_bash_kill,
-    "bash_list": tool_bash_list,
     "checkpoint_tool": tool_checkpoint_tool,
     "checkpoint_get": tool_checkpoint_get,
     "checkpoint_clear": tool_checkpoint_clear,
