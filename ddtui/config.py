@@ -200,10 +200,10 @@ try:
     AUTO_COMPACT_THRESHOLD = (
         min(0.95, max(0.0, float(_raw_auto_compact)))
         if _raw_auto_compact
-        else 0.75
+        else 0.95
     )
 except ValueError:
-    AUTO_COMPACT_THRESHOLD = 0.75
+    AUTO_COMPACT_THRESHOLD = 0.95
 
 
 # ───────── /compact ─────────

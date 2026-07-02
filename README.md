@@ -535,7 +535,7 @@ sudo 等）不再拦截。当前只拒绝：
 
 `/compact` 会把较早历史压缩成一个摘要 system message，保留最近两轮原文，适合长对话里降低上下文压力。
 
-上下文压力还有自动兜底：某个回合结束时，如果最近一次请求的 prompt tokens 超过了模型上下文窗口的 75%，会自动执行同样的压缩并在对话里提示。阈值用 `DDTUI_AUTO_COMPACT_THRESHOLD` 调整（0 到 0.95 之间的小数），设为 `0` 关闭。自动压缩只发生在回合完全结束、无排队消息的安静时刻；explore 进行中会跳过。压缩失败不影响对话，可稍后手动 `/compact`。
+上下文压力还有自动兜底：某个回合结束时，如果最近一次请求的 prompt tokens 超过了模型上下文窗口的 95%，会自动执行同样的压缩并在对话里提示。阈值用 `DDTUI_AUTO_COMPACT_THRESHOLD` 调整（0 到 0.95 之间的小数），设为 `0` 关闭。自动压缩只发生在回合完全结束、无排队消息的安静时刻；explore 进行中会跳过。压缩失败不影响对话，可稍后手动 `/compact`。
 
 `explore_start` / `explore_end` 让 agent 把一段临时探索从主上下文里收束掉：适合单点功能探针、bug 定位、假设验证、代码考古、方案侦察、低密度资料搜索、环境检查、性能/数值实验、测试面发现、数据样本检查、日志聚类和风险预检。`explore_end` 会把 raw 过程归档到 `~/.ddtui/explorations/<session_id>/<explore_id>.json`，并在对话里留下一个探索摘要 system message；`explore_cancel` 则取消边界，不压缩历史。
 

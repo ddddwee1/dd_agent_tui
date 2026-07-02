@@ -10,6 +10,13 @@ from ddtui.config import COMPACT_KEEP_RECENT_TURNS
 from ddtui.state import TokenCounter
 
 
+@pytest.fixture(autouse=True)
+def _pin_threshold(monkeypatch):
+    # Scenarios below assert against a fixed 75% threshold so changing
+    # the shipped default doesn't silently change what they test.
+    monkeypatch.setattr(ah, "AUTO_COMPACT_THRESHOLD", 0.75)
+
+
 def _messages(n_user=5):
     msgs = [{"role": "system", "content": "sys"}]
     for i in range(n_user):
