@@ -10,10 +10,15 @@ from .tool_utils import _safe_path, _sandbox_error, _unified_diff
 def tool_read_file(
     ctx: ToolContext,
     path: str,
-    offset: int = 0,
+    offset: int = 1,
     limit: int = READ_FILE_MAX_LINES,
 ) -> str:
-    """Read a file with optional pagination."""
+    """Read a file with optional pagination.
+
+    Line numbers are 1-indexed to match edit_lines: offset=1 is the first
+    line, and the reported range uses the same base as edit_lines'
+    start_line/end_line.
+    """
     p = _safe_path(ctx.work_dir, path)
     try:
         text = p.read_text()
@@ -26,14 +31,15 @@ def tool_read_file(
 
     lines = text.splitlines()
     total = len(lines)
-    if offset < 0:
-        offset = 0
-    if offset >= total:
-        return f"File has {total} lines; offset {offset} is out of range."
+    if offset < 1:
+        offset = 1
+    if offset > total:
+        return f"File has {total} line(s); offset {offset} (1-indexed) is out of range."
     if limit <= 0:
         limit = READ_FILE_MAX_LINES
 
-    chunk = lines[offset : offset + limit]
+    start = offset - 1
+    chunk = lines[start : start + limit]
     header = f"[{p}] lines {offset}-{offset + len(chunk) - 1} of {total}"
     return header + "\n" + "\n".join(chunk)
 
@@ -100,7 +106,9 @@ def tool_edit_file(
         if idx == -1:
             break
         positions.append(idx)
-        start = idx + 1  # allow overlapping; unlikely for practical uses
+        # Non-overlapping, so the match count here agrees with
+        # str.count()/str.replace() used elsewhere (multi_edit).
+        start = idx + len(old_string)
 
     if not positions:
         return f"Error: old_string not found in {p}"
@@ -295,7 +303,9 @@ def _replace_nth(buffer: str, old: str, new: str, n: int) -> tuple[str, int]:
         if idx == -1:
             break
         positions.append(idx)
-        start = idx + 1
+        # Non-overlapping to match buffer.count(old), which callers use
+        # to validate the occurrence index against.
+        start = idx + len(old)
     if n < 1 or n > len(positions):
         return buffer, len(positions)
     idx = positions[n - 1]

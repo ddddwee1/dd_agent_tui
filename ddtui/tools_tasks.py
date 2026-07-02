@@ -283,7 +283,7 @@ def _completion_event(task: AsyncTask) -> str:
     else:
         tail = "(no output)"
     return (
-        "[异步任务完成]\n"
+        "[Async task complete]\n"
         f"task_id: {task.id}\n"
         f"name: {task.name}\n"
         f"status: {status}\n"

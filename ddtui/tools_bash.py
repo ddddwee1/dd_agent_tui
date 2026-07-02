@@ -67,19 +67,9 @@ def tool_bash(
 
     parts = []
     if result.stdout:
-        out = result.stdout
-        if len(out) > cap:
-            out = out[:cap] + (
-                f"\n…[+{len(result.stdout) - cap} chars]"
-            )
-        parts.append(f"STDOUT:\n{out}")
+        parts.append(f"STDOUT:\n{_truncate_output(result.stdout, cap)}")
     if result.stderr:
-        err_out = result.stderr
-        if len(err_out) > cap:
-            err_out = err_out[:cap] + (
-                f"\n…[+{len(result.stderr) - cap} chars]"
-            )
-        parts.append(f"STDERR:\n{err_out}")
+        parts.append(f"STDERR:\n{_truncate_output(result.stderr, cap)}")
     parts.append(f"Exit code: {result.returncode}")
     return "\n".join(parts)
 

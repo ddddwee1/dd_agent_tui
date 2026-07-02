@@ -95,20 +95,29 @@ _BINARY_CTYPE_PREFIXES = (
 
 
 def tool_web_fetch(
-    ctx: ToolContext, url: str, max_chars: int | None = None
+    ctx: ToolContext,
+    url: str,
+    max_output_chars: int | None = None,
+    max_chars: int | None = None,
 ) -> str:
     """Fetch an http(s) URL and return its body as text.
 
     HTML is stripped to plain text; other text-like content types are
     returned verbatim. Binary types are refused. Size is capped both at
     the byte level (raw download) and the char level (returned string).
+
+    The truncation cap is `max_output_chars`, matching the bash/task
+    tools. `max_chars` is accepted as a backward-compatible alias.
     """
+    # Canonical param is max_output_chars (consistent with bash/task_*);
+    # max_chars kept as an alias so older callers keep working.
+    cap_arg = max_output_chars if max_output_chars is not None else max_chars
     cap = WEB_FETCH_MAX_CHARS
-    if max_chars is not None:
+    if cap_arg is not None:
         try:
-            cap = max(1, min(WEB_FETCH_HARD_CHAR_CAP, int(max_chars)))
+            cap = max(1, min(WEB_FETCH_HARD_CHAR_CAP, int(cap_arg)))
         except (TypeError, ValueError):
-            return f"Error: max_chars must be an integer, got {max_chars!r}"
+            return f"Error: max_output_chars must be an integer, got {cap_arg!r}"
 
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:

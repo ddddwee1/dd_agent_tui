@@ -791,7 +791,10 @@ TOOLS = [
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Line number to start reading from (0-indexed). Default 0.",
+                        "description": (
+                            "Line number to start reading from (1-indexed, "
+                            "matching edit_lines). Default 1 (first line)."
+                        ),
                     },
                     "limit": {
                         "type": "integer",
@@ -1192,11 +1195,11 @@ TOOLS = [
                         "type": "string",
                         "description": "Absolute http(s) URL to fetch.",
                     },
-                    "max_chars": {
+                    "max_output_chars": {
                         "type": "integer",
                         "description": (
                             "Override the 10 000-char output cap. "
-                            "Hard upper bound is 50 000."
+                            "Hard upper bound is 50 000. (Alias: max_chars.)"
                         ),
                     },
                 },
