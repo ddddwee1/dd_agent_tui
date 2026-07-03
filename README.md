@@ -341,39 +341,17 @@ export DDTUI_REMOTE_ALLOW_TERMINAL_SEND=1
 
 ## 给其他大模型接入
 
-`ddtui-mcp` 是一个 MCP stdio bridge，让 Claude、Codex、其他支持 MCP 的 agent 或本地脚本通过现有 VPS relay 观察和控制活跃 ddtui session。它不直接运行新的 agent，也不绕过 ddtui 的会话状态机；所有写入都会走和远控网页一样的 `submit` / `steer` / `interrupt` 路径。
-
-先安装远控依赖：
+`ddtui-mcp` 是一个 MCP stdio bridge，让 Claude Code、Codex CLI、Claude Desktop 或任何支持 MCP 的 agent 观察并控制活跃 ddtui session。它不直接运行新的 agent，也不绕过 ddtui 的会话状态机；所有写入都走和远控网页一样的 `submit` / `steer` / `interrupt` 路径。relay 跑本机回环或 VPS 均可。
 
 ```bash
 pip install -e '.[remote]'
+ddtui-mcp --token-file ~/.ddtui/remote_token          # relay 地址可自动推导
+claude mcp add ddtui -- ddtui-mcp --token-file ~/.ddtui/remote_token
 ```
 
-然后启动 MCP server。`--relay` 指向 relay 的 control socket，token 和本地 `/remote on` 使用同一个：
+外部模型拿到 7 个工具：`ddtui_list_sessions`、`ddtui_result`（最轻量的"做完没有 + 结论"轮询）、`ddtui_observe`（默认 `detail="chat"` 只返回对话主线——reasoning 丢弃、工具往返折叠成一行占位，不会灌爆控制者的上下文）、`ddtui_submit`、`ddtui_steer`、`ddtui_interrupt`、`ddtui_terminal_read`。`terminal_send` 刻意不开放。
 
-```bash
-ddtui-mcp \
-  --relay ws://<vps-host>:10000/ws/control \
-  --token-file ~/.ddtui/remote_token
-```
-
-如果已经设置了 `DDTUI_REMOTE_URL`，或者 `~/vps_addr.txt` 可以推导出 relay 地址，也可以省略 `--relay`：
-
-```bash
-ddtui-mcp --token-file ~/.ddtui/remote_token
-```
-
-暴露给外部模型的 MCP tools：
-
-- `ddtui_list_sessions`：列出当前在线 session。
-- `ddtui_observe`：读取 session 状态、transcript tail 和最近 relay 事件。默认 `detail="chat"` 只返回对话主线——思考过程（reasoning）被丢弃、工具往返折叠成一行占位（`[tool read_file → 64,000 chars]`），每条消息按 `max_chars` 截断，长会话也不会灌爆控制者的上下文；`detail="status"` 连 transcript 都不带（顶层 `last_assistant` 字段已含最后结论）；`detail="full"` 才是原文，点名 debug 时用。
-- `ddtui_result`：最轻量的"做完没有 + 结论是什么"轮询——只返回 busy/queued 标志和最后一条 assistant 消息。等待一个 submit 的结果时优先用它而不是 observe。
-- `ddtui_submit`：发送普通下一轮输入；如果本地 session 正忙，会进入 ddtui 的 queued input。
-- `ddtui_steer`：发送忙碌中的实时插话。
-- `ddtui_interrupt`：请求中断当前回合。
-- `ddtui_terminal_read`：只读 persistent terminal 输出。
-
-MVP 默认不开放 `terminal_send`。它等价于让外部模型往交互 shell 里打字，后续会单独做 capability token 和审计日志后再考虑打开。
+完整文档（架构、快速开始、各客户端注册方式、工具参数、推荐控制循环、安全模型、故障排查）见 **[docs/mcp.md](docs/mcp.md)**。
 
 ## 工具能力
 
