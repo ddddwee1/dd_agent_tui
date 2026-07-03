@@ -218,6 +218,18 @@ class AppRemoteMixin:
             "busy": self._busy,
             "queued": len(self._queued),
             "steer": len(self._steer),
+            # Context pressure + runtime counts for the web status bar —
+            # the remote UI mirrors the TUI's "how close to the window"
+            # gauge and the sidebar's running-work overview.
+            "turns": self.counter.turns,
+            "context_used": (
+                self.counter.last_prompt + self.counter.last_completion
+            ),
+            "context_limit": self._context_limit(),
+            "tasks_running": sum(
+                1 for t in self.ctx.tasks.values() if t.proc.poll() is None
+            ),
+            "subagents": len(getattr(self, "_live_subagents", {})),
             "remote_state": self._remote_state,
             "remote_detail": self._remote_detail,
             "terminal_send_enabled": REMOTE_ALLOW_TERMINAL_SEND,

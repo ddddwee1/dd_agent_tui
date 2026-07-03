@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ddtui remote</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2218%22 fill=%22%23191a16%22/><text x=%2216%22 y=%2270%22 font-size=%2254%22 font-family=%22monospace%22 fill=%22%2366d9ef%22>❯_</text></svg>">
   <style>
     :root {
       color-scheme: dark;
@@ -165,6 +166,9 @@
     }
     .pill.online { color: var(--green); border-color: var(--green); }
     .pill.busy { color: var(--yellow); border-color: var(--yellow); }
+    .pill.ctx-ok { color: var(--green); border-color: var(--green); }
+    .pill.ctx-warn { color: var(--yellow); border-color: var(--yellow); }
+    .pill.ctx-hot { color: var(--red); border-color: var(--red); }
     .log {
       overflow: auto;
       padding: 14px;
@@ -182,7 +186,12 @@
       overflow-wrap: anywhere;
       background: var(--panel);
     }
-    .msg.user { border-color: #75715e; }
+    .msg.user {
+      border-color: #3a5f66;
+      background: #20302f;
+      margin-left: auto;
+      max-width: min(720px, 85%);
+    }
     .msg.assistant { border-color: #3f6f46; }
     .msg.tool { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     .msg.reasoning { color: var(--muted); border-style: dashed; }
@@ -293,6 +302,59 @@
       color: var(--cyan);
       text-decoration-thickness: 1px;
       text-underline-offset: 2px;
+    }
+    .typing {
+      display: flex;
+      gap: 5px;
+      padding: 10px 12px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .typing .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--cyan);
+      animation: typing-bounce 1.2s infinite ease-in-out;
+    }
+    .typing .dot:nth-child(2) { animation-delay: 0.15s; }
+    .typing .dot:nth-child(3) { animation-delay: 0.3s; }
+    @keyframes typing-bounce {
+      0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+      30% { opacity: 1; transform: translateY(-3px); }
+    }
+    .log-wrap {
+      position: relative;
+      min-height: 0;
+      display: grid;
+    }
+    .jump-bottom {
+      position: absolute;
+      right: 18px;
+      bottom: 14px;
+      z-index: 5;
+      display: none;
+      border-radius: 999px;
+      padding: 6px 14px;
+      background: #303129;
+      border: 1px solid var(--cyan);
+      color: var(--cyan);
+      font-size: 12px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+    }
+    .jump-bottom.visible { display: block; }
+    .empty-state {
+      color: var(--muted);
+      text-align: center;
+      margin-top: 18vh;
+      font-size: 13px;
+      line-height: 2;
+    }
+    .empty-state .mark {
+      font-size: 26px;
+      color: var(--cyan);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
     .composer {
       border-top: 1px solid var(--line);
@@ -559,7 +621,10 @@
       <section id="status" class="status">
         <span class="pill">disconnected</span>
       </section>
-      <section id="log" class="log"></section>
+      <section class="log-wrap">
+        <section id="log" class="log"></section>
+        <button id="jumpBottomBtn" class="jump-bottom" type="button">↓ 最新</button>
+      </section>
       <section class="composer">
         <textarea id="input" placeholder="Message this active ddtui session"></textarea>
         <div class="actions">
@@ -597,6 +662,7 @@
       interrupt: document.getElementById("interruptBtn"),
       snapshot: document.getElementById("snapshotBtn"),
       newSession: document.getElementById("newSessionBtn"),
+      jumpBottom: document.getElementById("jumpBottomBtn"),
       terminalSelect: document.getElementById("terminalSelect"),
       terminalInput: document.getElementById("terminalInput"),
       terminalRead: document.getElementById("terminalReadBtn"),
@@ -624,6 +690,16 @@
     // under a NEW session_id, so we watch sessions.list broadcasts for an
     // online id we have not seen before and auto-switch to it.
     let pendingNewSession = null;
+    // Follow-bottom: scrolling up detaches auto-scroll; scrolling back
+    // to the bottom (or the jump button) re-attaches it. Mirrors the
+    // TUI's behavior so streaming can't yank the view away.
+    let followBottom = true;
+    // tool_call_id → tool name, learned from assistant messages, so a
+    // tool RESULT block can be titled with the tool it belongs to.
+    let toolCallNames = {};
+    // Previous busy flag; the falling edge fires a desktop notification
+    // when the tab is hidden.
+    let lastBusy = null;
 
     document.body.dataset.mobileTab = "chat";
     els.token.value = localStorage.getItem("ddtuiRemoteToken") || "";
@@ -641,6 +717,11 @@
       }
       const token = els.token.value.trim();
       if (!token) return notice("Enter the login token first.");
+      // Inside the Connect click gesture — the only place a permission
+      // prompt is allowed without being flagged by the browser.
+      if ("Notification" in window && Notification.permission === "default") {
+        try { Notification.requestPermission(); } catch {}
+      }
       clearReconnect();
       manualDisconnect = false;
       localStorage.setItem("ddtuiRemoteToken", token);
@@ -794,6 +875,7 @@
           if (appended) {
             messages.push(appended);
             renderMessage(appended);
+            updateTyping();
             scrollLogToEnd();
           }
         }
@@ -849,6 +931,9 @@
       streaming = null;
       streamingNodes = null;
       lastSeq = 0;
+      toolCallNames = {};
+      lastBusy = null;
+      followBottom = true;
       renderSessions();
       renderMessages();
       sendRaw({ kind: "subscribe", session_id: sessionId, after_seq: -1 });
@@ -857,21 +942,97 @@
     }
 
     function renderStatus() {
+      maybeNotifyIdle(activeStatus);
       if (!activeStatus) {
         els.status.innerHTML = `<span class="pill">no session</span>`;
         renderTerminals([]);
+        updateTyping();
         return;
       }
       const terminals = activeStatus.terminals || [];
-      els.status.innerHTML = `
-        <span class="pill online">${escapeHtml(activeStatus.session_id || activeSession)}</span>
-        <span class="pill ${activeStatus.busy ? "busy" : ""}">${activeStatus.busy ? "busy" : "idle"}</span>
-        <span class="pill">${escapeHtml(activeStatus.provider || "")} ${escapeHtml(activeStatus.model || "")}</span>
-        <span class="pill">queue ${activeStatus.queued || 0}</span>
-        <span class="pill">steer ${activeStatus.steer || 0}</span>
-        <span class="pill">terminal_send ${activeStatus.terminal_send_enabled ? "on" : "off"}</span>
-      `;
+      const pills = [
+        `<span class="pill online">${escapeHtml(activeStatus.session_id || activeSession)}</span>`,
+        `<span class="pill ${activeStatus.busy ? "busy" : ""}">${activeStatus.busy ? "busy" : "idle"}</span>`,
+        `<span class="pill">${escapeHtml(activeStatus.provider || "")} ${escapeHtml(activeStatus.model || "")}</span>`,
+      ];
+      const ctx = contextPill(activeStatus);
+      if (ctx) pills.push(ctx);
+      if (activeStatus.turns) pills.push(`<span class="pill">${activeStatus.turns} 轮</span>`);
+      if (activeStatus.queued) pills.push(`<span class="pill">queue ${activeStatus.queued}</span>`);
+      if (activeStatus.steer) pills.push(`<span class="pill">steer ${activeStatus.steer}</span>`);
+      if (activeStatus.tasks_running) {
+        pills.push(`<span class="pill busy">⏳ tasks ${activeStatus.tasks_running}</span>`);
+      }
+      if (activeStatus.subagents) {
+        pills.push(`<span class="pill">🤖 sub ${activeStatus.subagents}</span>`);
+      }
+      if (activeStatus.terminal_send_enabled) {
+        pills.push(`<span class="pill">terminal_send on</span>`);
+      }
+      els.status.innerHTML = pills.join("");
       renderTerminals(terminals);
+      updateTyping();
+    }
+
+    function contextPill(status) {
+      const used = Number(status.context_used || 0);
+      const limit = Number(status.context_limit || 0);
+      if (!used || !limit) return "";
+      const pct = used / limit;
+      const cls = pct >= 0.85 ? "ctx-hot" : pct >= 0.6 ? "ctx-warn" : "ctx-ok";
+      return `<span class="pill ${cls}">ctx ${fmtTokens(used)}/${fmtTokens(limit)} (${Math.round(pct * 100)}%)</span>`;
+    }
+
+    function fmtTokens(n) {
+      if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+      if (n >= 1000) return `${Math.round(n / 1000)}k`;
+      return String(n);
+    }
+
+    function maybeNotifyIdle(status) {
+      if (!status) {
+        // Session went away (offline/deselect) — that is not "done".
+        lastBusy = null;
+        return;
+      }
+      const busy = !!status.busy;
+      const wasBusy = lastBusy;
+      lastBusy = busy;
+      if (
+        wasBusy === true &&
+        !busy &&
+        document.hidden &&
+        "Notification" in window &&
+        Notification.permission === "granted"
+      ) {
+        const n = new Notification("ddtui 空闲了", {
+          body: `${(status && status.session_id) || activeSession} 完成了当前回合`,
+        });
+        n.onclick = () => {
+          window.focus();
+          n.close();
+        };
+      }
+    }
+
+    let typingEl = null;
+    function updateTyping() {
+      const streamingContent = streamingNodes && streamingNodes.contentText;
+      const want = !!(activeSession && activeStatus && activeStatus.busy) && !streamingContent;
+      if (want) {
+        if (!typingEl || !typingEl.isConnected) {
+          typingEl = document.createElement("div");
+          typingEl.className = "typing";
+          typingEl.innerHTML =
+            `<span class="dot"></span><span class="dot"></span>` +
+            `<span class="dot"></span><span>working…</span>`;
+        }
+        els.log.appendChild(typingEl); // keep it at the end
+        scrollLogToEnd();
+      } else if (typingEl) {
+        typingEl.remove();
+        typingEl = null;
+      }
     }
 
     function renderTerminals(terminals) {
@@ -896,11 +1057,42 @@
     function renderMessages() {
       els.log.innerHTML = "";
       streamingNodes = null;
+      typingEl = null; // wiped with innerHTML; updateTyping rebuilds it
       const all = streaming ? [...messages, streaming] : messages;
+      if (!all.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty-state";
+        empty.innerHTML = activeSession
+          ? `<div class="mark">❯_</div>对话为空，发送第一条消息开始`
+          : `<div class="mark">❯_</div>选择一个 session 开始`;
+        els.log.appendChild(empty);
+        updateTyping();
+        return;
+      }
       for (const message of all) {
         renderMessage(message);
       }
+      updateTyping();
       scrollLogToEnd();
+    }
+
+    function formatToolCall(tc) {
+      const fn = tc.function || {};
+      const name = fn.name || "?";
+      let args;
+      try {
+        args = JSON.parse(fn.arguments || "{}");
+      } catch {
+        const raw = String(fn.arguments || "").replace(/\s+/g, " ");
+        return `${name}(${raw.length > 80 ? raw.slice(0, 80) + "…" : raw})`;
+      }
+      const parts = Object.entries(args).map(([key, value]) => {
+        let text = typeof value === "string" ? value : JSON.stringify(value);
+        text = String(text).replace(/\s+/g, " ");
+        if (text.length > 60) text = `${text.slice(0, 60)}…[+${text.length - 60}]`;
+        return `${key}=${text}`;
+      });
+      return `${name}(${parts.join(", ")})`;
     }
 
     function renderMessage(message) {
@@ -908,45 +1100,67 @@
       if (message.reasoning_content) {
         appendMessageBlock("reasoning", message.reasoning_content, "reasoning");
       }
-      let content = message.content || "";
+      if (message.tool_calls) {
+        for (const tc of message.tool_calls) {
+          const fn = tc.function || {};
+          if (tc.id && fn.name) toolCallNames[tc.id] = fn.name;
+        }
+      }
+      const content = message.content || "";
+      if (role === "tool") {
+        const name = toolCallNames[message.tool_call_id] || "";
+        appendMessageBlock("tool", content, "tool", name ? `tool · ${name}` : "tool");
+        return;
+      }
       if (content || !message.tool_calls) {
         appendMessageBlock(role, content, role);
       }
       if (message.tool_calls) {
-        appendMessageBlock("tool", JSON.stringify(message.tool_calls, null, 2), "tool");
+        const names = message.tool_calls.map((tc) => (tc.function || {}).name || "?");
+        appendMessageBlock(
+          "tool",
+          message.tool_calls.map(formatToolCall).join("\n"),
+          "tool",
+          `calls · ${names.join(", ")}`
+        );
       }
     }
 
-    function appendMessageBlock(role, content, className = role) {
-      const block = createMessageBlock(role, content, className);
+    function appendMessageBlock(role, content, className = role, label = role) {
+      const block = createMessageBlock(role, content, className, label);
       els.log.appendChild(block.root);
       return block;
     }
 
-    function createMessageBlock(role, content = "", className = role) {
+    function createMessageBlock(role, content = "", className = role, label = role) {
       if (role === "reasoning" || role === "tool") {
-        return createFoldableBlock(role, content || "", className);
+        return createFoldableBlock(role, content || "", className, label);
       }
       const root = document.createElement("div");
       root.className = `msg ${className}`;
-      const roleEl = document.createElement("div");
-      roleEl.className = "role";
-      roleEl.textContent = role;
       const textEl = document.createElement("div");
       textEl.className = "msg-text";
       renderMessageText(textEl, content || "", role);
-      root.append(roleEl, textEl);
+      if (role === "user" || role === "assistant") {
+        // Alignment + color already carry the speaker; skip the label.
+        root.append(textEl);
+      } else {
+        const roleEl = document.createElement("div");
+        roleEl.className = "role";
+        roleEl.textContent = label;
+        root.append(roleEl, textEl);
+      }
       return { root, text: textEl };
     }
 
-    function createFoldableBlock(role, content = "", className = role) {
+    function createFoldableBlock(role, content = "", className = role, labelText = role) {
       const root = document.createElement("details");
       root.className = `msg ${className} foldable`;
       root.open = !isMobileComposer();
       const summary = document.createElement("summary");
       const label = document.createElement("span");
       label.className = "role";
-      label.textContent = role;
+      label.textContent = labelText;
       const count = document.createElement("span");
       count.className = "fold-count";
       summary.append(label, count);
@@ -1140,6 +1354,7 @@
           streamingNodes.contentRoot = block.root;
           streamingNodes.contentText = block.text;
           els.log.appendChild(block.root);
+          updateTyping(); // content started streaming — drop the dots
         }
         queueStreamingMarkdownRender();
       }
@@ -1156,9 +1371,26 @@
       });
     }
 
-    function scrollLogToEnd() {
+    function scrollLogToEnd(force = false) {
+      if (force) followBottom = true;
+      if (!followBottom) return;
       els.log.scrollTop = els.log.scrollHeight;
+      els.jumpBottom.classList.remove("visible");
     }
+
+    els.log.addEventListener("scroll", () => {
+      const gap = els.log.scrollHeight - els.log.scrollTop - els.log.clientHeight;
+      const atBottom = gap < 40;
+      if (followBottom && !atBottom) {
+        followBottom = false;
+        els.jumpBottom.classList.add("visible");
+      } else if (!followBottom && atBottom) {
+        followBottom = true;
+        els.jumpBottom.classList.remove("visible");
+      }
+    });
+
+    els.jumpBottom.onclick = () => scrollLogToEnd(true);
 
     function appendMessage(role, content) {
       messages.push({ role, content });
@@ -1167,8 +1399,6 @@
     }
 
     function notice(text) {
-      const current = els.status.innerHTML;
-      els.status.innerHTML = `<span class="pill">${escapeHtml(text)}</span>${current}`;
       els.toast.textContent = text;
       els.toast.classList.add("visible");
       if (toastTimer) clearTimeout(toastTimer);
@@ -1208,6 +1438,7 @@
       if (!text) return;
       command("submit", { text });
       els.input.value = "";
+      scrollLogToEnd(true);
     };
     els.steer.onclick = () => {
       const text = els.input.value.trim();
