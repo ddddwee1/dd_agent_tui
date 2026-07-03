@@ -251,6 +251,19 @@ class ToolContext:
 
 
 @dataclass
+class ExploreState:
+    """Explore-span bookkeeping for one conversation.
+
+    Both the parent conversation and each subagent session own one, so
+    explore_start/end/cancel (see explore_core) can operate on any
+    message list without touching app attributes.
+    """
+
+    active: dict | None = None
+    next_id: int = 1
+
+
+@dataclass
 class SubagentSession:
     """One persistent subagent — created by spawn_agent, fed by chat_agent,
     released by end_agent (or the idle reaper).
@@ -307,6 +320,11 @@ class SubagentSession:
     # consume. None means "no result pending" (already consumed, or
     # task still running with nothing to return yet).
     last_result: str | None = None
+    # Explore-span state for THIS session — subagents can collapse
+    # their own probing spans exactly like the parent (explore_core
+    # operates on sess.messages + this state). Not persisted: subagent
+    # sessions don't survive /load.
+    explore: ExploreState = field(default_factory=ExploreState)
     # SubagentTabPane the round runner streams thinking/answer/tool
     # widgets into. Constructed synchronously in _spawn_subagent so the
     # ref exists before the first stream chunk arrives; mounted into the

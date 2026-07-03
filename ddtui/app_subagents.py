@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+from . import explore_core
 from .app_support import build_env_block, load_agents_md
 from .config import (
     COMPACT_KEEP_RECENT_TURNS,
@@ -172,15 +173,50 @@ class AppSubagentMixin:
         ) -> str | None:
             if name in SUBAGENT_BLOCKED_TOOLS:
                 # Defense in depth — schemas are filtered but models
-                # sometimes try anyway. spawn_* would nest; explore_*
-                # would compact the PARENT's history; checkpoint_* has
-                # no consumer for a subagent.
+                # sometimes try anyway. spawn_* would nest; checkpoint_*
+                # has no consumer for a subagent.
                 return f"Error: {name} is not available to subagents."
+            if name in ("explore_start", "explore_end", "explore_cancel"):
+                # Same core as the parent, bound to THIS session's state
+                # and message list. No main-pane widget: the summary
+                # lands in sess.messages and the tool result says where
+                # the raw span was archived.
+                try:
+                    if name == "explore_start":
+                        return await explore_core.explore_start(
+                            sess.explore, sess.messages, args, batch_size
+                        )
+                    if name == "explore_cancel":
+                        return await explore_core.explore_cancel(
+                            sess.explore, args, batch_size
+                        )
+                    result, _summary = await explore_core.explore_end(
+                        sess.explore,
+                        sess.messages,
+                        args,
+                        batch_size,
+                        provider=self.provider,
+                        model=sess.model or self.model,
+                        effort=sess.effort or self.effort,
+                        session_id=self._session_id,
+                        agent_id=sess.id,
+                    )
+                    return result
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    return f"Error: {name} failed: {type(e).__name__}: {e}"
             if name == "compact_self":
                 # Subagent-only meta-tool: rewrite the session's own
                 # messages with a summary. Reuses _compact_messages so
                 # /compact and compact_self share the same prompt / cut
                 # policy. No tool_confirm — memory-only, no side effects.
+                if sess.explore.active is not None:
+                    return (
+                        "Error: an exploration span is open and pins "
+                        "message indices. Call explore_end or "
+                        "explore_cancel before compact_self."
+                    )
                 try:
                     new_messages, stats = await self._compact_messages(
                         sess.messages

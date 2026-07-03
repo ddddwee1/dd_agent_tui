@@ -438,7 +438,7 @@ ssh -tt host 'tmux new -A -s ddtui-agent'
 
 子 agent 使用独立的精简 system prompt——它知道自己是子 agent、结果会截断回传。项目级 `AGENTS.md` 和环境信息仍会注入，与父 agent 遵循同样的项目约定。
 
-子 agent 的工具面：有 bash、文件、搜索、web、todo、项目笔记、`compact_self`，**也有 `task_*` 和 `terminal_*`**——但任务完成通知只投递给父 agent，子 agent 的任务强制为纯后台模式（`notify_on_complete=false`），需要自己 `task_wait` / `task_check`；子 agent 的 terminal 没有顶部 tab 展示。没有 checkpoint（其展示/恢复/自动收回都只挂在父会话上）、没有 explore（其实现操作父对话历史）、不能嵌套子 agent。
+子 agent 的工具面：有 bash、文件、搜索、web、todo、项目笔记、`compact_self`，**也有 `task_*` 和 `terminal_*`**——但任务完成通知只投递给父 agent，子 agent 的任务强制为纯后台模式（`notify_on_complete=false`），需要自己 `task_wait` / `task_check`；子 agent 的 terminal 没有顶部 tab 展示。**也有 explore**：explore 逻辑对会话参数化（`explore_core`），子 agent 在自己的消息历史上圈探索区间、收束成摘要，原始过程归档到同一会话目录下带 `sub-N-` 前缀的文件；探索区间开着时 `compact_self` 会被拒绝（消息索引会失效）。没有 checkpoint（其展示/恢复/自动收回都只挂在父会话上）、不能嵌套子 agent。
 
 限制：
 
@@ -551,7 +551,7 @@ sudo 等）不再拦截。当前只拒绝：
 
 上下文压力还有自动兜底：某个回合结束时，如果最近一次请求的 prompt tokens 超过了模型上下文窗口的 95%，会自动执行同样的压缩并在对话里提示。阈值用 `DDTUI_AUTO_COMPACT_THRESHOLD` 调整（0 到 0.95 之间的小数），设为 `0` 关闭。自动压缩只发生在回合完全结束、无排队消息的安静时刻；explore 进行中会跳过。压缩失败不影响对话，可稍后手动 `/compact`。
 
-`explore_start` / `explore_end` 让 agent 把一段临时探索从主上下文里收束掉：适合单点功能探针、bug 定位、假设验证、代码考古、方案侦察、低密度资料搜索、环境检查、性能/数值实验、测试面发现、数据样本检查、日志聚类和风险预检。`explore_end` 会把 raw 过程归档到 `~/.ddtui/explorations/<session_id>/<explore_id>.json`，并在对话里留下一个探索摘要 system message；`explore_cancel` 则取消边界，不压缩历史。
+`explore_start` / `explore_end` 让 agent 把一段临时探索从主上下文里收束掉：适合单点功能探针、bug 定位、假设验证、代码考古、方案侦察、低密度资料搜索、环境检查、性能/数值实验、测试面发现、数据样本检查、日志聚类和风险预检。`explore_end` 会把 raw 过程归档到 `~/.ddtui/explorations/<session_id>/<explore_id>.json`，并在对话里留下一个探索摘要 system message；`explore_cancel` 则取消边界，不压缩历史。父 agent 和子 agent 都可以用——各自作用于自己的会话历史，子 agent 的归档文件带 `sub-N-` 前缀。
 
 ## 开发结构
 

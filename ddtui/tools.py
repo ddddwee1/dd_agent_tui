@@ -152,9 +152,11 @@ def _specs() -> list[ToolSpec]:
         # app-level meta tools (func=None): need the live LLM client /
         # app state, dispatched by the host loop before execute_tool.
         S("compact_self", None, parent=False),           # subagent-only
-        S("explore_start", None, subagent=False),
-        S("explore_end", None, subagent=False),
-        S("explore_cancel", None, subagent=False),
+        # explore spans work for both: the parent binds them to its own
+        # history, each subagent session to its own (see explore_core).
+        S("explore_start", None),
+        S("explore_end", None),
+        S("explore_cancel", None),
         S("spawn_agent", None, subagent=False),
         S("chat_agent", None, subagent=False),
         S("await_agent", None, subagent=False),

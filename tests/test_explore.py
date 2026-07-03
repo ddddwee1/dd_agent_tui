@@ -5,8 +5,9 @@ import json
 
 import pytest
 
-import ddtui.app_explore as ax
+import ddtui.explore_core as ax
 from ddtui.app_explore import AppExploreMixin
+from ddtui.state import ExploreState
 
 
 class FakeProvider:
@@ -166,3 +167,48 @@ def test_explore_cancel_keeps_history(tmp_path, monkeypatch):
     assert app.messages is shared
     assert app._active_explore is None
     _assert_tool_calls_paired(app.messages)
+
+
+def test_subagent_scoped_span_via_core(tmp_path, monkeypatch):
+    """Same core bound to a subagent's own state/messages: archive is
+    prefixed with the agent id, mutation stays in place."""
+    monkeypatch.setattr(ax, "EXPLORE_ARCHIVE_DIR", tmp_path)
+    state = ExploreState()
+    messages = [{"role": "system", "content": "sub sys"}]
+    shared = messages
+
+    async def scenario():
+        messages.append(_tc("explore_start", "c1"))
+        result = await ax.explore_start(
+            state, messages, {"goal": "查日志", "kind": "log_clustering"}, 1
+        )
+        assert result.startswith("Exploration exp-1 started.")
+        messages.append(_tool("c1", result))
+        messages.append(_tc("bash", "c2"))
+        messages.append(_tool("c2", "ERROR spam x1000"))
+        messages.append(_tc("explore_end", "c3"))
+        result, summary = await ax.explore_end(
+            state, messages, {"outcome_hint": "聚类完成"}, 1,
+            provider=FakeProvider(), model="m", effort="",
+            session_id="session-test", agent_id="sub-1",
+        )
+        assert result.startswith("Exploration exp-1 summarized.")
+        assert summary is not None and summary["role"] == "system"
+        messages.append(_tool("c3", result))
+
+    asyncio.run(scenario())
+    assert messages is shared
+    assert state.active is None
+    _assert_tool_calls_paired(messages)
+    archive = tmp_path / "session-test" / "sub-1-exp-1.json"
+    assert archive.exists()
+    assert json.loads(archive.read_text())["agent_id"] == "sub-1"
+
+
+def test_parent_and_subagent_archives_coexist(tmp_path, monkeypatch):
+    monkeypatch.setattr(ax, "EXPLORE_ARCHIVE_DIR", tmp_path)
+    assert ax.archive_path_for("s", "exp-1") == tmp_path / "s" / "exp-1.json"
+    assert (
+        ax.archive_path_for("s", "exp-1", agent_id="sub-2")
+        == tmp_path / "s" / "sub-2-exp-1.json"
+    )

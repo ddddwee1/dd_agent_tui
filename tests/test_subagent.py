@@ -45,6 +45,7 @@ class FakeApp(AppSubagentMixin):
         self.effort = "high"
         self.ctx = ToolContext(work_dir=workdir)
         self.counter = TokenCounter()
+        self._session_id = "session-test"
         self._live_subagents = {}
         self._subagent_next_id = 1
         self.tool_confirm = _allow_all
@@ -112,7 +113,8 @@ def test_sub_toolset_and_ctx_flag(playground):
         sess = app._live_subagents["sub-1"]
         names = {t["function"]["name"] for t in sess.sub_tools}
         assert {"task_start", "task_wait", "terminal_start"} <= names
-        assert not {"checkpoint_tool", "explore_start", "spawn_agent"} & names
+        assert {"explore_start", "explore_end", "explore_cancel"} <= names
+        assert not {"checkpoint_tool", "spawn_agent"} & names
         assert sess.ctx.is_subagent is True
         await _wait_round(sess)
     asyncio.run(run())
@@ -195,6 +197,59 @@ def test_compact_self_keeps_list_identity(playground):
         assert any("已压缩" in (m.get("content") or "")
                    for m in sess.messages if m["role"] == "tool")
         assert sess.last_result == "压缩后继续"
+    asyncio.run(run())
+
+
+def test_subagent_explore_full_span(playground, tmp_path, monkeypatch):
+    async def run():
+        import ddtui.explore_core as ec
+        monkeypatch.setattr(ec, "EXPLORE_ARCHIVE_DIR", tmp_path / "arch")
+
+        class ExploreProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.rounds = [
+                    [LLMStreamEvent(tool_call=_tc(
+                        0, "explore_start",
+                        '{"goal": "考古配置加载", "kind": "code_archaeology"}',
+                    ))],
+                    [LLMStreamEvent(tool_call=_tc(
+                        0, "read_file", '{"path": "AGENTS.md", "limit": 1}',
+                    ))],
+                    [LLMStreamEvent(tool_call=_tc(
+                        0, "explore_end", '{"outcome_hint": "已定位"}',
+                    ))],
+                    [LLMStreamEvent(content="探索完毕")],
+                ]
+
+            async def stream(self, messages, tools, model, effort):
+                self.stream_calls.append((model, effort))
+                for ev in self.rounds.pop(0):
+                    yield ev
+
+            async def complete_text(self, messages, model, effort):
+                return "## 结论\n配置在 config.py 加载"
+
+        app = FakeApp(playground)
+        app.provider = ExploreProvider()
+        app._spawn_subagent("探索任务", "")
+        sess = app._live_subagents["sub-1"]
+        list_id = id(sess.messages)
+        await _wait_round(sess)
+
+        assert id(sess.messages) == list_id  # engine shares this object
+        assert sess.explore.active is None
+        assert any(
+            m.get("ddtui_kind") == "explore_summary" for m in sess.messages
+        )
+        # the probing round-trip (read_file) was collapsed out
+        assert not any(
+            "AGENTS.md] lines" in (m.get("content") or "")
+            for m in sess.messages if m["role"] == "tool"
+        )
+        assert sess.last_result == "探索完毕"
+        files = list((tmp_path / "arch").rglob("*.json"))
+        assert [f.name for f in files] == ["sub-1-exp-1.json"]
     asyncio.run(run())
 
 

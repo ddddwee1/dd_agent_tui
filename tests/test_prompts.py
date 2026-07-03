@@ -75,10 +75,12 @@ def test_subagent_prompt_matches_its_toolset():
     assert "task_start" in sp and "收不到任务完成通知" in sp
     assert "用 task_wait 阻塞等待" in sp
     assert "terminal_start" in sp
+    # teaches explore (subagents own their spans since explore_core)
+    assert "explore_start" in sp and "explore_end" in sp
     # never teaches what it lacks
-    for absent in ["checkpoint_tool", "explore_start", "spawn_agent", "await_agent"]:
+    for absent in ["checkpoint_tool", "spawn_agent", "await_agent"]:
         assert absent not in sp, absent
-    assert "你没有 checkpoint、explore" in sp
+    assert "你没有 checkpoint" in sp
 
 
 # ── env block ──
@@ -120,7 +122,6 @@ def test_derived_sets():
     )
     assert SUBAGENT_BLOCKED_TOOLS == frozenset({
         "spawn_agent", "chat_agent", "await_agent", "end_agent",
-        "explore_start", "explore_end", "explore_cancel",
         "checkpoint_tool", "checkpoint_get", "checkpoint_clear",
     })
     assert "read_file" in PARALLEL_SAFE_TOOLS
