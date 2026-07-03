@@ -256,6 +256,31 @@ class RelayBackend:
             "observed_at": now_iso(),
         }
 
+    async def new_session(self, session_id: str) -> dict[str, Any]:
+        """Reset a session to a fresh conversation (the TUI's /clear).
+
+        The TUI rebuilds its system prefix — re-reading AGENTS.md and
+        re-snapshotting the environment — then re-registers on the relay
+        under a NEW session_id, so cached state for the old id is
+        dropped here and the caller must list sessions again.
+        """
+        session_id = _require_text(session_id, "session_id")
+        ack = await self.command(session_id, "clear", {})
+        if ack.get("status") == "error":
+            raise BridgeError(str(ack.get("message") or "clear failed"))
+        self._snapshots.pop(session_id, None)
+        self._statuses.pop(session_id, None)
+        self._events.pop(session_id, None)
+        self._subscribed.discard(session_id)
+        return {
+            "status": "accepted",
+            "note": (
+                "Session cleared. It re-registers under a NEW session_id "
+                "with a fresh AGENTS.md + environment snapshot — call "
+                "ddtui_list_sessions to find it before the next submit."
+            ),
+        }
+
     async def submit(self, session_id: str, text: str) -> dict[str, Any]:
         return await self.command(
             session_id,
@@ -608,6 +633,10 @@ class McpStdioServer:
                     args.get("max_chars") or RESULT_DEFAULT_MAX_CHARS
                 ),
             )
+        if name == "ddtui_new_session":
+            return await self.backend.new_session(
+                str(args.get("session_id") or "")
+            )
         if name == "ddtui_submit":
             return await self.backend.submit(
                 str(args.get("session_id") or ""),
@@ -743,6 +772,27 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "minimum": 100,
                         "description": "Clip length for last_assistant.",
                     },
+                },
+                "required": ["session_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "ddtui_new_session",
+            "title": "Reset ddtui to a fresh session",
+            "description": (
+                "Clear a session's conversation and start fresh (the TUI's "
+                "/clear): its tasks/terminals/subagents are torn down and the "
+                "system prompt is rebuilt with the CURRENT AGENTS.md and a "
+                "fresh environment snapshot — edit the project docs, reset, "
+                "and retry. Refused while the session is busy (interrupt "
+                "first). The session re-registers under a NEW session_id; "
+                "call ddtui_list_sessions afterwards."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
                 },
                 "required": ["session_id"],
                 "additionalProperties": False,

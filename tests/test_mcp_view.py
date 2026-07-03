@@ -115,3 +115,34 @@ def test_result_poll_minimal(monkeypatch):
     }
     assert out["busy"] is True and out["queued"] == 2
     assert out["last_assistant"].startswith("修好了")
+
+
+def test_new_session_drops_stale_caches():
+    backend = _backend_with_snapshot()
+    backend._subscribed.add("s1")
+
+    async def fake_command(session_id, command_type, payload):
+        assert command_type == "clear"
+        return {"status": "accepted", "message": "clearing"}
+
+    backend.command = fake_command
+    out = asyncio.run(backend.new_session("s1"))
+    assert out["status"] == "accepted"
+    assert "ddtui_list_sessions" in out["note"]
+    assert "s1" not in backend._snapshots
+    assert "s1" not in backend._statuses
+    assert "s1" not in backend._subscribed
+
+
+def test_new_session_propagates_busy_error():
+    from ddtui.mcp_server import BridgeError
+
+    backend = _backend_with_snapshot()
+
+    async def fake_command(session_id, command_type, payload):
+        return {"status": "error", "message": "session is busy"}
+
+    backend.command = fake_command
+    with pytest.raises(BridgeError, match="busy"):
+        asyncio.run(backend.new_session("s1"))
+    assert "s1" in backend._snapshots  # untouched on failure

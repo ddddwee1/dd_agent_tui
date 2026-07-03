@@ -349,7 +349,7 @@ ddtui-mcp --token-file ~/.ddtui/remote_token          # relay 地址可自动推
 claude mcp add ddtui -- ddtui-mcp --token-file ~/.ddtui/remote_token
 ```
 
-外部模型拿到 7 个工具：`ddtui_list_sessions`、`ddtui_result`（最轻量的"做完没有 + 结论"轮询）、`ddtui_observe`（默认 `detail="chat"` 只返回对话主线——reasoning 丢弃、工具往返折叠成一行占位，不会灌爆控制者的上下文）、`ddtui_submit`、`ddtui_steer`、`ddtui_interrupt`、`ddtui_terminal_read`。`terminal_send` 刻意不开放。
+外部模型拿到 8 个工具：`ddtui_list_sessions`、`ddtui_result`（最轻量的"做完没有 + 结论"轮询）、`ddtui_observe`（默认 `detail="chat"` 只返回对话主线——reasoning 丢弃、工具往返折叠成一行占位，不会灌爆控制者的上下文）、`ddtui_new_session`（重置为全新会话，重新读取 AGENTS.md——支撑"改项目文档 → 重跑任务"的外部调优循环）、`ddtui_submit`、`ddtui_steer`、`ddtui_interrupt`、`ddtui_terminal_read`。`terminal_send` 刻意不开放。
 
 完整文档（架构、快速开始、各客户端注册方式、工具参数、推荐控制循环、安全模型、故障排查）见 **[docs/mcp.md](docs/mcp.md)**。
 
@@ -524,7 +524,7 @@ sudo 等）不再拦截。当前只拒绝：
 
 断线恢复使用 `~/.ddtui/runtime/<session_id>/` 记录当前回合和托管异步任务。重启后仍默认进入新会话，但如果检测到未完成回合，会提示用 `/resume <name>` 接回。恢复时，断在模型流式输出阶段的回合会回滚到上一条稳定消息，并把用户输入放回输入框；断在工具执行阶段不会自动重跑工具，而是补一个未知结果占位，避免重复执行有副作用的操作。`task_start` 创建的托管任务由独立 runner 负责写最终状态，恢复会话后可以重新出现在侧边栏并补发完成通知。
 
-`/clear` 会开始一个新的自动保存会话，不会把刚清空的内容写回旧会话文件。
+`/clear` 会开始一个新的自动保存会话，不会把刚清空的内容写回旧会话文件。system prompt 会整体重建：重新读取当前的 `AGENTS.md`、重新快照环境（日期、git 分支）——改完项目约定后 `/clear` 即生效，不必重启 TUI。
 
 `/compact` 会把较早历史压缩成一个摘要 system message，保留最近两轮原文，适合长对话里降低上下文压力。
 

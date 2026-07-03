@@ -263,6 +263,30 @@ class AppRemoteMixin:
             self._interrupt_now()
             self._remote_emit_status("interrupt", force=True)
             return {"status": "accepted", "message": "interrupt requested"}
+        if command_type in ("clear", "command.clear"):
+            # Same semantics as local /clear: wipe the conversation,
+            # tear down its tasks/terminals/subagents, rebuild the
+            # system prefix (fresh AGENTS.md + env snapshot), and
+            # restart autosave under a NEW session_id — the session
+            # re-registers on the relay under that id. Refuse while
+            # busy: the engine would keep appending to the wiped
+            # history mid-turn.
+            if self._busy:
+                return {
+                    "status": "error",
+                    "message": "session is busy; interrupt first, then clear",
+                }
+            # Deferred: action_clear_chat restarts the remote client,
+            # which would kill this very connection before the ack got
+            # written. call_later runs it on the next loop tick.
+            self.call_later(self.action_clear_chat)
+            return {
+                "status": "accepted",
+                "message": (
+                    "clearing; the session re-registers under a new "
+                    "session_id — list sessions to find it"
+                ),
+            }
         if command_type in ("snapshot", "command.snapshot"):
             self._remote_emit_snapshot("remote_request")
             return {"status": "accepted", "message": "snapshot sent"}

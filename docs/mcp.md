@@ -79,10 +79,17 @@ args = ["--token-file", "/Users/you/.ddtui/remote_token"]
 | `ddtui_list_sessions` | 列出 relay 上在线的 session | — |
 | `ddtui_result` | 最轻量的"做完没有 + 结论"轮询 | `session_id`、`max_chars`（默认 4000） |
 | `ddtui_observe` | 状态 + transcript tail + relay 事件 | `session_id`、`detail`、`max_messages`、`max_chars`、`max_events`、`after_seq` |
+| `ddtui_new_session` | 重置为全新会话（等价 TUI 的 `/clear`） | `session_id` |
 | `ddtui_submit` | 发送下一轮输入（忙时进 ddtui 排队） | `session_id`、`text` |
 | `ddtui_steer` | 忙碌中的实时插话 | `session_id`、`text` |
 | `ddtui_interrupt` | 请求中断当前回合 | `session_id` |
 | `ddtui_terminal_read` | 只读 persistent terminal 输出 | `session_id`、`terminal_id`、`offset`、`max_chars` |
+
+### new_session 的语义
+
+`ddtui_new_session` 触发 TUI 的 `/clear`：对话清空、该会话的 task/terminal/子 agent 全部回收、autosave 换新会话文件，并且 **system prompt 重建——重新读取当前的 `AGENTS.md`、重新快照环境（日期、git 分支）**。这正是"外部模型调优"循环的钩子：控制者编辑项目文档 → `ddtui_new_session` → 重新 `ddtui_submit` 同一任务 → 对比表现。
+
+两个注意点：会话忙碌时会被拒绝（先 `ddtui_interrupt`）；清空后 TUI 以**新的 session_id** 重新注册到 relay，旧 id 失效——下一步操作前先 `ddtui_list_sessions` 拿新 id。
 
 ### observe 的三档 detail
 
@@ -103,6 +110,19 @@ ddtui_list_sessions
   → 需要过程细节时 ddtui_observe(detail="chat")
   → 怀疑具体某步出错时 ddtui_observe(detail="full", max_messages=5)
   → 跑偏时 ddtui_steer（忙碌中）或 ddtui_interrupt
+```
+
+### prompt / 文档调优循环
+
+控制者用自己的文件工具改 `AGENTS.md`（或项目内文档），用 new_session 让改动生效后重试同一任务：
+
+```
+编辑 AGENTS.md / 项目文档
+  → ddtui_new_session(session_id)        # 重建 system prompt，读到新文档
+  → ddtui_list_sessions                  # 拿新 session_id
+  → ddtui_submit(新id, 同一任务)
+  → ddtui_result / ddtui_observe 评估表现（轮数、跑偏、结论质量）
+  → 不满意 ⇒ 回到第一步继续改
 ```
 
 ## 安全模型

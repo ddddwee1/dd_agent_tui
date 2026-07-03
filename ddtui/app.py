@@ -160,34 +160,7 @@ class AgentApp(
         # The store's identity never changes for the app's lifetime —
         # see the `messages` property below.
         self._history = HistoryStore()
-        self.messages = [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT
-                + "\n"
-                + build_env_block(
-                    self.ctx.work_dir, self.provider.label, self.model
-                ),
-            },
-        ]
-        # If <cwd>/AGENTS.md exists, append it as a SECOND system
-        # message so the framework's identity/tools/language rules stay
-        # separate from project-specific guidance — easier to audit.
-        agents_md = load_agents_md(self.ctx.work_dir)
-        if agents_md:
-            self.messages.append(
-                {
-                    "role": "system",
-                    "content": f"# Project guidelines (from AGENTS.md)\n\n{agents_md}",
-                }
-            )
-        self._agents_md_loaded = agents_md is not None
-        # Optional THIRD system message — global override that lands after
-        # AGENTS.md so it can correct or supersede project-level guidance.
-        if POST_SYSTEM_PROMPT:
-            self.messages.append(
-                {"role": "system", "content": POST_SYSTEM_PROMPT}
-            )
+        self.messages = self._build_system_prefix()
         self._active_explore: dict | None = None
         self._explore_next_id = 1
         self.counter = TokenCounter()
@@ -265,6 +238,40 @@ class AgentApp(
         self._init_remote_state()
 
     # ─ conversation history ─
+
+    def _build_system_prefix(self) -> list[dict]:
+        """Framework prompt + a FRESH environment snapshot + the CURRENT
+        AGENTS.md + optional global override.
+
+        Called at construction and by /clear — a new conversation always
+        picks up the latest project guidelines, so an external loop can
+        edit AGENTS.md and reset the session to try again. The AGENTS.md
+        content lands in a SECOND system message so framework rules stay
+        separate from project-specific guidance; POST_SYSTEM_PROMPT (if
+        set) lands third so it can supersede both.
+        """
+        prefix = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+                + "\n"
+                + build_env_block(
+                    self.ctx.work_dir, self.provider.label, self.model
+                ),
+            },
+        ]
+        agents_md = load_agents_md(self.ctx.work_dir)
+        if agents_md:
+            prefix.append(
+                {
+                    "role": "system",
+                    "content": f"# Project guidelines (from AGENTS.md)\n\n{agents_md}",
+                }
+            )
+        self._agents_md_loaded = agents_md is not None
+        if POST_SYSTEM_PROMPT:
+            prefix.append({"role": "system", "content": POST_SYSTEM_PROMPT})
+        return prefix
 
     @property
     def messages(self) -> HistoryStore:

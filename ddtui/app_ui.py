@@ -439,16 +439,12 @@ class AppUiMixin:
             self.call_later(self._remove_sub_tab, sid)
 
     def action_clear_chat(self) -> None:
-        # Keep ALL leading system messages (core prompt + optional
-        # AGENTS.md). Stop at the first non-system message — anything
-        # after that is conversation history that should be wiped.
-        keep = []
-        for m in self.messages:
-            if m["role"] == "system":
-                keep.append(m)
-            else:
-                break
-        self.messages = keep
+        # Rebuild the system prefix from scratch instead of keeping the
+        # startup copy: /clear means "fresh conversation", so it re-reads
+        # AGENTS.md and re-snapshots the environment (date, git branch).
+        # This is what lets an external controller edit the project
+        # guidelines and reset the session to try again.
+        self.messages = self._build_system_prefix()
         # Drop any messages that hadn't started running yet — both the
         # state buffers and their parked bubbles in #pending.
         self._drop_queue()
