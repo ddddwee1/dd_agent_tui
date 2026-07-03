@@ -567,6 +567,7 @@
           <button id="steerBtn">Steer</button>
           <button id="interruptBtn" class="warn">Interrupt</button>
           <button id="snapshotBtn">Snapshot</button>
+          <button id="newSessionBtn" class="warn">New session</button>
         </div>
         <details class="terminal">
           <summary>Terminal</summary>
@@ -595,6 +596,7 @@
       steer: document.getElementById("steerBtn"),
       interrupt: document.getElementById("interruptBtn"),
       snapshot: document.getElementById("snapshotBtn"),
+      newSession: document.getElementById("newSessionBtn"),
       terminalSelect: document.getElementById("terminalSelect"),
       terminalInput: document.getElementById("terminalInput"),
       terminalRead: document.getElementById("terminalReadBtn"),
@@ -618,6 +620,10 @@
     let manualDisconnect = false;
     let streamingNodes = null;
     let streamingRenderFrame = 0;
+    // Set while a "clear" command is in flight: the session re-registers
+    // under a NEW session_id, so we watch sessions.list broadcasts for an
+    // online id we have not seen before and auto-switch to it.
+    let pendingNewSession = null;
 
     document.body.dataset.mobileTab = "chat";
     els.token.value = localStorage.getItem("ddtuiRemoteToken") || "";
@@ -686,30 +692,53 @@
     function command(type, payload = {}) {
       if (!activeSession) {
         notice("select a session first");
-        return;
+        return null;
       }
+      const commandId = `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       sendRaw({
         kind: "command",
         type,
         session_id: activeSession,
-        command_id: `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        command_id: commandId,
         client_id: clientId,
         payload,
       });
+      return commandId;
     }
 
     function handleMessage(message) {
       if (message.seq) lastSeq = Math.max(lastSeq, Number(message.seq) || 0);
       if (message.kind === "sessions.list") {
         sessions = message.sessions || [];
+        if (pendingNewSession && Date.now() > pendingNewSession.until) {
+          pendingNewSession = null;
+        }
+        if (pendingNewSession) {
+          const fresh = sessions.find(
+            (s) => s.online && !pendingNewSession.known.has(s.session_id)
+          );
+          if (fresh) {
+            pendingNewSession = null;
+            notice("switched to the new session");
+            renderSessions();
+            selectSession(fresh.session_id);
+            return;
+          }
+        }
         if (activeSession && !sessions.some((s) => s.session_id === activeSession)) {
           activeSession = "";
           activeStatus = null;
           messages = [];
           streaming = null;
           streamingNodes = null;
-          notice("session disconnected");
-          setMobileTab("sessions");
+          if (pendingNewSession) {
+            // The old id just went offline mid-clear; stay on the chat
+            // tab and wait for the re-registration broadcast.
+            notice("waiting for the new session…");
+          } else {
+            notice("session disconnected");
+            setMobileTab("sessions");
+          }
           renderStatus();
           renderMessages();
         }
@@ -718,6 +747,14 @@
       }
       if (message.kind === "command_ack") {
         notice(`${message.status}: ${message.message || message.command_id || ""}`);
+        if (
+          pendingNewSession &&
+          message.command_id === pendingNewSession.cmdId &&
+          message.status === "error"
+        ) {
+          // clear refused (e.g. session busy) — stop watching.
+          pendingNewSession = null;
+        }
         if (message.payload && message.payload.result) {
           appendMessage("tool", message.payload.result);
         }
@@ -1180,6 +1217,19 @@
     };
     els.interrupt.onclick = () => command("interrupt");
     els.snapshot.onclick = () => command("snapshot");
+    els.newSession.onclick = () => {
+      if (!activeSession) return notice("select a session first");
+      const ok = confirm(
+        "Start a fresh session? The current conversation is cleared, its " +
+        "tasks/terminals/subagents are torn down, and AGENTS.md is re-read."
+      );
+      if (!ok) return;
+      const known = new Set(sessions.map((s) => s.session_id));
+      const cmdId = command("clear");
+      if (cmdId) {
+        pendingNewSession = { known, cmdId, until: Date.now() + 15000 };
+      }
+    };
     els.terminalRead.onclick = () => {
       const terminal_id = els.terminalSelect.value;
       if (!terminal_id) return;

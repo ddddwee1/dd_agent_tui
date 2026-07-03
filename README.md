@@ -323,6 +323,7 @@ export DDTUI_REMOTE_TLS=0
 - 查看在线 session 列表、cwd、model、busy/idle、queue/steer 数。
 - 订阅 transcript/status/streaming delta/tool started/terminal tail。
 - 发送普通输入、steer 实时插话、interrupt。
+- `New session`：重置为全新会话（等价本地 `/clear`，重新读取 AGENTS.md 和环境快照）；会话以新 session_id 重新注册，网页会自动跟随切换过去。忙碌中会被拒绝，先 interrupt。
 - 读取 terminal 输出。
 
 断线行为：
