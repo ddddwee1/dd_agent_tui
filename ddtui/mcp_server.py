@@ -42,6 +42,99 @@ SERVER_VERSION = "0.1.0"
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 MAX_EVENT_CACHE = 500
 
+# Observe detail levels. The controller LLM usually needs "is it busy
+# and what has it concluded", not ddtui's working memory — full
+# transcripts (reasoning, raw tool results) would flood its context.
+OBSERVE_DETAIL_LEVELS = ("status", "chat", "full")
+DEFAULT_OBSERVE_DETAIL = "chat"
+DEFAULT_OBSERVE_MAX_MESSAGES = 20
+DEFAULT_OBSERVE_MAX_CHARS = 800
+RESULT_DEFAULT_MAX_CHARS = 4000
+
+
+def _clip_text(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[:limit] + f"...[+{len(text) - limit:,} chars]"
+
+
+def _tool_call_names(message: dict[str, Any]) -> list[str]:
+    names = []
+    for tc in message.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        names.append(str(fn.get("name") or "?"))
+    return names
+
+
+def _condense_messages(
+    messages: list[Any],
+    *,
+    detail: str,
+    max_messages: int,
+    max_chars: int,
+) -> list[dict[str, Any]]:
+    """Shape a snapshot transcript for a controller's context.
+
+    status: no transcript at all (the view's last_assistant covers it).
+    chat:   the conversation mainline — user/assistant content clipped,
+            reasoning dropped, tool round-trips folded to one-line
+            placeholders that name the tool and the payload size.
+    full:   verbatim messages (still subject to max_messages).
+    """
+    if detail == "status":
+        return []
+    tail = [m for m in messages if isinstance(m, dict)]
+    if max_messages > 0:
+        tail = tail[-max_messages:]
+    if detail == "full":
+        return tail
+
+    # id → tool name across the WHOLE snapshot (a fold window may start
+    # after the assistant message that declared the call).
+    call_names: dict[str, str] = {}
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            call_names[str(tc.get("id") or "")] = str(fn.get("name") or "?")
+
+    condensed: list[dict[str, Any]] = []
+    for m in tail:
+        role = m.get("role")
+        content = str(m.get("content") or "")
+        if role == "tool":
+            name = call_names.get(str(m.get("tool_call_id") or ""), "?")
+            condensed.append({
+                "role": "tool",
+                "content": f"[tool {name} → {len(content):,} chars]",
+            })
+            continue
+        if role == "assistant":
+            text = _clip_text(content, max_chars)
+            calls = _tool_call_names(m)
+            if calls:
+                suffix = f"[calls: {', '.join(calls)}]"
+                text = f"{text}\n{suffix}" if text else suffix
+            condensed.append({"role": "assistant", "content": text})
+            continue
+        condensed.append({
+            "role": str(role or "?"),
+            "content": _clip_text(content, max_chars),
+        })
+    return condensed
+
+
+def _last_assistant_text(messages: list[Any], max_chars: int) -> str:
+    for m in reversed(messages):
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and (m.get("content") or "")
+        ):
+            return _clip_text(str(m["content"]), max_chars)
+    return ""
+
 
 class BridgeError(RuntimeError):
     """Tool-facing error that should be returned as an MCP tool error."""
@@ -110,15 +203,58 @@ class RelayBackend:
         after_seq: int | None = None,
         max_events: int = 30,
         refresh: bool = True,
+        detail: str = DEFAULT_OBSERVE_DETAIL,
+        max_messages: int = DEFAULT_OBSERVE_MAX_MESSAGES,
+        max_chars: int = DEFAULT_OBSERVE_MAX_CHARS,
     ) -> dict[str, Any]:
         session_id = _require_text(session_id, "session_id")
+        if detail not in OBSERVE_DETAIL_LEVELS:
+            raise BridgeError(
+                f"detail must be one of {', '.join(OBSERVE_DETAIL_LEVELS)}"
+            )
         await self._ensure_connected()
         await self._subscribe(session_id, after_seq=after_seq)
         if refresh:
             ack = await self.command(session_id, "snapshot", {})
             if ack.get("status") == "error":
                 raise BridgeError(str(ack.get("message") or "snapshot failed"))
-        return self._session_view(session_id, max_events=max_events)
+        return self._session_view(
+            session_id,
+            max_events=max_events,
+            detail=detail,
+            max_messages=max_messages,
+            max_chars=max_chars,
+        )
+
+    async def result(
+        self,
+        session_id: str,
+        *,
+        refresh: bool = True,
+        max_chars: int = RESULT_DEFAULT_MAX_CHARS,
+    ) -> dict[str, Any]:
+        """Minimal 'is it done and what did it say' poll: busy flags plus
+        the last assistant message, nothing else."""
+        session_id = _require_text(session_id, "session_id")
+        await self._ensure_connected()
+        await self._subscribe(session_id)
+        if refresh:
+            ack = await self.command(session_id, "snapshot", {})
+            if ack.get("status") == "error":
+                raise BridgeError(str(ack.get("message") or "snapshot failed"))
+        snapshot = self._snapshots.get(session_id, {})
+        status = self._statuses.get(session_id) or snapshot.get("status") or {}
+        messages = snapshot.get("messages", [])
+        if not isinstance(messages, list):
+            messages = []
+        return {
+            "session_id": session_id,
+            "busy": bool(status.get("busy")),
+            "queued": status.get("queued", 0),
+            "steer": status.get("steer", 0),
+            "last_assistant": _last_assistant_text(messages, max_chars),
+            "observed_at": now_iso(),
+        }
 
     async def submit(self, session_id: str, text: str) -> dict[str, Any]:
         return await self.command(
@@ -300,7 +436,15 @@ class RelayBackend:
         if kind == "error":
             self._last_error = str(message.get("message") or "relay error")
 
-    def _session_view(self, session_id: str, *, max_events: int) -> dict[str, Any]:
+    def _session_view(
+        self,
+        session_id: str,
+        *,
+        max_events: int,
+        detail: str = DEFAULT_OBSERVE_DETAIL,
+        max_messages: int = DEFAULT_OBSERVE_MAX_MESSAGES,
+        max_chars: int = DEFAULT_OBSERVE_MAX_CHARS,
+    ) -> dict[str, Any]:
         events = list(self._events.get(session_id, ()))
         max_events = max(0, min(int(max_events or 0), 200))
         if max_events:
@@ -309,11 +453,21 @@ class RelayBackend:
             events = []
         snapshot = self._snapshots.get(session_id, {})
         status = self._statuses.get(session_id) or snapshot.get("status") or {}
+        raw_messages = snapshot.get("messages", [])
+        if not isinstance(raw_messages, list):
+            raw_messages = []
         return {
             "session_id": session_id,
             "status": status,
+            "detail": detail,
             "system_message_count": snapshot.get("system_message_count", 0),
-            "messages": snapshot.get("messages", []),
+            "messages": _condense_messages(
+                raw_messages,
+                detail=detail,
+                max_messages=max_messages,
+                max_chars=max_chars,
+            ),
+            "last_assistant": _last_assistant_text(raw_messages, max_chars),
             "events": events,
             "last_error": self._last_error,
             "observed_at": now_iso(),
@@ -438,6 +592,21 @@ class McpStdioServer:
                 after_seq=_optional_int(args.get("after_seq")),
                 max_events=int(args.get("max_events") or 30),
                 refresh=bool(args.get("refresh", True)),
+                detail=str(args.get("detail") or DEFAULT_OBSERVE_DETAIL),
+                max_messages=int(
+                    args.get("max_messages") or DEFAULT_OBSERVE_MAX_MESSAGES
+                ),
+                max_chars=int(
+                    args.get("max_chars") or DEFAULT_OBSERVE_MAX_CHARS
+                ),
+            )
+        if name == "ddtui_result":
+            return await self.backend.result(
+                str(args.get("session_id") or ""),
+                refresh=bool(args.get("refresh", True)),
+                max_chars=int(
+                    args.get("max_chars") or RESULT_DEFAULT_MAX_CHARS
+                ),
             )
         if name == "ddtui_submit":
             return await self.backend.submit(
@@ -499,7 +668,11 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "title": "Observe ddtui session",
             "description": (
                 "Fetch the latest status, transcript tail, and recent relay events "
-                "for an active ddtui session."
+                "for an active ddtui session. Default detail='chat' returns the "
+                "conversation mainline only: reasoning is dropped and tool "
+                "round-trips are folded to one-line placeholders, so a long "
+                "session stays cheap to observe. Use detail='full' sparingly — "
+                "verbatim messages include raw tool output and can be very large."
             ),
             "inputSchema": {
                 "type": "object",
@@ -519,6 +692,56 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "type": "boolean",
                         "default": True,
                         "description": "Ask the session for a fresh snapshot first.",
+                    },
+                    "detail": {
+                        "type": "string",
+                        "enum": list(OBSERVE_DETAIL_LEVELS),
+                        "default": DEFAULT_OBSERVE_DETAIL,
+                        "description": (
+                            "status = no transcript (last_assistant only); "
+                            "chat = clipped mainline, tools folded; "
+                            "full = verbatim messages."
+                        ),
+                    },
+                    "max_messages": {
+                        "type": "integer",
+                        "default": DEFAULT_OBSERVE_MAX_MESSAGES,
+                        "minimum": 1,
+                        "description": "Transcript tail length (chat/full).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": DEFAULT_OBSERVE_MAX_CHARS,
+                        "minimum": 50,
+                        "description": "Per-message clip length in chat detail.",
+                    },
+                },
+                "required": ["session_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "ddtui_result",
+            "title": "Poll ddtui result",
+            "description": (
+                "Cheapest 'is it done and what did it conclude' poll: busy/queued "
+                "flags plus the last assistant message. Prefer this over "
+                "ddtui_observe when waiting for a submitted turn to finish."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "refresh": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Ask the session for a fresh snapshot first.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": RESULT_DEFAULT_MAX_CHARS,
+                        "minimum": 100,
+                        "description": "Clip length for last_assistant.",
                     },
                 },
                 "required": ["session_id"],

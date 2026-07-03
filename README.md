@@ -366,7 +366,8 @@ ddtui-mcp --token-file ~/.ddtui/remote_token
 暴露给外部模型的 MCP tools：
 
 - `ddtui_list_sessions`：列出当前在线 session。
-- `ddtui_observe`：读取 session 状态、transcript tail 和最近 relay 事件。
+- `ddtui_observe`：读取 session 状态、transcript tail 和最近 relay 事件。默认 `detail="chat"` 只返回对话主线——思考过程（reasoning）被丢弃、工具往返折叠成一行占位（`[tool read_file → 64,000 chars]`），每条消息按 `max_chars` 截断，长会话也不会灌爆控制者的上下文；`detail="status"` 连 transcript 都不带（顶层 `last_assistant` 字段已含最后结论）；`detail="full"` 才是原文，点名 debug 时用。
+- `ddtui_result`：最轻量的"做完没有 + 结论是什么"轮询——只返回 busy/queued 标志和最后一条 assistant 消息。等待一个 submit 的结果时优先用它而不是 observe。
 - `ddtui_submit`：发送普通下一轮输入；如果本地 session 正忙，会进入 ddtui 的 queued input。
 - `ddtui_steer`：发送忙碌中的实时插话。
 - `ddtui_interrupt`：请求中断当前回合。
