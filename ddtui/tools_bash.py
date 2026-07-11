@@ -57,6 +57,10 @@ def tool_bash(
         result = subprocess.run(
             command,
             shell=True,
+            # Keep tool commands off the TUI's tty: a command that reads
+            # stdin would steal keystrokes from the input loop (and hang
+            # until BASH_TIMEOUT waiting for terminal input).
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=BASH_TIMEOUT,

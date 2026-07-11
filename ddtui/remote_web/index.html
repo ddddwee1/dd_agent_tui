@@ -905,8 +905,13 @@
           renderStatus();
           renderMessages();
         }
-      } else if (message.type === "remote.input" || message.type === "tool.started") {
+      } else if (message.type === "remote.input") {
         appendMessage("tool", `${message.type}: ${JSON.stringify(payload)}`);
+      } else if (message.type === "tool.started") {
+        // Tool progress is reflected in the status bar and the next snapshot.
+        // Keeping each started event out of the transcript prevents tool-heavy
+        // turns from flooding the chat spine.
+        updateTyping();
       }
     }
 
@@ -1069,7 +1074,29 @@
         updateTyping();
         return;
       }
-      for (const message of all) {
+      for (let i = 0; i < all.length; i += 1) {
+        const message = all[i];
+        if (hasToolCalls(message)) {
+          const ids = new Set(
+            (message.tool_calls || [])
+              .map((tc) => tc.id)
+              .filter(Boolean)
+          );
+          const toolMessages = [];
+          let j = i + 1;
+          while (
+            j < all.length &&
+            all[j] &&
+            all[j].role === "tool" &&
+            ids.has(all[j].tool_call_id)
+          ) {
+            toolMessages.push(all[j]);
+            j += 1;
+          }
+          renderAssistantToolRound(message, toolMessages);
+          i = j - 1;
+          continue;
+        }
         renderMessage(message);
       }
       updateTyping();
@@ -1095,8 +1122,88 @@
       return `${name}(${parts.join(", ")})`;
     }
 
+    function hasToolCalls(message) {
+      return Boolean(
+        message &&
+        message.role === "assistant" &&
+        Array.isArray(message.tool_calls) &&
+        message.tool_calls.length
+      );
+    }
+
+    function renderAssistantToolRound(message, toolMessages = []) {
+      for (const tc of message.tool_calls || []) {
+        const fn = tc.function || {};
+        if (tc.id && fn.name) toolCallNames[tc.id] = fn.name;
+      }
+      const content = message.content || "";
+      if (content) {
+        appendMessageBlock("assistant", content, "assistant");
+      }
+      appendTraceBlock(message, toolMessages);
+    }
+
+    function toolRunLabel(toolCalls, toolMessages = []) {
+      const counts = new Map();
+      for (const tc of toolCalls) {
+        const name = ((tc.function || {}).name) || "?";
+        counts.set(name, (counts.get(name) || 0) + 1);
+      }
+      let names = [...counts.entries()].map(([name, count]) =>
+        count === 1 ? name : `${name} x${count}`
+      );
+      if (names.length > 4) {
+        names = [...names.slice(0, 4), `+${names.length - 4} kinds`];
+      }
+      const chars = toolMessages.reduce(
+        (n, msg) => n + String(msg.content || "").length,
+        0
+      );
+      const pending = toolMessages.length < toolCalls.length;
+      return `tools · ${toolCalls.length} ${toolCalls.length === 1 ? "call" : "calls"} · ${names.join(", ")} · ${chars.toLocaleString()} chars · ${pending ? "running" : "✓"}`;
+    }
+
+    function traceLabel(message, toolMessages = []) {
+      const reasoningChars = String(message.reasoning_content || "").length;
+      return `trace · ${reasoningChars.toLocaleString()} thinking chars · ${toolRunLabel(message.tool_calls || [], toolMessages)}`;
+    }
+
+    function formatToolRunContent(toolCalls, toolMessages = []) {
+      const byId = new Map();
+      for (const msg of toolMessages) byId.set(msg.tool_call_id || "", msg);
+      return toolCalls.map((tc, index) => {
+        const result = byId.get(tc.id || "");
+        const resultText = result ? String(result.content || "") : "running...";
+        return [
+          `${index + 1}. ${formatToolCall(tc)}`,
+          `result (${result ? resultText.length.toLocaleString() : 0} chars):`,
+          resultText,
+        ].join("\n");
+      }).join("\n\n");
+    }
+
+    function appendTraceBlock(message, toolMessages = []) {
+      const sections = [];
+      if (message.reasoning_content) {
+        sections.push(`thinking:\n${message.reasoning_content}`);
+      }
+      sections.push(
+        `tools:\n${formatToolRunContent(message.tool_calls || [], toolMessages)}`
+      );
+      appendMessageBlock(
+        "tool",
+        sections.join("\n\n"),
+        "tool",
+        traceLabel(message, toolMessages)
+      );
+    }
+
     function renderMessage(message) {
       const role = message.role || "event";
+      if (hasToolCalls(message)) {
+        renderAssistantToolRound(message, []);
+        return;
+      }
       if (message.reasoning_content) {
         appendMessageBlock("reasoning", message.reasoning_content, "reasoning");
       }
@@ -1156,7 +1263,7 @@
     function createFoldableBlock(role, content = "", className = role, labelText = role) {
       const root = document.createElement("details");
       root.className = `msg ${className} foldable`;
-      root.open = !isMobileComposer();
+      root.open = false;
       const summary = document.createElement("summary");
       const label = document.createElement("span");
       label.className = "role";

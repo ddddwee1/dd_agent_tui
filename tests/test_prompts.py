@@ -48,7 +48,8 @@ def test_prompt_key_rules_present():
 
 def test_all_injection_tags_framed():
     for tag in ["# 历史摘要", "# 探索摘要", "[实时插话]",
-                "[Async task complete]", "[Subagent result]"]:
+                "[Async task notice]", "[Async task complete]",
+                "[Subagent result]"]:
         assert tag in SYSTEM_PROMPT, tag
 
 
@@ -72,13 +73,14 @@ def test_subagent_prompt_identity_and_contract():
 def test_subagent_prompt_matches_its_toolset():
     sp = SUBAGENT_SYSTEM_PROMPT
     # teaches what it has (task/terminal with subagent-specific rules)
-    assert "task_start" in sp and "收不到任务完成通知" in sp
-    assert "用 task_wait 阻塞等待" in sp
+    assert "task_start" in sp and "task_pause" in sp
+    assert "waiting phase" in sp
+    assert "Async task complete" in sp
     assert "terminal_start" in sp
     # teaches explore (subagents own their spans since explore_core)
     assert "explore_start" in sp and "explore_end" in sp
     # never teaches what it lacks
-    for absent in ["checkpoint_tool", "spawn_agent", "await_agent"]:
+    for absent in ["checkpoint_tool", "spawn_agent", "agent_check", "await_agent"]:
         assert absent not in sp, absent
     assert "你没有 checkpoint" in sp
 
@@ -111,8 +113,9 @@ def test_registry_covers_all_schemas():
 
 def test_derived_sets():
     assert APP_DISPATCHED_TOOLS == frozenset({
-        "spawn_agent", "chat_agent", "await_agent", "end_agent",
-        "compact_self", "explore_start", "explore_end", "explore_cancel",
+        "spawn_agent", "chat_agent", "agent_check", "await_agent",
+        "end_agent", "compact_self", "task_pause",
+        "explore_start", "explore_end", "explore_cancel",
     })
     assert CONFIRM_TOOLS == frozenset(
         {"write_file", "edit_file", "edit_lines", "multi_edit"}
@@ -121,8 +124,9 @@ def test_derived_sets():
         {"edit_file", "edit_lines", "multi_edit"}
     )
     assert SUBAGENT_BLOCKED_TOOLS == frozenset({
-        "spawn_agent", "chat_agent", "await_agent", "end_agent",
+        "spawn_agent", "chat_agent", "agent_check", "await_agent", "end_agent",
         "checkpoint_tool", "checkpoint_get", "checkpoint_clear",
+        "task_wait",
     })
     assert "read_file" in PARALLEL_SAFE_TOOLS
     assert "write_file" not in PARALLEL_SAFE_TOOLS
@@ -133,7 +137,9 @@ def test_schema_visibility():
     schema_names = {t["function"]["name"] for t in TOOLS}
     parent = {t["function"]["name"] for t in PARENT_TOOL_SCHEMAS}
     sub = {t["function"]["name"] for t in SUBAGENT_TOOL_SCHEMAS}
-    assert parent == schema_names - {"compact_self"}
+    assert parent == schema_names - {
+        "compact_self", "task_pause", "task_wait", "await_agent",
+    }
     assert sub == schema_names - SUBAGENT_BLOCKED_TOOLS
 
 

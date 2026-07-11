@@ -81,6 +81,6 @@ def _exception_block(title: str, exc: BaseException) -> Collapsible:
     summary, detail = _format_exception_for_ui(exc)
     return Collapsible(
         Static(Text(detail, style="#f92672"), markup=False),
-        title=f"❌ {title} · {summary}",
+        title=f"❌ {title} · {summary}".replace("[", "\\["),
         collapsed=False,
     )

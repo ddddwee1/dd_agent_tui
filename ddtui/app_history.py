@@ -18,9 +18,7 @@ from .config import (
     COMPACT_KEEP_RECENT_TURNS,
     HISTORY_DIR,
     MAX_LIVE_SUBAGENTS,
-    SUBAGENT_DEFAULT_AWAIT_TIMEOUT,
     SUBAGENT_IDLE_TIMEOUT_SEC,
-    SUBAGENT_MAX_AWAIT_TIMEOUT,
     SUBAGENT_RESULT_MAX_CHARS,
 )
 from .runtime_state import (
@@ -44,8 +42,10 @@ from .widgets import (
     SteerBubble,
     ThinkingBlock,
     TodoBlock,
-    ToolCallBlock,
+    TraceBlock,
+    ToolRunBlock,
     UserBubble,
+    _sanitize_table_pipes,
 )
 
 
@@ -674,6 +674,7 @@ class AppHistoryMixin:
                 if tcid:
                     tool_results[tcid] = m.get("content") or ""
 
+        trace: TraceBlock | None = None
         for m in self.messages:
             role = m.get("role")
             if role == "system":
@@ -684,6 +685,7 @@ class AppHistoryMixin:
                 continue
             content = m.get("content") or ""
             if role == "user":
+                trace = None
                 if content.startswith("[实时插话] "):
                     await self._mount_widget(
                         SteerBubble(content[len("[实时插话] "):])
@@ -695,20 +697,25 @@ class AppHistoryMixin:
                 continue
 
             rc = m.get("reasoning_content")
+            has_tool_calls = bool(m.get("tool_calls") or [])
+            if (rc or has_tool_calls) and trace is None:
+                trace = TraceBlock()
+                await self._mount_widget(trace)
             if rc:
                 tb = ThinkingBlock()
                 tb.append_text(rc)
                 tb.finalize(0)
-                # Default-collapse on replay — a freshly loaded
-                # conversation shouldn't bury the user under walls of
+                # ThinkingBlock is collapsed by default, so a freshly
+                # loaded conversation won't bury the user under walls of
                 # thought from earlier turns.
-                tb.collapsed = True
-                await self._mount_widget(tb)
+                await trace.mount_trace_widget(tb)
             if content:
                 am = AssistantMessage()
                 am.append_text(content)
                 await self._mount_widget(am)
 
+            tool_run: ToolRunBlock | None = None
+            diff_blocks: list[DiffBlock] = []
             for tc in (m.get("tool_calls") or []):
                 fn = tc.get("function") or {}
                 name = fn.get("name", "?")
@@ -760,9 +767,17 @@ class AppHistoryMixin:
                             await self._sync_checkpoint_block()
                     continue
 
-                block = ToolCallBlock(name, args)
-                await self._mount_widget(block)
-                result = tool_results.get(tc.get("id"))
+                if tool_run is None:
+                    tool_run = ToolRunBlock()
+                    if trace is None:
+                        trace = TraceBlock()
+                        await self._mount_widget(trace)
+                    await trace.mount_trace_widget(tool_run)
+                tcid = tc.get("id") or ""
+                tool_run.add_call(tcid, name, args)
+                if trace is not None:
+                    trace.refresh_summary()
+                result = tool_results.get(tcid)
                 if result is None:
                     continue
                 diff_text = None
@@ -771,11 +786,15 @@ class AppHistoryMixin:
                     if sep and "@@" in diff:
                         diff_text = diff
                         result = head
-                block.set_result(result)
+                tool_run.set_result(tcid, result)
+                if trace is not None:
+                    trace.refresh_summary()
                 if diff_text:
-                    await self._mount_widget(
-                        DiffBlock(args.get("path", "?"), diff_text)
-                    )
+                    diff_blocks.append(DiffBlock(args.get("path", "?"), diff_text))
+            for diff_block in diff_blocks:
+                await self._mount_widget(diff_block)
+            if not has_tool_calls:
+                trace = None
 
     async def _show_help(self) -> None:
         md = (
@@ -810,27 +829,26 @@ class AppHistoryMixin:
             "### 工具(模型可调用)\n"
             "`bash` "
             "`terminal_start/send/read/interrupt/close/list` "
-            "`task_start/check/read/wait/kill/list` "
+            "`task_start/check/read/kill/list` "
             "`explore_start/end/cancel` "
             "`checkpoint_tool/get/clear` "
             "`project_note_add/search/list/read/update/delete` "
             "`read_file` `write_file` `edit_file` `edit_lines` `multi_edit` "
             "`list_files` `glob_files` `search_content` `web_fetch` `web_search` "
-            "`todo_tool` `spawn_agent` `chat_agent` `await_agent` `end_agent`\n"
+            "`todo_tool` `spawn_agent` `chat_agent` `agent_check` `end_agent`\n"
             "\n"
-            f"子 agent 四件套（异步并发）：`spawn_agent` / `chat_agent` "
-            f"立即返回 `session_id`，子 agent 在后台跑；用 "
-            f"`await_agent(session_id, timeout?)` 拿结果（默认 "
-            f"{SUBAGENT_DEFAULT_AWAIT_TIMEOUT}s，最大 "
-            f"{SUBAGENT_MAX_AWAIT_TIMEOUT}s，0=非阻塞 poll）；`end_agent` "
-            f"释放。并发用法：一次发多个 `spawn_agent` → 自己继续做别的事 "
-            f"→ 用 `await_agent` 分别收。\n"
+            f"子 agent（异步并发）：`spawn_agent` / `chat_agent` "
+            f"立即返回 `session_id`，子 agent 在后台跑；结果就绪会自动投递，"
+            f"也可用 `agent_check(session_id)` 做非阻塞状态/结果检查；"
+            f"`end_agent` 释放。并发用法：一次发多个 `spawn_agent` → "
+            f"自己继续做别的事 → 等 `[Subagent result]` 或按需 "
+            f"`agent_check`。\n"
             f"\n"
             f"上限：返回截断 {SUBAGENT_RESULT_MAX_CHARS:,} 字符；同时存活会话 "
             f"上限 {MAX_LIVE_SUBAGENTS} 个；闲置 {SUBAGENT_IDLE_TIMEOUT_SEC // 60} "
             f"分钟自动回收。子 agent 不能嵌套子 agent；token 计入主对话。\n"
         )
-        await self._mount_widget(Static(Markdown(md)))
+        await self._mount_widget(Static(Markdown(_sanitize_table_pipes(md))))
 
     async def _rewind_last_user(self) -> None:
         """Drop the most recent user message (and everything after it)

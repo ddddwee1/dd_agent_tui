@@ -245,6 +245,15 @@ class AppInputMixin:
             await self._mount_pending(bubble)
             self._queued.append((text, bubble))
             self._refresh_status()
+            # Re-assert focus: pending-tray mount can trigger layout
+            # recalculation that may steal focus from the input.
+            # Use synchronous set_focus (not widget.focus() which defers
+            # via call_later) so the assignment beats any async focus
+            # shifts that the layout trigger might schedule.
+            try:
+                self.screen.set_focus(inp)
+            except Exception:
+                inp.focus()
             return
 
         # New turn: snap back to the bottom — the user just submitted,
@@ -254,6 +263,12 @@ class AppInputMixin:
         self._agent_worker = self.run_worker(
             self._agent_turn(text), exclusive=True
         )
+        # Ensure input retains focus after mounting (the mount may
+        # have laid out new widgets and shifted focus).
+        try:
+            self.screen.set_focus(inp)
+        except Exception:
+            inp.focus()
 
     async def on_multiline_input_steer_submitted(
         self, event: "MultilineInput.SteerSubmitted"
@@ -263,8 +278,14 @@ class AppInputMixin:
         text = event.value.strip()
         if not text:
             return
-        self.query_one("#user-input", MultilineInput).text = ""
+        inp = self.query_one("#user-input", MultilineInput)
+        inp.text = ""
         bubble = SteerBubble(text)
         await self._mount_pending(bubble)
         self._steer.append((text, bubble))
         self._refresh_status()
+        # Restore focus synchronously (see queue-mode comment above).
+        try:
+            self.screen.set_focus(inp)
+        except Exception:
+            inp.focus()

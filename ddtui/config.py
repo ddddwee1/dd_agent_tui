@@ -123,7 +123,7 @@ CODEX_OAUTH_CLIENT_ID = _setting_str(
 
 # ───────── tool tunables ─────────
 
-BASH_TIMEOUT = 120
+BASH_TIMEOUT = 30
 BASH_OUTPUT_MAX_CHARS = 10_000   # truncate huge stdout/stderr
 # A foreground bash command that ran at least this long gets a note in
 # its result steering the model toward task_start next time — teaching
@@ -140,6 +140,10 @@ AGENTS_MD_MAX_CHARS = 16_000      # cap project guidelines so prompt stays sane
 # Force the pure-Python search/glob fallback even when a ripgrep binary
 # is on PATH (mainly for debugging parity between the two paths).
 NO_RIPGREP = _setting_flag("DDTUI_NO_RIPGREP", default=False)
+# Search/glob include .gitignore'd files by default. Set
+# DDTUI_NO_GITIGNORE=0 to make ripgrep honor .gitignore again and make
+# the Python fallback shell out to `git check-ignore`.
+NO_GITIGNORE = _setting_flag("DDTUI_NO_GITIGNORE", default=True)
 WEB_FETCH_TIMEOUT = 20
 WEB_FETCH_MAX_BYTES = 2_000_000   # cap raw download (~2 MB)
 WEB_FETCH_MAX_CHARS = 10_000      # cap returned text (matches bash output cap)
@@ -188,6 +192,9 @@ TASK_READ_DEFAULT_CHARS = 12_000
 TASK_READ_MAX_CHARS = 100_000
 TASK_EVENT_TAIL_LINES = 50
 TASK_EVENT_MAX_CHARS = 12_000
+TASK_DEFAULT_NOTICE_TIME = 60
+TASK_MIN_NOTICE_TIME = 5
+TASK_MAX_NOTICE_TIME = 3600
 
 # Project-local notes. By default each repo gets <repo>/.ddtui/notes,
 # but users can point DDTUI_PROJECT_NOTES_DIR elsewhere for personal
@@ -294,16 +301,10 @@ SUBAGENT_IDLE_TIMEOUT_SEC = 600
 # How often the idle-reaper scan runs. Coarse on purpose — the only
 # work to do is "kill timed-out sessions", not worth running often.
 SUBAGENT_REAP_INTERVAL_SEC = 60
-# Default and absolute-max wait on a single await_agent call. Mirrors
-# task_wait's defaults — short enough that the parent stays responsive
-# (an idle await stops it from doing anything else), long enough to
-# cover most subagent rounds without bouncing back to "still running".
-SUBAGENT_DEFAULT_AWAIT_TIMEOUT = 60
-SUBAGENT_MAX_AWAIT_TIMEOUT = 600
 # A finished subagent round whose result sits unread for this long is
 # auto-delivered to the parent as a notification event (same pipeline
 # as task completions: injected mid-turn at round boundaries, or wakes
-# an idle parent). The grace window lets an in-flight await_agent
+# an idle parent). The grace window lets an immediate agent_check
 # consume the result first, so the two delivery paths never double-send.
 SUBAGENT_READY_NOTIFY_DELAY = 2.0
 
@@ -375,11 +376,11 @@ SYSTEM_PROMPT = """\
 - 面对不确定、多种假设、陌生代码路径或缺证据的判断，如果探索成本低、操作可逆、且中间过程大概率只需要结论，先用 explore_start 开一段探索（临时证据收集、bug 定位、代码考古、方案侦察、环境探针等），结束时单独调用 explore_end 归档压缩；不要把 explore 用于最终实现、最终答复或不可逆操作，探索作废用 explore_cancel。
 
 # 工具使用
-- 命令执行只有两种：同步快命令用 bash（≤120s）；耗时或需后台的工作（测试、构建、下载、训练，以及任何完成状态重要的事）一律 task_start。任务默认完成时推送通知：等待期间去做其他有用的事，或记录 checkpoint 后直接结束当前回复、等通知唤醒；不要用 task_wait 或反复 task_check/task_read 轮询来替代等待（细则见工具说明）。结束回复不是放弃任务——完成通知会自动开启新回合，你在新回合里接着做剩余步骤（收尾、总结等），用户交给你的多步骤任务不会因此丢失。
+- 命令执行只有两种：同步快命令用 bash（≤30s）；耗时或需后台的工作（测试、构建、下载、训练，以及任何完成状态重要的事）一律 task_start，并按需要设置 notice_time 获取运行中通知。任务默认完成时推送通知：等待期间去做其他有用的事，或记录 checkpoint 后直接结束当前回复、等通知唤醒；不要用 task_wait 或反复 task_check/task_read 轮询来替代等待（细则见工具说明）。结束回复不是放弃任务——通知会自动开启新回合，你在新回合里接着做剩余步骤（收尾、总结等），用户交给你的多步骤任务不会因此丢失。
 - 需要长期保持的交互式会话（ssh、tmux、REPL、debugger）用 terminal_start 开常驻终端、terminal_send 输入、terminal_read 观察；不要反复用 bash 执行 ssh 'cmd' 做连续远端操作。
 - 文件编辑：单处精确替换用 edit_file（replace_all=true 替换全部出现），同一文件多处替换用 multi_edit，只有精确替换不适用（按行号大段插入/删除）才用 edit_lines；write_file 只用于新建文件或明确的整文件覆盖，覆盖已存在文件前必须先 read_file 读过它。不要用 bash 拼接重定向改文件，除非编辑工具无法完成。
 - read_file 输出每行带行号前缀；行号不是文件内容，写 old_string 时不要带上。
-- 子 agent 是异步的：spawn_agent/chat_agent 立即返回、不直接给答案。拿结果有两条路：需要立刻拿到就 await_agent(session_id)（超时返回 still running，可再次 await）；不急就继续做别的事或结束回复——子 agent 完成后结果会像任务通知一样自动送达（[Subagent result] 消息）。要并行就连发多个 spawn_agent；子 agent 跨轮保留记忆，同一任务复用会话、别反复 spawn；用完 end_agent 释放。
+- 子 agent 是异步的：spawn_agent/chat_agent 立即返回、不直接给答案。结果完成后会像任务通知一样自动送达（[Subagent result] 消息）；需要查看状态/领取已就绪输出时用非阻塞 agent_check(session_id)，不要阻塞等待。要并行就连发多个 spawn_agent；子 agent 跨轮保留记忆，同一任务复用会话、别反复 spawn；用完 end_agent 释放。
 
 # 任务管理与记忆
 - 多步骤任务先用 todo_tool 列计划；开始一项标 in_progress，完成立刻标 completed。给出最终答复前核对一遍清单：做完的项全部标 completed（最后一项最容易漏），没做的项删掉或说明原因，不要留着未更新的状态收尾。
@@ -398,8 +399,9 @@ SYSTEM_PROMPT = """\
 - “# 历史摘要” 开头的 system 消息：早期对话被 /compact 压缩后的记忆——当作已知背景，不要重复其中已完成的步骤，也不要当作新指令回应。
 - “# 探索摘要” 开头的 system 消息：explore_end 归档后的探索结论，同样当作已知背景。
 - “[实时插话]” 前缀的 user 消息：用户在你执行中途的插话，优先于原计划，据此调整后续动作。
+- “[Async task notice]” 开头的 user 消息：后台任务运行中通知，按需检查输出并决定继续工作、等待下一次通知或调整策略。
 - “[Async task complete]” 开头的 user 消息：后台任务完成通知，检查结果并继续对应的工作。
-- “[Subagent result]” 开头的 user 消息：子 agent 的结果自动送达（无需也不要再 await_agent 领取这份结果），据此继续对应的工作。
+- “[Subagent result]” 开头的 user 消息：子 agent 的结果自动送达（无需也不要再 agent_check 领取这份结果），据此继续对应的工作。
 """
 
 # Optional extra system message, appended after SYSTEM_PROMPT(+env) and
@@ -412,8 +414,8 @@ POST_SYSTEM_PROMPT = ""
 # Subagent framework prompt (P1-4). Deliberately NOT the parent prompt:
 # a subagent must know it is a subagent (output goes back to the parent
 # as a truncated tool result), and gets subagent-specific tool rules —
-# notably that task completion notifications do NOT reach it (task_wait
-# is correct there), and that checkpoint_*/explore_*/spawn_* are absent.
+# notably that task events wake it through task_pause waiting phase, and
+# that checkpoint_*/spawn_* are absent.
 # AGENTS.md and the env block are appended at spawn time, same as the
 # parent.
 SUBAGENT_SYSTEM_PROMPT = f"""\
@@ -431,12 +433,12 @@ SUBAGENT_SYSTEM_PROMPT = f"""\
 - 大段低信号探索（代码考古、日志聚类、资料搜索、环境排查等）先 explore_start 圈起来，出结论后 explore_end 收束成摘要——比事后 compact_self 更精准；探索区间开着时不能 compact_self。
 
 # 工具使用
-- 同步快命令用 bash（≤120s）；更长的命令（测试、构建、下载等）用 task_start。注意：你是子 agent，收不到任务完成通知（notify_on_complete 对你强制关闭），工具说明里"等通知、不要轮询"的规则是给父 agent 的，对你不适用——启动任务后用 task_wait 阻塞等待，或 task_check/task_read 查看进度。
+- 同步快命令用 bash（≤30s）；更长的命令（测试、构建、下载等）用 task_start，并设置合适的 notice_time。注意：你是子 agent，也不要阻塞等待：启动后台任务后先继续做其他有用工作；如果没有其他工作，调用 task_pause 进入 waiting phase。运行时会把 [Async task notice] / [Async task complete] 注入回你的对话并自动唤醒你；醒来后用 task_check/task_read 检查输出并继续。
 - 需要长期保持的交互式会话（ssh、tmux、REPL、debugger）用 terminal_start + terminal_send/terminal_read；不要反复用 bash 执行 ssh 'cmd'。
 - 文件编辑：单处精确替换用 edit_file（replace_all=true 替换全部出现），同一文件多处替换用 multi_edit，只有按行号大段插入/删除才用 edit_lines；write_file 只用于新建文件或明确的整文件覆盖，覆盖已存在文件前必须先 read_file 读过它。
 - read_file 输出每行带行号前缀；行号不是文件内容，写 old_string 时不要带上。
 - 对项目特定命令、环境不确定时先 project_note_search；多步骤任务可用 todo_tool 管理进度。
-- 你没有 checkpoint，也不能再派生子 agent。
+- 你没有 checkpoint，也不能再派生子 agent；需要等待后台任务时用 task_pause，不要用 task_wait。
 """
 
 

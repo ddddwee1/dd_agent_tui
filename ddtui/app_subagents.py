@@ -18,8 +18,6 @@ from .config import (
     COMPACT_KEEP_RECENT_TURNS,
     MAX_LIVE_SUBAGENTS,
     POST_SYSTEM_PROMPT,
-    SUBAGENT_DEFAULT_AWAIT_TIMEOUT,
-    SUBAGENT_MAX_AWAIT_TIMEOUT,
     SUBAGENT_READY_NOTIFY_DELAY,
     SUBAGENT_RESULT_MAX_CHARS,
     SUBAGENT_SYSTEM_PROMPT,
@@ -28,11 +26,17 @@ from .engine import ToolOutcome, TurnEngine, TurnObserver
 from .state import (
     SubagentSession,
     ToolContext,
+    async_task_status,
     kill_all_tasks,
     kill_all_terminals,
 )
 from .tools import SUBAGENT_BLOCKED_TOOLS, SUBAGENT_TOOL_SCHEMAS
+from .tools_tasks import collect_task_events
 from .widgets import SubagentTabPane
+
+
+class SubagentParked(Exception):
+    """Internal control-flow signal: a subagent round entered waiting."""
 
 
 class SubagentTurnObserver(TurnObserver):
@@ -90,7 +94,7 @@ class SubagentTurnObserver(TurnObserver):
                 getattr(usage, "completion_tokens", 0) or 0
             )
             # THIS call's prompt tokens (not cumulative) so the sidebar
-            # + await_agent gauge reflect how full the next request is.
+            # + agent_check gauge reflect how full the next request is.
             self.sess.last_prompt_tokens = (
                 getattr(usage, "prompt_tokens", 0) or 0
             )
@@ -101,7 +105,7 @@ class SubagentTurnObserver(TurnObserver):
         if pane is not None:
             try:
                 pane.finalize_thinking(self.app.counter.last_reasoning)
-                pane.finalize_answer()
+                pane.finalize_answer(keep_trace=bool(msg.get("tool_calls") or []))
                 pane.mark_round_committed()
             except Exception:
                 pass
@@ -156,6 +160,22 @@ class AppSubagentMixin:
         """
 
         async def before_round() -> None:
+            if sess.park_requested:
+                sess.park_requested = False
+                sess.phase = "waiting"
+                if sess.pane is not None:
+                    try:
+                        sess.pane.refresh_from_session()
+                    except Exception:
+                        pass
+                raise SubagentParked()
+
+            if sess.pending_events:
+                events = sess.pending_events
+                sess.pending_events = []
+                for event in events:
+                    sess.messages.append({"role": "user", "content": event})
+
             sess.turn += 1
             sess.phase = "thinking"
             sess.last_tool = None
@@ -176,6 +196,8 @@ class AppSubagentMixin:
                 # sometimes try anyway. spawn_* would nest; checkpoint_*
                 # has no consumer for a subagent.
                 return f"Error: {name} is not available to subagents."
+            if name == "task_pause":
+                return self._subagent_task_pause(sess, args)
             if name in ("explore_start", "explore_end", "explore_cancel"):
                 # Same core as the parent, bound to THIS session's state
                 # and message list. No main-pane widget: the summary
@@ -265,6 +287,8 @@ class AppSubagentMixin:
                     except Exception:
                         pass
                 raise
+            except SubagentParked:
+                raise
             except Exception as e:
                 sess.phase = "error"
                 if sess.pane is not None:
@@ -287,7 +311,7 @@ class AppSubagentMixin:
             # Idle / error are terminal-for-this-round; anything else
             # (cancelled, unexpected exit) becomes "error" so the panel
             # signals the user that something went wrong.
-            if sess.phase not in ("idle", "error"):
+            if sess.phase not in ("idle", "waiting", "error"):
                 sess.phase = "error"
             sess.last_active_at = time.monotonic()
 
@@ -297,12 +321,16 @@ class AppSubagentMixin:
         Wraps `_run_subagent_round` so its return value is captured on
         the session (`last_result`) instead of returned to a caller.
         Cancellation, stream errors, and unexpected crashes all become
-        a `last_result` string + phase=error so await_agent has
+        a `last_result` string + phase=error so agent_check has
         something concrete to return. `task` is cleared in `finally`
-        so chat_agent / await_agent / the reaper can tell the round
+        so chat_agent / agent_check / the reaper can tell the round
         has ended."""
         try:
             answer = await self._run_subagent_round(sess)
+        except SubagentParked:
+            sess.last_result = None
+            sess.phase = "waiting"
+            sess.last_active_at = time.monotonic()
         except asyncio.CancelledError:
             sess.last_result = "⛔ subagent task cancelled."
             sess.phase = "error"
@@ -321,6 +349,54 @@ class AppSubagentMixin:
         finally:
             sess.task = None
 
+    def _subagent_task_pause(self, sess: SubagentSession, args: dict) -> str:
+        """Subagent-only park primitive used after task_start.
+
+        The tool result is committed to history first. Then the next
+        before_round hook raises SubagentParked so the engine stops
+        before another model request. Task events later wake this same
+        session and are injected as user messages.
+        """
+        raw_ids = args.get("task_ids") if isinstance(args, dict) else None
+        if isinstance(raw_ids, str):
+            task_ids = [raw_ids]
+        elif isinstance(raw_ids, list):
+            task_ids = [str(x) for x in raw_ids if str(x).strip()]
+        else:
+            task_ids = []
+
+        if not task_ids:
+            task_ids = [
+                tid for tid, task in sess.ctx.tasks.items()
+                if async_task_status(task)[0] == "running"
+                and task.notify_on_complete
+            ]
+        unknown = [tid for tid in task_ids if tid not in sess.ctx.tasks]
+        if unknown:
+            return "Error: unknown task_id(s): " + ", ".join(unknown)
+        if not task_ids:
+            return (
+                "Error: no notified running tasks to wait for. Use "
+                "task_start(..., notify_on_complete=true) first, or "
+                "task_check/task_read if the task may already be done."
+            )
+
+        sess.waiting_refs = task_ids
+        sess.waiting_reason = str(args.get("reason") or "").strip()
+        sess.waiting_next_action = str(args.get("next_action") or "").strip()
+        sess.park_requested = True
+        sess.phase = "waiting"
+        refs = ", ".join(task_ids)
+        detail = (
+            f" reason={sess.waiting_reason!r}"
+            if sess.waiting_reason else ""
+        )
+        return (
+            f"[Subagent waiting] parked on task event(s): {refs}.{detail} "
+            "The runtime will wake this subagent with [Async task notice] "
+            "or [Async task complete]."
+        )
+
     def _spawn_subagent(
         self,
         prompt: str,
@@ -330,7 +406,8 @@ class AppSubagentMixin:
     ) -> str:
         """Create a fresh SubagentSession and schedule its first round
         as a background task. Returns immediately with the assigned
-        session_id; the parent calls `await_agent` to fetch the answer.
+        session_id; the answer auto-delivers or can be checked with
+        agent_check.
 
         Each session gets its own ToolContext (independent task/terminal
         tables) and the parent's work_dir and provider. Model / effort
@@ -351,9 +428,15 @@ class AppSubagentMixin:
 
         sub_model = (model or "").strip() or self.model
         sub_effort = (effort or "").strip() or self.effort
-        # is_subagent=True switches task_start into pure-background mode
-        # (no completion notifications — those only reach the parent).
-        sub_ctx = ToolContext(work_dir=self.ctx.work_dir, is_subagent=True)
+        sub_id = f"sub-{self._subagent_next_id}"
+        self._subagent_next_id += 1
+        # is_subagent=True lets task_start return subagent-specific
+        # park/wake guidance. This ctx has its own task event stream.
+        sub_ctx = ToolContext(
+            work_dir=self.ctx.work_dir,
+            session_id=f"{self._session_id}-{sub_id}",
+            is_subagent=True,
+        )
         # Subagents get their OWN framework prompt — they must know they
         # are subagents (output returns to the parent, truncated) and
         # must not be taught the meta tools they can't call. AGENTS.md
@@ -394,12 +477,10 @@ class AppSubagentMixin:
         # no spawn_* (no recursive forking), no explore_* (the impl
         # compacts the PARENT's history), no checkpoint_* (no consumer
         # for a subagent). task_* and terminal_* ARE available (own ctx
-        # tables, cleaned up by end_agent/reaper); task notifications
-        # are disabled via ctx.is_subagent, so subagents task_wait.
+        # tables, cleaned up by end_agent/reaper); task events wake a
+        # parked subagent through task_pause.
         sub_tools = list(SUBAGENT_TOOL_SCHEMAS)
 
-        sub_id = f"sub-{self._subagent_next_id}"
-        self._subagent_next_id += 1
         preview = prompt.strip().replace("\n", " ")
         if len(preview) > 40:
             preview = preview[:40] + "…"
@@ -416,7 +497,7 @@ class AppSubagentMixin:
             effort=sub_effort,
         )
         # Resolve the model's context window once so the sidebar +
-        # await_agent return can render a ctx% gauge. None if the
+        # agent_check return can render a ctx% gauge. None if the
         # provider doesn't know (we just skip the gauge in that case).
         try:
             sess.context_limit = self.provider.context_limit_for_model(
@@ -437,17 +518,19 @@ class AppSubagentMixin:
         self.call_later(self._add_sub_tab, sess)
         return (
             f"[session_id={sub_id}, status=running] subagent spawned. "
-            f"Call await_agent(session_id='{sub_id}') to fetch the answer."
+            "It will auto-deliver [Subagent result] when ready; use "
+            f"agent_check(session_id='{sub_id}') for a non-blocking status "
+            "check."
         )
 
     def _chat_subagent(self, sid: str, prompt: str) -> str:
         """Append `prompt` to an existing session and schedule the
         next round as a background task. Returns immediately; the
-        parent calls `await_agent` to fetch the answer.
+        parent receives the answer via auto-delivery or agent_check.
 
         Errors if the session is busy (a previous round still running)
         or if there's an unread result still waiting — the parent must
-        await_agent the previous round's answer before sending another.
+        agent_check the previous round's answer before sending another.
         """
         if not sid or not prompt.strip():
             return (
@@ -463,71 +546,82 @@ class AppSubagentMixin:
         if sess.task is not None and not sess.task.done():
             return (
                 f"Error: session {sid} is still running an earlier "
-                "round. Call await_agent first."
+                "round. Use agent_check for status."
+            )
+        if sess.phase == "waiting":
+            return (
+                f"Error: session {sid} is waiting on task event(s) "
+                f"{sess.waiting_refs}. Use agent_check for status or "
+                "end_agent to cancel it."
             )
         if sess.last_result is not None:
             return (
                 f"Error: session {sid} has an unread result. Call "
-                "await_agent first to consume it."
+                "agent_check first to consume it."
             )
         sess.messages.append({"role": "user", "content": prompt})
         sess.last_active_at = time.monotonic()
         sess.task = asyncio.create_task(self._run_subagent_task(sess))
         return (
-            f"[session_id={sid}, status=running] chat sent. Call "
-            f"await_agent(session_id='{sid}') to fetch the answer."
+            f"[session_id={sid}, status=running] chat sent. It will "
+            "auto-deliver [Subagent result] when ready; use "
+            f"agent_check(session_id='{sid}') for a non-blocking status "
+            "check."
         )
 
     async def _await_subagent(
         self, sid: str, timeout: float | int | None
     ) -> str:
-        """Wait for a session's pending round (up to `timeout`s) and
-        return its answer, consuming `last_result`. timeout=0 polls
-        without blocking. If the round is still running when the
-        timeout expires, returns a 'still running' notice WITHOUT
-        cancelling the task (the parent can await_agent again or
-        end_agent to give up).
+        """Deprecated compatibility wrapper for old conversations.
+
+        await_agent used to block. New subagent flow is task-like:
+        spawn/chat are fire-and-forget, result auto-delivers, and
+        agent_check is the non-blocking status/result inspection path.
+        """
+        return (
+            "Deprecated: await_agent no longer blocks. Use agent_check "
+            "for non-blocking status/output checks.\n"
+            + self._check_subagent(sid)
+        )
+
+    def _check_subagent(self, sid: str) -> str:
+        """Non-blocking status/result check for a subagent session.
+
+        If a result is ready, this consumes it so chat_agent can send a
+        follow-up. Running/waiting states are status-only.
         """
         if not sid:
-            return "Error: await_agent requires a 'session_id' argument."
+            return "Error: agent_check requires a 'session_id' argument."
         sess = self._live_subagents.get(sid)
         if sess is None:
             return (
                 f"Error: unknown session_id '{sid}' (already ended or "
                 "idle-reaped)."
             )
-        # Resolve timeout — clamp to [0, max].
-        if timeout is None:
-            wait_secs: float = float(SUBAGENT_DEFAULT_AWAIT_TIMEOUT)
-        else:
-            try:
-                wait_secs = float(timeout)
-            except (TypeError, ValueError):
-                wait_secs = float(SUBAGENT_DEFAULT_AWAIT_TIMEOUT)
-        if wait_secs < 0:
-            wait_secs = 0.0
-        if wait_secs > SUBAGENT_MAX_AWAIT_TIMEOUT:
-            wait_secs = float(SUBAGENT_MAX_AWAIT_TIMEOUT)
 
-        # Wait for the task to finish if one is in flight. asyncio.wait
-        # does NOT cancel pending tasks on timeout — exactly what we
-        # want: the subagent keeps running, the parent can poll again.
         if sess.task is not None and not sess.task.done():
-            done, _pending = await asyncio.wait(
-                {sess.task}, timeout=wait_secs
+            return (
+                f"[session_id={sid}, status=running, phase={sess.phase}, "
+                f"turn={sess.turn}, last_tool={sess.last_tool}] "
+                "Result is not ready yet. Keep working or wait for "
+                "[Subagent result]."
             )
-            if not done:
-                return (
-                    f"[session_id={sid}, status=running] still running "
-                    f"after {wait_secs:.0f}s ({sess.phase}, turn "
-                    f"{sess.turn}). Call await_agent again."
-                )
-
-        # Task is done (or there was none). Surface the pending result.
+        if sess.phase == "waiting":
+            refs = ", ".join(sess.waiting_refs) or "(unspecified)"
+            reason = (
+                f", reason={sess.waiting_reason!r}"
+                if sess.waiting_reason else ""
+            )
+            return (
+                f"[session_id={sid}, status=waiting, turn={sess.turn}, "
+                f"tasks={refs}{reason}] Waiting for task notice/complete; "
+                "the runtime will wake the subagent automatically."
+            )
         if sess.last_result is None:
             return (
-                f"Error: session {sid} has no pending result. Send "
-                "chat_agent before await_agent."
+                f"[session_id={sid}, status={sess.phase}, turn={sess.turn}] "
+                "No pending result. Send chat_agent for a follow-up or "
+                "end_agent if the session is no longer needed."
             )
         result = sess.last_result
         sess.last_result = None
@@ -539,11 +633,12 @@ class AppSubagentMixin:
         # compact_self call before the next round. Skipped when the
         # provider doesn't expose a context_limit.
         header = self._subagent_ctx_gauge(sess)
-        return header + result if header else result
+        prefix = f"[session_id={sid}, status=ready, turn={sess.turn}]\n"
+        return prefix + (header + result if header else result)
 
     @staticmethod
     def _subagent_ctx_gauge(sess: SubagentSession) -> str:
-        """Context-pressure header shared by await_agent returns and
+        """Context-pressure header shared by agent_check returns and
         auto-delivered result notifications. Empty when the provider
         doesn't expose a context_limit."""
         if sess.context_limit and sess.last_prompt_tokens:
@@ -554,15 +649,41 @@ class AppSubagentMixin:
             )
         return ""
 
+    def _poll_subagent_task_events(self) -> int:
+        """Collect task notices/completions for live subagents.
+
+        Running subagents receive the events at the next model-round
+        boundary. Parked subagents are woken immediately by scheduling
+        a fresh round with the events already queued in `pending_events`.
+        Returns the number of task events collected for UI notification.
+        """
+        n_events = 0
+        for sess in self._live_subagents.values():
+            if sess.phase not in ("thinking", "answering", "tool", "waiting"):
+                continue
+            events = collect_task_events(sess.ctx)
+            if not events:
+                continue
+            n_events += len(events)
+            sess.pending_events.extend(events)
+            if (
+                sess.phase == "waiting"
+                and sess.task is None
+                and sess.last_result is None
+            ):
+                sess.phase = "thinking"
+                sess.task = asyncio.create_task(self._run_subagent_task(sess))
+        return n_events
+
     def _collect_ready_subagent_events(self) -> list[str]:
         """Package idle-ready subagent results as notification events,
         consuming them (ready → idle) — task-completion-style delivery.
 
         Called by the 1 Hz notification poller. Results younger than
         SUBAGENT_READY_NOTIFY_DELAY are skipped so an in-flight
-        await_agent (which consumes within milliseconds of the round
-        ending) always wins; only results the parent left unread get
-        pushed. The session stays alive for chat_agent follow-ups.
+        agent_check can consume first; only results the parent left
+        unread get pushed. The session stays alive for chat_agent
+        follow-ups.
         """
         events: list[str] = []
         now = time.monotonic()
@@ -584,7 +705,7 @@ class AppSubagentMixin:
             events.append(
                 f"[Subagent result] session_id={sess.id} (turn "
                 f"{sess.turn}) finished; its answer is delivered below — "
-                "do NOT call await_agent for it (already consumed). The "
+                "do NOT call agent_check for it (already consumed). The "
                 "session stays alive for chat_agent follow-ups; end_agent "
                 "it when no longer needed.\n"
                 f"{gauge}{result}"

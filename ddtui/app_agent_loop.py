@@ -33,7 +33,8 @@ from .widgets import (
     SteerBubble,
     ThinkingBlock,
     TodoBlock,
-    ToolCallBlock,
+    TraceBlock,
+    ToolRunBlock,
     UserBubble,
 )
 
@@ -46,7 +47,7 @@ class ParentTurnObserver(TurnObserver):
     """Bridges TurnEngine events to the main-conversation UI, the
     remote relay, and history persistence (autosave + turn journal)."""
 
-    # Sidebar-rendered tools: no ToolCallBlock in the conversation flow,
+    # Sidebar-rendered tools: no ToolRunBlock in the conversation flow,
     # their UI lives in the sidebar (TodoBlock / CheckpointBlock).
     NO_BLOCK_TOOLS = frozenset({
         "todo_tool", "checkpoint_tool", "checkpoint_clear",
@@ -56,7 +57,9 @@ class ParentTurnObserver(TurnObserver):
         self.app = app
         self._thinking: ThinkingBlock | None = None
         self._answer: AssistantMessage | None = None
-        self._blocks: dict[str, ToolCallBlock] = {}
+        self._trace: TraceBlock | None = None
+        self._tool_run: ToolRunBlock | None = None
+        self._blocks: dict[str, ToolRunBlock] = {}
 
     def _scroll_view(self) -> VerticalScroll:
         return self.app.query_one("#conversation", VerticalScroll)
@@ -67,13 +70,22 @@ class ParentTurnObserver(TurnObserver):
         except Exception:
             pass
 
+    async def _ensure_trace(self) -> TraceBlock:
+        if self._trace is None:
+            self._trace = TraceBlock()
+            await self.app._mount_widget(self._trace)
+        return self._trace
+
     # ── streaming ──
 
     async def on_reasoning_delta(self, text: str) -> None:
         if self._thinking is None:
             self._thinking = ThinkingBlock()
-            await self.app._mount_widget(self._thinking)
+            trace = await self._ensure_trace()
+            await trace.mount_trace_widget(self._thinking)
         self._thinking.append_text(text)
+        if self._trace is not None:
+            self._trace.refresh_summary()
         self._emit("assistant.delta", {"kind": "reasoning", "text": text})
         if self.app._follow_bottom:
             self._scroll_view().scroll_end(animate=False)
@@ -97,8 +109,17 @@ class ParentTurnObserver(TurnObserver):
                     w.remove()
                 except Exception:
                     pass
+                if self._trace is not None:
+                    self._trace.discard_trace_widget(w)
         self._thinking = None
         self._answer = None
+        self._tool_run = None
+        if self._trace is not None and self._trace.is_empty:
+            try:
+                self._trace.remove()
+            except Exception:
+                pass
+        self._trace = None
 
     async def on_usage(self, usage) -> None:
         self.app.counter.add(usage)
@@ -106,6 +127,8 @@ class ParentTurnObserver(TurnObserver):
     async def on_assistant_message(self, msg: dict) -> None:
         if self._thinking is not None:
             self._thinking.finalize(self.app.counter.last_reasoning)
+            if self._trace is not None:
+                self._trace.refresh_summary()
         self.app._refresh_status()
         if self.app._follow_bottom:
             view = self._scroll_view()
@@ -113,6 +136,9 @@ class ParentTurnObserver(TurnObserver):
         self._emit("message.append", {"message": msg, "source": "assistant"})
         self._thinking = None
         self._answer = None
+        self._tool_run = None
+        if not (msg.get("tool_calls") or []):
+            self._trace = None
 
     # ── tools ──
 
@@ -129,16 +155,23 @@ class ParentTurnObserver(TurnObserver):
             message_len_current=len(self.app.messages),
         )
         if name not in self.NO_BLOCK_TOOLS:
-            block = ToolCallBlock(name, args)
-            await self.app._mount_widget(block)
-            self._blocks[tc_id or name] = block
+            if self._tool_run is None:
+                self._tool_run = ToolRunBlock()
+                trace = await self._ensure_trace()
+                await trace.mount_trace_widget(self._tool_run)
+            self._tool_run.add_call(tc_id, name, args)
+            if self._trace is not None:
+                self._trace.refresh_summary()
+            self._blocks[tc_id or name] = self._tool_run
 
     async def on_tool_result(
         self, tc_id: str, name: str, args: dict, outcome: ToolOutcome
     ) -> None:
         block = self._blocks.pop(tc_id or name, None)
         if block is not None:
-            block.set_result(outcome.content, blocked=not outcome.ok)
+            block.set_result(tc_id, outcome.content, blocked=not outcome.ok)
+            if self._trace is not None:
+                self._trace.refresh_summary()
         if outcome.diff:
             await self.app._mount_widget(
                 DiffBlock(args.get("path", "?"), outcome.diff)
@@ -381,6 +414,12 @@ class AppAgentLoopMixin:
                 "agent should compress history via the /compact slash "
                 "command (user-triggered), not as a tool call."
             )
+        if name == "task_pause":
+            return (
+                "Error: task_pause is a subagent-only tool. The main agent "
+                "should finish the current response and let task_start "
+                "notifications wake the next turn."
+            )
 
         if name in ("explore_start", "explore_end", "explore_cancel"):
             try:
@@ -394,12 +433,14 @@ class AppAgentLoopMixin:
             except Exception as e:
                 return f"Error: {name} failed: {type(e).__name__}: {e}"
 
-        if name in ("spawn_agent", "chat_agent", "await_agent", "end_agent"):
+        if name in (
+            "spawn_agent", "chat_agent", "agent_check",
+            "await_agent", "end_agent",
+        ):
             # spawn_agent and chat_agent are fire-and-forget — they
-            # schedule a task and return immediately. await_agent is the
-            # only one that blocks; it's cancellable via parent ESC×2
-            # and will NOT cancel the underlying subagent on its own
-            # timeout (use end_agent for that).
+            # schedule a task and return immediately. agent_check is
+            # the non-blocking status/result path; await_agent remains
+            # a compatibility stub for old conversations.
             if name == "spawn_agent":
                 result = self._spawn_subagent(
                     args.get("prompt") or "",
@@ -411,6 +452,8 @@ class AppAgentLoopMixin:
                 result = self._chat_subagent(
                     args.get("session_id") or "", args.get("prompt") or ""
                 )
+            elif name == "agent_check":
+                result = self._check_subagent(args.get("session_id") or "")
             elif name == "await_agent":
                 result = await self._await_subagent(
                     args.get("session_id") or "", args.get("timeout")

@@ -1,16 +1,19 @@
 """File enumeration, regex search, and glob tool implementations.
 
 search_content and glob_files prefer ripgrep when it is installed —
-one to two orders of magnitude faster on big trees, .gitignore-aware,
-and with glob semantics identical to ours. Every rg failure mode
+one to two orders of magnitude faster on big trees, and with glob
+semantics identical to ours. Every rg failure mode
 (binary missing, unsupported regex syntax, timeout) falls back to the
 pure-Python implementation, so behavior degrades gracefully rather
 than erroring. Set DDTUI_NO_RIPGREP=1 to force the Python paths.
 
 Behavior parity notes: the rg paths pass --hidden plus explicit
-exclusions mirroring DEFAULT_IGNORED_DIRS / _FILE_PATTERNS, so the two
-implementations see the same tree — except that rg additionally
-respects .gitignore (a strict improvement for source-focused search).
+exclusions mirroring DEFAULT_IGNORED_DIRS / _FILE_PATTERNS, and the
+Python paths can run each directory through `git check-ignore`, so both
+can honor .gitignore (nested files, negations, core.excludesFile). By
+default ignored files are included: rg gets --no-ignore-vcs and the
+Python paths skip the git query. Set DDTUI_NO_GITIGNORE=0 to honor
+.gitignore on both paths.
 """
 
 from __future__ import annotations
@@ -21,11 +24,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .config import NO_RIPGREP
+from .config import NO_GITIGNORE, NO_RIPGREP
 from .state import ToolContext
 from .tool_utils import (
     DEFAULT_IGNORED_DIRS,
     DEFAULT_IGNORED_FILE_PATTERNS,
+    _GitIgnoreFilter,
     _is_ignored_path,
     _matches_glob,
     _prune_ignored_dirs,
@@ -54,6 +58,17 @@ def _rg_ignore_globs() -> list[str]:
     return args
 
 
+def _rg_tree_args() -> list[str]:
+    """--hidden + the built-in exclusions shared by the rg search and
+    glob paths, plus --no-ignore-vcs unless the user opted into
+    .gitignore filtering. rg respects .gitignore by default, so the flag
+    is added to make ignored files visible."""
+    args = ["--hidden", *_rg_ignore_globs()]
+    if NO_GITIGNORE:
+        args.append("--no-ignore-vcs")
+    return args
+
+
 def _run_rg(args: list[str], cwd: str) -> subprocess.CompletedProcess | None:
     """Run ripgrep; None means 'unusable, fall back to Python'.
 
@@ -66,6 +81,7 @@ def _run_rg(args: list[str], cwd: str) -> subprocess.CompletedProcess | None:
         r = subprocess.run(
             [_RG_PATH, *args],
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=_RG_TIMEOUT,
@@ -147,16 +163,15 @@ def _search_rg(
 
     file_filter is applied in Python via _matches_glob, NOT passed as
     rg -g: command-line globs are rg's highest-precedence override
-    layer, so a whitelist -g resurrects .gitignore'd files — exactly
-    the wrong interaction. Post-filtering match lines is cheap and
-    keeps one authoritative glob semantics (ours, tested).
+    layer, so a whitelist -g can bypass configured .gitignore
+    filtering. Post-filtering match lines is cheap and keeps one
+    authoritative glob semantics (ours, tested).
     """
     args = [
         "--line-number", "--no-heading", "--color=never",
         "--max-columns", "4096", "--max-columns-preview",
         "--max-count", str(SEARCH_MAX_MATCHES),  # per-file blowup guard
-        "--hidden",
-        *_rg_ignore_globs(),
+        *_rg_tree_args(),
     ]
     if not case_sensitive:
         args.append("-i")
@@ -184,13 +199,20 @@ def _search_rg(
 def _search_python(
     p: Path, regex: re.Pattern, file_filter: str
 ) -> list[str]:
-    """Pure-Python fallback: os.walk + line regex."""
+    """Pure-Python fallback: os.walk + line regex, with optional
+    .gitignore filtering (via git) to match the rg path."""
     matches: list[str] = []
     files_to_search: list[Path] = []
     file_scan_truncated = False
+    gitignore = _GitIgnoreFilter(p)
     for root, dirs, files in os.walk(p):
         _prune_ignored_dirs(root, dirs)
+        ignored = gitignore.ignored(root, dirs + files)
+        if ignored:
+            dirs[:] = [d for d in dirs if d not in ignored]
         for f in files:
+            if f in ignored:
+                continue
             fpath = Path(root, f)
             if _is_ignored_path(fpath):
                 continue
@@ -276,7 +298,7 @@ def _glob_rg(p: Path, pattern: str) -> list[Path] | None:
 
     The pattern is matched in Python (_matches_glob), not via rg -g —
     see _search_rg for why (-g overrides .gitignore)."""
-    args = ["--files", "--hidden", *_rg_ignore_globs()]
+    args = ["--files", *_rg_tree_args()]
     r = _run_rg(args, cwd=str(p))
     if r is None:
         return None
@@ -291,11 +313,18 @@ def _glob_rg(p: Path, pattern: str) -> list[Path] | None:
 
 
 def _glob_python(p: Path, pattern: str) -> list[Path]:
-    """Pure-Python fallback: os.walk + _matches_glob."""
+    """Pure-Python fallback: os.walk + _matches_glob, with optional
+    .gitignore filtering (via git) to match the rg path."""
     matches: list[Path] = []
+    gitignore = _GitIgnoreFilter(p)
     for root, dirs, files in os.walk(p):
         _prune_ignored_dirs(root, dirs)
+        ignored = gitignore.ignored(root, dirs + files)
+        if ignored:
+            dirs[:] = [d for d in dirs if d not in ignored]
         for f in files:
+            if f in ignored:
+                continue
             match = Path(root, f)
             if _is_ignored_path(match):
                 continue
@@ -316,9 +345,10 @@ def tool_glob_files(ctx: ToolContext, pattern: str, path: str = ".") -> str:
 
     Common VCS/cache/build artifacts are skipped by default so patterns
     like `**/*.py` stay source-focused instead of returning `.git`,
-    `__pycache__`, or egg-info contents. Sorted by mtime descending so
-    recently-touched files come first. ripgrep-accelerated (and then
-    .gitignore-aware) when available.
+    `__pycache__`, or egg-info contents. .gitignore'd files are included
+    by default. Set DDTUI_NO_GITIGNORE=0 to skip them too (via ripgrep,
+    or `git check-ignore` on the Python fallback). Sorted by mtime
+    descending so recently-touched files come first.
     """
     p = _safe_path(ctx.work_dir, path)
     if not p.exists():

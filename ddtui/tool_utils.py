@@ -6,9 +6,11 @@ import difflib
 import fnmatch
 import functools
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
-from .config import DANGEROUS_SHELL_PATTERNS
+from .config import DANGEROUS_SHELL_PATTERNS, NO_GITIGNORE
 
 
 _BASH_HARD_CHAR_CAP = 100_000
@@ -141,6 +143,79 @@ def _is_ignored_path(path: Path) -> bool:
 def _prune_ignored_dirs(root: str, dirs: list[str]) -> None:
     root_path = Path(root)
     dirs[:] = [d for d in dirs if not _is_ignored_path(root_path / d)]
+
+
+_GIT_CHECK_IGNORE_TIMEOUT = 10
+
+
+class _GitIgnoreFilter:
+    """Batch `git check-ignore` so the pure-Python search/glob fallbacks
+    can honor .gitignore the way ripgrep does natively.
+
+    Constructed once per tree walk. It is inert — reporting nothing as
+    ignored — by default, when git is missing, when DDTUI_NO_GITIGNORE
+    is set, or when the root is not inside a work tree, so callers
+    degrade cleanly to the built-in ignore list. Delegating to git
+    (rather than re-parsing .gitignore) gets nested ignore files,
+    negations, core.excludesFile and .git/info/exclude correct for free.
+    """
+
+    _git: str | None = shutil.which("git")
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._active = (
+            not NO_GITIGNORE
+            and self._git is not None
+            and self._inside_work_tree()
+        )
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def _inside_work_tree(self) -> bool:
+        try:
+            r = subprocess.run(
+                [self._git, "rev-parse", "--is-inside-work-tree"],
+                cwd=str(self._root),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=_GIT_CHECK_IGNORE_TIMEOUT,
+            )
+        except Exception:
+            return False
+        return r.returncode == 0 and r.stdout.strip() == "true"
+
+    def ignored(self, dir_abs: str, names: list[str]) -> set[str]:
+        """Return which of *names* (basenames directly under absolute
+        *dir_abs*) git ignores. Empty set when inactive or on any error,
+        so a git hiccup mid-walk just falls back to the built-in list."""
+        if not self._active or not names:
+            return set()
+        rels = [
+            Path(dir_abs, n).relative_to(self._root).as_posix() for n in names
+        ]
+        # NUL-terminate each record so paths with newlines/spaces survive.
+        payload = "".join(rel + "\0" for rel in rels)
+        try:
+            r = subprocess.run(
+                [self._git, "check-ignore", "--stdin", "-z"],
+                cwd=str(self._root),
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=_GIT_CHECK_IGNORE_TIMEOUT,
+            )
+        except Exception:
+            return set()
+        # 0 = some ignored, 1 = none; 128 (not a repo) or anything else →
+        # report nothing and let the built-in ignore list carry the walk.
+        if r.returncode not in (0, 1):
+            return set()
+        hit = {x for x in r.stdout.split("\0") if x}
+        return {n for n, rel in zip(names, rels) if rel in hit}
 
 
 def _translate_glob(pattern: str) -> str:

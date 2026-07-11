@@ -26,6 +26,7 @@ def _git_snapshot(work_dir: str) -> str | None:
         r = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=work_dir,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=2,

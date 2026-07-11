@@ -5,7 +5,7 @@ import asyncio
 
 import ddtui.app as app_mod
 from ddtui.providers import LLMProvider, LLMStreamEvent, ToolCallDelta
-from ddtui.widgets import AssistantMessage, ThinkingBlock, ToolCallBlock
+from ddtui.widgets import AssistantMessage, ThinkingBlock, TraceBlock, ToolRunBlock
 from tests.conftest import REPO_ROOT
 
 
@@ -25,6 +25,19 @@ class FakeProvider(LLMProvider):
                     index=0, id="call_0", type="function",
                     name="read_file",
                     arguments=f'{{"path": "{readme}", "limit": 3}}',
+                )),
+                LLMStreamEvent(tool_call=ToolCallDelta(
+                    index=1, id="call_1", type="function",
+                    name="read_file",
+                    arguments=f'{{"path": "{readme}", "limit": 1}}',
+                )),
+            ],
+            [
+                LLMStreamEvent(reasoning="再看一眼开头"),
+                LLMStreamEvent(tool_call=ToolCallDelta(
+                    index=0, id="call_2", type="function",
+                    name="read_file",
+                    arguments=f'{{"path": "{readme}", "limit": 1}}',
                 )),
             ],
             [LLMStreamEvent(content="已读取，"), LLMStreamEvent(content="完成。")],
@@ -48,10 +61,16 @@ def test_full_turn_through_engine(monkeypatch):
             await pilot.pause()
 
             roles = [m["role"] for m in app.messages if m["role"] != "system"]
-            assert roles == ["user", "assistant", "tool", "assistant"]
+            assert roles == [
+                "user",
+                "assistant", "tool", "tool",
+                "assistant", "tool",
+                "assistant",
+            ]
 
             asst = next(m for m in app.messages if m.get("tool_calls"))
             assert asst["tool_calls"][0]["function"]["name"] == "read_file"
+            assert asst["tool_calls"][1]["function"]["name"] == "read_file"
             assert asst["reasoning_content"] == "先读一下 README"
 
             tool_msg = next(m for m in app.messages if m["role"] == "tool")
@@ -59,8 +78,12 @@ def test_full_turn_through_engine(monkeypatch):
             assert "\t" in tool_msg["content"]  # numbered output
 
             assert app.messages[-1]["content"] == "已读取，完成。"
-            assert len(app.query(ThinkingBlock)) == 1
-            assert len(app.query(ToolCallBlock)) == 1
+            assert len(app.query(TraceBlock)) == 1
+            assert len(app.query(ThinkingBlock)) == 2
+            tool_runs = list(app.query(ToolRunBlock))
+            assert len(tool_runs) == 2
+            assert "2 calls" in tool_runs[0].title
+            assert "read_file x2" in tool_runs[0].title
             assert len(app.query(AssistantMessage)) == 1
             assert app._busy is False
 

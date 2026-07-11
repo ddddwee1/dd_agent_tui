@@ -14,11 +14,14 @@ from pathlib import Path
 from .config import (
     ALLOW_UNSANDBOXED_BASH,
     TASK_DEFAULT_TAIL_LINES,
+    TASK_DEFAULT_NOTICE_TIME,
     TASK_DEFAULT_WAIT_TIMEOUT,
     TASK_EVENT_MAX_CHARS,
     TASK_EVENT_TAIL_LINES,
     TASK_MAX_CONCURRENT,
+    TASK_MAX_NOTICE_TIME,
     TASK_MAX_WAIT_TIMEOUT,
+    TASK_MIN_NOTICE_TIME,
     TASK_OUTPUT_DIR,
     TASK_READ_DEFAULT_CHARS,
     TASK_READ_MAX_CHARS,
@@ -53,6 +56,23 @@ def _clamp_int(value, default: int, low: int, high: int) -> int:
         return max(low, min(high, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+def _clamp_notice_time(value) -> float | None:
+    """Normalize task_start.notice_time.
+
+    None/0 disables running notices; positive values are clamped so a
+    typo cannot create a sub-second wake loop or a multi-day silence.
+    """
+    if value is None:
+        return float(TASK_DEFAULT_NOTICE_TIME)
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return float(TASK_DEFAULT_NOTICE_TIME)
+    if seconds <= 0:
+        return None
+    return float(max(TASK_MIN_NOTICE_TIME, min(TASK_MAX_NOTICE_TIME, seconds)))
 
 
 def _short_command(command: str, limit: int = 48) -> str:
@@ -118,6 +138,12 @@ def _task_registry_payload(task: AsyncTask) -> dict:
         "status": status,
         "return_code": rc,
         "notify_on_complete": task.notify_on_complete,
+        "notice_time": task.notice_time,
+        "notice_count": task.notice_count,
+        "next_notice_at": _iso_from_ts(
+            time.time() + (task.next_notice_at - time.monotonic())
+            if task.next_notice_at is not None else None
+        ),
         "notified": task.notified,
         "killed": task.killed,
     }
@@ -147,6 +173,8 @@ def _write_status(task: AsyncTask) -> None:
         "output_path": str(task.output_path),
         "status_path": str(task.status_path),
         "notify_on_complete": task.notify_on_complete,
+        "notice_time": task.notice_time,
+        "notice_count": task.notice_count,
     }
     tmp = task.status_path.with_name(
         f".{task.status_path.name}.{os.getpid()}.tmp"
@@ -233,6 +261,10 @@ def recover_tasks_for_session(ctx: ToolContext, session_id: str) -> list[AsyncTa
             started_at=started_at,
             started_wall=float(started_wall),
             notify_on_complete=bool(payload.get("notify_on_complete", True)),
+            notice_time=_clamp_notice_time(payload.get("notice_time")),
+            notice_count=_clamp_int(
+                payload.get("notice_count"), 0, 0, 10**9
+            ),
             session_id=session_id,
             registry_path=path,
             runner_pid=runner_pid,
@@ -240,6 +272,10 @@ def recover_tasks_for_session(ctx: ToolContext, session_id: str) -> list[AsyncTa
             notified=bool(payload.get("notified", False)),
             killed=bool(payload.get("killed", False)),
         )
+        if task.notice_time:
+            task.next_notice_at = task.started_at + (
+                task.notice_time * (task.notice_count + 1)
+            )
         ctx.tasks[task_id] = task
         recovered.append(task)
     if max_seen >= ctx.task_next_id:
@@ -260,7 +296,8 @@ def _format_task(task: AsyncTask, tail_lines: int) -> str:
         f"Workdir: {task.workdir}\n"
         f"Output: {task.output_path}\n"
         f"Status: {task.status_path}\n"
-        f"notify_on_complete: {task.notify_on_complete}"
+        f"notify_on_complete: {task.notify_on_complete}\n"
+        f"notice_time: {task.notice_time if task.notice_time else 'disabled'}"
     )
     if status == "running" and task.notify_on_complete:
         if task.check_count >= 2:
@@ -307,14 +344,47 @@ def _completion_event(task: AsyncTask) -> str:
     )
 
 
-def collect_task_completion_events(ctx: ToolContext) -> list[str]:
-    """Return completion events for notified tasks that just finished."""
+def _notice_event(task: AsyncTask) -> str:
+    status, rc, elapsed = _task_status(task)
+    _write_status(task)
+    tail = _tail(task.output_path, TASK_EVENT_TAIL_LINES)
+    if tail:
+        tail = _truncate_output(tail, TASK_EVENT_MAX_CHARS)
+    else:
+        tail = "(no output)"
+    return (
+        "[Async task notice]\n"
+        f"task_id: {task.id}\n"
+        f"name: {task.name}\n"
+        f"status: {status}\n"
+        f"return_code: {rc}\n"
+        f"runtime: {elapsed:.1f}s\n"
+        f"notice_count: {task.notice_count}\n"
+        f"output_path: {task.output_path}\n"
+        f"status_path: {task.status_path}\n"
+        f"\nlast {TASK_EVENT_TAIL_LINES} lines:\n{tail}"
+    )
+
+
+def collect_task_events(ctx: ToolContext) -> list[str]:
+    """Return running notices and completion events for notified tasks."""
     events: list[str] = []
+    now = time.monotonic()
     for task in list(ctx.tasks.values()):
         status, _rc, _elapsed = _task_status(task)
-        if status == "running":
-            continue
         if not task.notify_on_complete or task.notified:
+            continue
+        if status == "running":
+            if not task.notice_time:
+                continue
+            if task.next_notice_at is None:
+                task.next_notice_at = task.started_at + task.notice_time
+            if now < task.next_notice_at:
+                continue
+            task.notice_count += 1
+            task.next_notice_at = now + task.notice_time
+            events.append(_notice_event(task))
+            _write_registry(task)
             continue
         task.notified = True
         events.append(_completion_event(task))
@@ -324,6 +394,11 @@ def collect_task_completion_events(ctx: ToolContext) -> list[str]:
     return events
 
 
+def collect_task_completion_events(ctx: ToolContext) -> list[str]:
+    """Compatibility wrapper for older app code/tests."""
+    return collect_task_events(ctx)
+
+
 def tool_task_start(
     ctx: ToolContext,
     command: str,
@@ -331,18 +406,15 @@ def tool_task_start(
     name: str | None = None,
     description: str | None = None,
     notify_on_complete: bool = True,
+    notice_time: float | int | None = None,
 ) -> str:
     """Start a managed asynchronous shell task."""
     err = _check_dangerous(command)
     if err:
         return f"Error: {err}"
-    # Subagents never receive completion notifications — the poller only
-    # scans the parent's ctx, and a subagent round has no "pause and get
-    # woken" mechanism anyway. Force pure-background mode so the whole
-    # notify/waiting-rule chain (guidance below, task_check's
-    # waiting_rule, collect_task_completion_events) stays consistent.
-    if ctx.is_subagent:
-        notify_on_complete = False
+    notice_seconds = _clamp_notice_time(notice_time)
+    if not notify_on_complete:
+        notice_seconds = None
     _task_gc(ctx.tasks)
     if _task_count_running(ctx.tasks) >= TASK_MAX_CONCURRENT:
         running = [
@@ -392,6 +464,7 @@ def tool_task_start(
         "output_path": str(output_path),
         "status_path": str(status_path),
         "notify_on_complete": bool(notify_on_complete),
+        "notice_time": notice_seconds,
         "started_wall": started_wall,
     }
     atomic_write_json(spec_path, spec)
@@ -402,6 +475,12 @@ def tool_task_start(
                 str(Path(__file__).with_name("task_runner.py")),
                 str(spec_path),
             ],
+            # DEVNULL stdin is load-bearing: without it the runner (and
+            # the user's command under it) inherits the TUI's tty and
+            # any stdin read steals keystrokes from Textual's input
+            # loop — start_new_session puts it in another session, so
+            # SIGTTIN never blocks those reads.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -421,6 +500,11 @@ def tool_task_start(
         started_at=time.monotonic(),
         started_wall=started_wall,
         notify_on_complete=bool(notify_on_complete),
+        notice_time=notice_seconds,
+        next_notice_at=(
+            time.monotonic() + notice_seconds
+            if notice_seconds is not None else None
+        ),
         session_id=session_id,
         registry_path=registry_path,
         runner_pid=proc.pid,
@@ -430,34 +514,37 @@ def tool_task_start(
     _write_status(task)
 
     if task.notify_on_complete:
-        wait_guidance = (
-            "WAITING RULE: notify_on_complete=True, so do NOT call "
-            "task_wait, repeated task_check, or repeated task_read just to "
-            "wait for this task. You can work on other useful tasks in "
-            "parallel while this task runs. If no useful work remains, "
-            "update checkpoint_tool with "
-            f"status='waiting' and active_refs=['{task_id}'] if helpful, "
-            "then pause the session by finishing the current response and "
-            "wait for the runtime completion notification. Do not call "
-            "task_check as a polling loop. Use task_check/task_read only "
-            "for a one-off inspection when the current output changes what "
-            "you should do next. Use task_wait only when the user explicitly "
-            "requested blocking, or for one short bounded wait for an "
-            "almost-finished task."
-        )
-    elif ctx.is_subagent:
-        wait_guidance = (
-            "You are a subagent: completion notifications are NOT "
-            "delivered to you (notify_on_complete was forced to False). "
-            "The parent-oriented waiting rule does not apply — use "
-            "task_wait to block until this task finishes, or "
-            "task_check/task_read to inspect progress."
-        )
+        if ctx.is_subagent:
+            wait_guidance = (
+                "SUBAGENT WAITING RULE: do NOT block with task_wait. "
+                "Continue useful work in this round; if no useful work "
+                "remains, call task_pause(task_ids=["
+                f"'{task_id}'"
+                "]) to park. The runtime will inject [Async task notice] "
+                "while it is still running and [Async task complete] when "
+                "it exits, then wake you to inspect output with "
+                "task_check/task_read and continue."
+            )
+        else:
+            wait_guidance = (
+                "WAITING RULE: notify_on_complete=True, so do NOT call "
+                "task_wait, repeated task_check, or repeated task_read just to "
+                "wait for this task. You can work on other useful tasks in "
+                "parallel while this task runs. If no useful work remains, "
+                "update checkpoint_tool with "
+                f"status='waiting' and active_refs=['{task_id}'] if helpful, "
+                "then pause the session by finishing the current response and "
+                "wait for the runtime task notification. Do not call "
+                "task_check as a polling loop. Use task_check/task_read only "
+                "for a one-off inspection when the current output changes what "
+                "you should do next."
+            )
     else:
         wait_guidance = (
             "No completion notification will be sent because "
             "notify_on_complete=False. Use task_check/task_read to inspect "
-            "progress, or task_wait when you intentionally want to block."
+            "progress; start a new notified task instead of blocking if "
+            "completion matters."
         )
     return (
         f"Started managed task {task_id}: {task.name}\n"
@@ -467,6 +554,7 @@ def tool_task_start(
         f"output_path: {output_path}\n"
         f"status_path: {status_path}\n"
         f"notify_on_complete: {task.notify_on_complete}\n"
+        f"notice_time: {task.notice_time if task.notice_time else 'disabled'}\n"
         f"{wait_guidance}\n"
         f"Use task_check(\"{task_id}\") to inspect progress, "
         f"or task_read(\"{task_id}\", offset=0) for incremental output."
@@ -553,29 +641,16 @@ def tool_task_wait(
     task = ctx.tasks.get(task_id)
     if task is None:
         return f"Error: unknown task_id {task_id!r}."
-    timeout = _clamp_int(
-        timeout, TASK_DEFAULT_WAIT_TIMEOUT, 1, TASK_MAX_WAIT_TIMEOUT
-    )
     tail_lines = _clamp_int(tail_lines, TASK_DEFAULT_TAIL_LINES, 0, 500)
-
-    deadline = time.monotonic() + timeout
-    while True:
-        status, _rc, _elapsed = _task_status(task)
-        if status != "running":
-            break
-        if time.monotonic() >= deadline:
-            output = _format_task(task, tail_lines)
-            return (
-                f"task_wait timed out after {timeout}s; task {task_id} "
-                "is still running. If notify_on_complete=true, do not call "
-                "task_wait again just because you are waiting. Continue other "
-                "useful work; if none remains, finish/pause the current "
-                "response and wait for the completion notification unless "
-                "the user explicitly requested blocking.\n"
-                + _truncate_output(output, max_output_chars)
-            )
-        time.sleep(0.2)
-    return _truncate_output(_format_task(task, tail_lines), max_output_chars)
+    output = _format_task(task, tail_lines)
+    return _truncate_output(
+        "Error: task_wait is deprecated and no longer blocks. Use "
+        "task_check/task_read for a non-blocking inspection. Parent agents "
+        "should let task_start notifications wake the next turn; subagents "
+        "should call task_pause to enter the waiting phase.\n"
+        + output,
+        max_output_chars,
+    )
 
 
 def tool_task_kill(ctx: ToolContext, task_id: str, force: bool = False) -> str:

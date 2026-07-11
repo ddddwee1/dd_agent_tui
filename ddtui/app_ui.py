@@ -24,7 +24,7 @@ from .state import (
     kill_all_tasks,
     kill_all_terminals,
 )
-from .tools_tasks import collect_task_completion_events
+from .tools_tasks import collect_task_events
 from .tools_terminal import drain_terminal_output
 from .widgets import (
     CheckpointBlock,
@@ -38,7 +38,8 @@ from .widgets import (
     TasksBlock,
     TerminalTabPane,
     ThinkingBlock,
-    ToolCallBlock,
+    TraceBlock,
+    ToolRunBlock,
     UserBubble,
 )
 
@@ -97,14 +98,20 @@ class AppUiMixin:
 
     def _poll_task_notifications(self) -> None:
         checkpoint_before = self.ctx.checkpoint
-        events = collect_task_completion_events(self.ctx)
+        events = collect_task_events(self.ctx)
         if checkpoint_before is not self.ctx.checkpoint:
             self.call_later(self._sync_checkpoint_block)
             self.call_later(self._autosave_conversation)
         if events:
             self._task_events.extend(events)
             self.notify(
-                f"{len(events)} 个异步任务完成，已通知 agent",
+                f"{len(events)} 个异步任务事件，已通知 agent",
+                timeout=4,
+            )
+        sub_task_events = self._poll_subagent_task_events()
+        if sub_task_events:
+            self.notify(
+                f"{sub_task_events} 个子 agent 任务事件，已唤醒对应会话",
                 timeout=4,
             )
         # Unread subagent results ride the same delivery pipeline as
@@ -707,7 +714,7 @@ class AppUiMixin:
 
         Scan back to the most recent assistant message; for every
         unpaired tool_call id, append a stub `tool` message marking it
-        cancelled. Also flip any still-pending `ToolCallBlock` widget to
+        cancelled. Also flip any still-pending `ToolRunBlock` widget to
         a blocked state so the UI doesn't keep showing 「执行中…」.
 
         Returns the number of stub messages appended.
@@ -755,9 +762,15 @@ class AppUiMixin:
             for child in reversed(list(view.children)):
                 if isinstance(child, (UserBubble, SteerBubble)):
                     break
-                if isinstance(child, ToolCallBlock) and child.is_pending:
+                if isinstance(child, TraceBlock) and child.is_pending:
                     try:
-                        child.set_result(cancel_note, blocked=True)
+                        child.set_pending_results(cancel_note, blocked=True)
+                    except Exception:
+                        pass
+                    continue
+                if isinstance(child, ToolRunBlock) and child.is_pending:
+                    try:
+                        child.set_pending_results(cancel_note, blocked=True)
                     except Exception:
                         pass
         except Exception:

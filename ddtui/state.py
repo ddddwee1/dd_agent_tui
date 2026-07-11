@@ -75,6 +75,11 @@ class AsyncTask:
     started_at: float
     started_wall: float
     notify_on_complete: bool = True
+    # Optional running-notice cadence. Completion notifications still
+    # fire independently when notify_on_complete is true.
+    notice_time: float | None = None
+    next_notice_at: float | None = None
+    notice_count: int = 0
     session_id: str | None = None
     registry_path: Path | None = None
     runner_pid: int | None = None
@@ -224,10 +229,9 @@ class ToolContext:
     checkpoint: dict | None = None
     terminal_next_id: int = 1
     task_next_id: int = 1
-    # True for a subagent's ToolContext. Task completion notifications
-    # are only ever collected from the PARENT ctx (app_ui polls it), so
-    # tool_task_start forces notify_on_complete=False here and returns
-    # subagent-appropriate wait guidance (task_wait IS correct for them).
+    # True for a subagent's ToolContext. Subagent task events are
+    # collected from this ctx and injected back into that subagent's
+    # message stream while it is parked in the waiting phase.
     is_subagent: bool = False
     # Read-before-overwrite ledger: resolved path -> mtime at the moment
     # the model last read (or wrote/edited) the file. write_file refuses
@@ -249,7 +253,6 @@ class ToolContext:
         self.task_next_id += 1
         return f"task-{i}"
 
-
 @dataclass
 class ExploreState:
     """Explore-span bookkeeping for one conversation.
@@ -270,11 +273,9 @@ class SubagentSession:
 
     Concurrency model: each round runs in its own `asyncio.Task` stored
     on `task`. `spawn_agent` and `chat_agent` schedule the task and
-    return immediately so the parent can pursue other work; the parent
-    fetches the round's answer with `await_agent`, which blocks (with
-    timeout) on the task and consumes `last_result`. `task is None`
-    means the session is between rounds; `last_result is not None`
-    means a finished round's answer is sitting unread.
+    return immediately so the parent can pursue other work. Finished
+    answers sit in `last_result`; parked rounds use phase="waiting"
+    with `task is None` until task events wake the subagent again.
 
     Holds both the runtime conversation state (messages, own
     ToolContext, tool schemas) AND the UI-visible snapshot fields
@@ -299,16 +300,17 @@ class SubagentSession:
     model: str = ""
     effort: str = ""
     turn: int = 0            # cumulative round count across all chat calls
-    # phase ∈ {"thinking","answering","tool","ready","idle","done","error"}
+    # phase ∈ {"thinking","answering","tool","waiting","ready","idle","done","error"}
     # ready  = round finished, result waiting in last_result
     # idle   = result already consumed, awaiting next chat_agent
+    # waiting= task_pause parked the round; task events will wake it
     phase: str = "thinking"
     last_tool: str | None = None
     tokens_in: int = 0       # cumulative prompt tokens for this subagent
     tokens_out: int = 0      # cumulative completion tokens
     # Most recent call's prompt_tokens and the model's context window
-    # so the sidebar can render a ctx% gauge and await_agent can prefix
-    # its return with the same number — that's what tells the parent
+    # so the sidebar and agent_check can render a ctx% gauge — that's
+    # what tells the parent
     # when to chat_agent the subagent into a compact_self call.
     last_prompt_tokens: int = 0
     context_limit: int | None = None
@@ -316,10 +318,20 @@ class SubagentSession:
     # Set by spawn_agent / chat_agent, cleared in the task wrapper's
     # `finally`. Cancelled by end_agent / action_clear_chat.
     task: "asyncio.Task | None" = None
-    # The most recent round's final answer, waiting for await_agent to
+    # The most recent round's final answer, waiting for agent_check or
     # consume. None means "no result pending" (already consumed, or
     # task still running with nothing to return yet).
     last_result: str | None = None
+    # Task/event parking state. `pending_events` are injected into
+    # messages before the next model call. `park_requested` is set by
+    # the subagent-only task_pause tool; the engine commits that tool
+    # result, then the before_round hook parks cleanly before the next
+    # model request.
+    pending_events: list[str] = field(default_factory=list)
+    waiting_refs: list[str] = field(default_factory=list)
+    waiting_reason: str = ""
+    waiting_next_action: str = ""
+    park_requested: bool = False
     # Explore-span state for THIS session — subagents can collapse
     # their own probing spans exactly like the parent (explore_core
     # operates on sess.messages + this state). Not persisted: subagent

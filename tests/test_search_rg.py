@@ -12,8 +12,7 @@ HAS_RG = shutil.which("rg") is not None
 
 @pytest.fixture
 def tree(tmp_path):
-    # rg only applies .gitignore inside a git repo — mirror the real
-    # use case (project dirs are repos) with a bare .git marker.
+    # Keep a repo marker around to mirror the real project-directory case.
     (tmp_path / ".git").mkdir()
     (tmp_path / "src" / "deep").mkdir(parents=True)
     (tmp_path / "node_modules").mkdir()
@@ -50,7 +49,7 @@ def test_python_fallback_search(ctx, monkeypatch):
     monkeypatch.setattr(ts, "_RG_PATH", None)
     lines = _search(ctx)
     _common_search_assertions(lines)
-    # pure python does NOT read .gitignore
+    # Default behavior includes files even when .gitignore matches them.
     assert any("generated.py" in l for l in lines)
 
 
@@ -58,8 +57,7 @@ def test_python_fallback_search(ctx, monkeypatch):
 def test_rg_search(ctx):
     lines = _search(ctx)
     _common_search_assertions(lines)
-    # rg respects .gitignore — a strict improvement
-    assert not any("generated.py" in l for l in lines)
+    assert any("generated.py" in l for l in lines)
 
 
 @pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")
@@ -67,8 +65,6 @@ def test_rg_and_python_agree_on_filter_and_case(ctx, monkeypatch):
     rg_lines = set(_search(ctx, file_filter="*.py", case_sensitive=True))
     monkeypatch.setattr(ts, "_RG_PATH", None)
     py_lines = set(_search(ctx, file_filter="*.py", case_sensitive=True))
-    # identical except the gitignored file only python sees
-    py_lines = {l for l in py_lines if "generated.py" not in l}
     assert rg_lines == py_lines
     assert not any("NEEDLE" in l for l in rg_lines)  # case-sensitive honored
 
@@ -104,14 +100,14 @@ def test_python_fallback_glob(ctx, monkeypatch):
     monkeypatch.setattr(ts, "_RG_PATH", None)
     lines = _glob(ctx, "**/*.py")
     _common_glob_assertions(lines)
-    assert "generated.py" in lines                # no .gitignore awareness
+    assert "generated.py" in lines                # default includes it
 
 
 @pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")
 def test_rg_glob(ctx):
     lines = _glob(ctx, "**/*.py")
     _common_glob_assertions(lines)
-    assert "generated.py" not in lines            # .gitignore-aware
+    assert "generated.py" in lines                # default includes it
 
 
 @pytest.mark.skipif(not HAS_RG, reason="ripgrep not installed")

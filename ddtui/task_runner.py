@@ -102,6 +102,10 @@ def main(argv: list[str] | None = None) -> int:
             _child = subprocess.Popen(
                 str(spec["command"]),
                 shell=True,
+                # Never let the command read the terminal the TUI owns;
+                # a background task that consumes tty bytes competes
+                # with the TUI's input loop for every keystroke.
+                stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 cwd=str(spec["workdir"]),

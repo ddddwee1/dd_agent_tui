@@ -112,7 +112,8 @@ def test_sub_toolset_and_ctx_flag(playground):
         app._spawn_subagent("t", "")
         sess = app._live_subagents["sub-1"]
         names = {t["function"]["name"] for t in sess.sub_tools}
-        assert {"task_start", "task_wait", "terminal_start"} <= names
+        assert {"task_start", "task_pause", "terminal_start"} <= names
+        assert "task_wait" not in names
         assert {"explore_start", "explore_end", "explore_cancel"} <= names
         assert not {"checkpoint_tool", "spawn_agent"} & names
         assert sess.ctx.is_subagent is True
@@ -120,11 +121,11 @@ def test_sub_toolset_and_ctx_flag(playground):
     asyncio.run(run())
 
 
-def test_subagent_task_start_forced_background(playground):
+def test_subagent_task_start_uses_notified_park_guidance(playground):
     ctx = ToolContext(work_dir=playground, is_subagent=True)
     r = tool_task_start(ctx, "echo sub-test", name="t")
-    assert "notify_on_complete: False" in r
-    assert "You are a subagent" in r and "task_wait" in r
+    assert "notify_on_complete: True" in r
+    assert "SUBAGENT WAITING RULE" in r and "task_pause" in r
     for tid in list(ctx.tasks):
         tool_task_kill(ctx, tid)
     # parent ctx unaffected
@@ -270,13 +271,73 @@ def test_result_auto_delivery(playground):
         assert len(events) == 1
         assert events[0].startswith("[Subagent result] session_id=sub-1")
         assert "done" in events[0]
-        assert "do NOT call await_agent" in events[0]
+        assert "do NOT call agent_check" in events[0]
         assert sess.phase == "idle" and sess.last_result is None
         assert app._collect_ready_subagent_events() == []
 
-        # awaiting an already-delivered result errors cleanly
-        r = await app._await_subagent("sub-1", 0)
-        assert "no pending result" in r
+        # checking an already-delivered result is a clean status.
+        r = app._check_subagent("sub-1")
+        assert "No pending result" in r
+    asyncio.run(run())
+
+
+def test_subagent_task_pause_waiting_wake(playground):
+    async def run():
+        class ParkProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.rounds = [
+                    [
+                        LLMStreamEvent(tool_call=_tc(
+                            0, "task_start",
+                            '{"command": "sleep 0.5; echo woke", "name": "slow", "notice_time": 0}',
+                        )),
+                        LLMStreamEvent(tool_call=_tc(
+                            1, "task_pause",
+                            '{"reason": "waiting for slow task"}',
+                        )),
+                    ],
+                    [
+                        LLMStreamEvent(tool_call=_tc(
+                            0, "task_check",
+                            '{"task_id": "task-1", "tail_lines": 5}',
+                        )),
+                    ],
+                    [LLMStreamEvent(content="任务完成，输出包含 woke")],
+                ]
+
+            async def stream(self, messages, tools, model, effort):
+                self.stream_calls.append((model, effort))
+                for ev in self.rounds.pop(0):
+                    yield ev
+
+        app = FakeApp(playground)
+        app.provider = ParkProvider()
+        app._spawn_subagent("跑慢任务", "")
+        sess = app._live_subagents["sub-1"]
+
+        await _wait_round(sess)
+        assert sess.phase == "waiting"
+        assert sess.task is None
+        assert sess.last_result is None
+        assert sess.waiting_refs == ["task-1"]
+
+        await asyncio.sleep(0.8)
+        assert app._poll_subagent_task_events() == 1
+        assert sess.task is not None
+        await _wait_round(sess)
+
+        assert any(
+            "[Async task complete]" in (m.get("content") or "")
+            for m in sess.messages if m["role"] == "user"
+        )
+        assert any(
+            "woke" in (m.get("content") or "")
+            for m in sess.messages if m["role"] == "tool"
+        )
+        assert sess.phase == "ready"
+        assert sess.last_result == "任务完成，输出包含 woke"
+
     asyncio.run(run())
 
 

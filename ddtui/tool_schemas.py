@@ -10,7 +10,7 @@ TOOLS = [
             "name": "bash",
             "description": (
                 "Run a synchronous bash command and return stdout/stderr/"
-                "exit code. Times out (errors) at 120 s, and blocks "
+                "exit code. Times out (errors) at 30 s, and blocks "
                 "everything else while it runs — for anything expected to "
                 "take more than ~30 s, or whose completion matters (test "
                 "suites, builds, downloads, training), use task_start "
@@ -59,18 +59,20 @@ TOOLS = [
                 "task_read while continuing other work. If notify_on_complete "
                 "is true, the runtime will deliver a completion notification "
                 "when the task exits, including status, return code, duration, "
-                "and output path. STRICT WAITING RULE: for "
+                "and output path. Set notice_time to receive running notices "
+                "while the task is still in progress. STRICT WAITING RULE: for "
                 "notify_on_complete=true tasks, do not call task_wait, "
                 "repeated task_check, or repeated task_read merely because "
                 "you are waiting for the task. Continue other useful work; "
                 "if no useful work remains, update checkpoint_tool if helpful, "
                 "then pause/finish the current response and let the runtime "
-                "wake you when the notification arrives. Calling task_wait or "
+                "wake you when the notification arrives. Subagents should call "
+                "task_pause after task_start when no useful work remains. "
+                "Calling task_wait or "
                 "polling task_check/task_read after finishing other work is "
                 "the wrong behavior unless the user explicitly requested "
                 "blocking or you need one short bounded inspection because "
-                "the current output changes your next action. Use task_wait "
-                "normally for notify_on_complete=false tasks. "
+                "the current output changes your next action. "
                 "Use task_start for long-running work whose completion matters. "
                 "Same footgun guard as bash."
             ),
@@ -108,8 +110,16 @@ TOOLS = [
                             "Default true. If true, the runtime sends the "
                             "agent a completion notification when the task "
                             "exits; the agent can do other work or pause "
-                            "and let the runtime wake it instead of blocking "
-                            "with task_wait."
+                            "and let the runtime wake it instead of blocking."
+                        ),
+                    },
+                    "notice_time": {
+                        "type": "number",
+                        "description": (
+                            "Seconds between running notices while the task "
+                            "is still active. Default 60; 0 disables running "
+                            "notices but still sends the completion "
+                            "notification when notify_on_complete=true."
                         ),
                     },
                 },
@@ -349,16 +359,10 @@ TOOLS = [
         "function": {
             "name": "task_wait",
             "description": (
-                "BLOCK until a managed task finishes or timeout seconds "
-                "elapse. The task keeps running on timeout. Use this for "
-                "tasks started with notify_on_complete=false, for an explicit "
-                "user request to block, or for one short bounded wait when an "
-                "almost-finished result is immediately useful. STRICT RULE: "
-                "if notify_on_complete=true, do not call task_wait merely "
-                "because there is no other work left. Finish/pause the "
-                "current response and wait for the completion notification "
-                "instead. Repeated task_wait calls for a notified task are "
-                "wrong unless the user explicitly asked for blocking."
+                "Deprecated compatibility stub. This tool no longer blocks "
+                "and is not advertised to agents. Use task_check/task_read "
+                "for inspection, task_start notifications for parent wakeup, "
+                "and task_pause for subagent waiting."
             ),
             "parameters": {
                 "type": "object",
@@ -384,6 +388,46 @@ TOOLS = [
                     },
                 },
                 "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_pause",
+            "description": (
+                "Subagent-only: park this subagent round while waiting for "
+                "task_start notifications. Call after starting one or more "
+                "notify_on_complete=true tasks when no useful work remains. "
+                "This is fire-and-forget: it commits a tool result, enters "
+                "the waiting phase, and the runtime will wake the subagent "
+                "with [Async task notice] or [Async task complete]. Do not "
+                "use task_wait."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Task ids to wait on. Defaults to all currently "
+                            "running notified tasks in this subagent."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short reason shown in status/check output.",
+                    },
+                    "next_action": {
+                        "type": "string",
+                        "description": (
+                            "What the subagent should do after the task event "
+                            "wakes it."
+                        ),
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -921,8 +965,8 @@ TOOLS = [
                 "Returns matching lines with file:line:content. "
                 "Supports file_filter glob (e.g. '*.py') and case-insensitive "
                 "matching by default. Results are truncated at 500 matches. "
-                "Fast (ripgrep-backed) and .gitignore-aware when rg is "
-                "installed."
+                "Fast when ripgrep-backed; .gitignore'd files are included "
+                "by default."
             ),
             "parameters": {
                 "type": "object",
@@ -1062,12 +1106,11 @@ TOOLS = [
                 "Create a persistent subagent session, send it the "
                 "first prompt, and IMMEDIATELY return — the subagent "
                 "runs in the background. Returns a session_id and a "
-                "status hint. Two ways to get the answer: call "
-                "await_agent(session_id) when you need it now, or keep "
-                "working / end your response — an unread result is "
-                "auto-delivered a moment later as a '[Subagent result]' "
-                "notification (same pipeline as task completions), so "
-                "you never need to poll. The session keeps full memory "
+                "status hint. Keep working / end your response; an unread "
+                "result is auto-delivered a moment later as a "
+                "'[Subagent result]' notification (same pipeline as task "
+                "completions). Use agent_check(session_id) only for a "
+                "non-blocking status/output inspection. The session keeps full memory "
                 "(messages + reasoning) across rounds, so for "
                 "follow-ups use chat_agent, not another spawn_agent. "
                 "To run subagents in parallel, emit multiple "
@@ -1129,12 +1172,13 @@ TOOLS = [
             "description": (
                 "Send another message to an existing subagent session "
                 "and IMMEDIATELY return — the round runs in the "
-                "background. Use await_agent(session_id) to fetch the "
-                "answer. The subagent sees its full prior history "
+                "background. The result auto-delivers when ready; use "
+                "agent_check(session_id) only for a non-blocking status/"
+                "output inspection. The subagent sees its full prior history "
                 "including its own reasoning, so refer to earlier "
                 "findings naturally. Errors if the session is still "
-                "running an earlier round (await it first), if the "
-                "previous result hasn't been await_agent'd yet, or if "
+                "running or waiting on an earlier round, if the "
+                "previous result hasn't been agent_check'd yet, or if "
                 "the session_id is unknown."
             ),
             "parameters": {
@@ -1156,19 +1200,35 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "agent_check",
+            "description": (
+                "Non-blocking status/output check for a subagent session. "
+                "Returns running/waiting/idle status immediately. If a final "
+                "answer is ready, returns and consumes it so chat_agent can "
+                "send a follow-up. Does not wait; if the answer is not ready, "
+                "keep working or let the '[Subagent result]' notification "
+                "arrive automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The id returned by spawn_agent.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "await_agent",
             "description": (
-                "Wait for a subagent's most recent round to finish and "
-                "return its answer. Use this when you need the answer "
-                "NOW to proceed; if you don't, just keep working or end "
-                "your response — unread results are auto-delivered as "
-                "'[Subagent result]' notifications. Blocks for up to "
-                "`timeout` seconds; if the subagent is still running "
-                "when the timeout expires, returns a 'still running' "
-                "notice and you can call await_agent again. Pass "
-                "timeout=0 to poll without blocking. Once consumed "
-                "(by await_agent OR by auto-delivery), the answer is "
-                "gone — errors if the session has no pending result."
+                "Deprecated compatibility stub. This tool no longer blocks "
+                "and is not advertised to agents. Use agent_check for "
+                "non-blocking subagent status/output checks."
             ),
             "parameters": {
                 "type": "object",
