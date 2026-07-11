@@ -631,6 +631,11 @@ class AssistantMessage(Static):
         self._buffer += text
         self.update(self._build())
 
+    def set_text(self, text: str) -> None:
+        """Replace streamed text when the committed message was guarded."""
+        self._buffer = text
+        self.update(self._build())
+
     @property
     def text(self) -> str:
         return self._buffer
@@ -1554,6 +1559,11 @@ class SubagentTabPane(VerticalScroll):
         self._live_answer.append_text(text)
         if self.is_mounted:
             self.scroll_end(animate=False)
+
+    def sync_answer(self, text: str) -> None:
+        """Synchronize a live answer with its final committed content."""
+        if self._live_answer is not None and self._live_answer.text != text:
+            self._live_answer.set_text(text)
 
     def finalize_answer(self, *, keep_trace: bool = False) -> None:
         # Just drop the ref — the widget stays mounted as historical

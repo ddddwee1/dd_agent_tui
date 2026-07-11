@@ -479,6 +479,10 @@ class AppUiMixin:
             self._todo_block.remove()
         self._todo_block = None
         self.ctx.checkpoint = None
+        self.ctx.doc_receipts.clear()
+        self.ctx.doc_receipt_next_id = 1
+        self.ctx.experiments.clear()
+        self.ctx.experiment_next_id = 1
         self._reset_explore_state()
         if (
             self._checkpoint_block is not None

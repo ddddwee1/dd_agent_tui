@@ -80,6 +80,11 @@ class AsyncTask:
     notice_time: float | None = None
     next_notice_at: float | None = None
     notice_count: int = 0
+    # Optional immutable evidence binding captured by task_start. Paths
+    # are resolved before launch and SHA-256 values describe the exact
+    # bytes the command was asked to validate.
+    artifact_hashes: dict[str, str] = field(default_factory=dict)
+    experiment_id: str | None = None
     session_id: str | None = None
     registry_path: Path | None = None
     runner_pid: int | None = None
@@ -240,6 +245,14 @@ class ToolContext:
     # restored session must re-read before overwriting, which is the
     # safe default.
     read_files: dict[str, float] = field(default_factory=dict)
+    # Structured document-navigation receipts. Unlike raw read_file
+    # output, these survive context compaction and can be serialized with
+    # conversation history so linked-document uptake remains inspectable.
+    doc_receipts: dict[str, dict] = field(default_factory=dict)
+    doc_receipt_next_id: int = 1
+    # Candidate/evidence ledger for bounded implementation experiments.
+    experiments: dict[str, dict] = field(default_factory=dict)
+    experiment_next_id: int = 1
 
     def alloc_terminal_id(self) -> str:
         """Reserve and return the next terminal id ('term-N')."""
@@ -252,6 +265,19 @@ class ToolContext:
         i = self.task_next_id
         self.task_next_id += 1
         return f"task-{i}"
+
+    def alloc_doc_receipt_id(self) -> str:
+        """Reserve and return the next document receipt id ('doc-N')."""
+        i = self.doc_receipt_next_id
+        self.doc_receipt_next_id += 1
+        return f"doc-{i}"
+
+    def alloc_experiment_id(self) -> str:
+        """Reserve and return the next experiment id ('exp-N')."""
+        i = self.experiment_next_id
+        self.experiment_next_id += 1
+        return f"exp-{i}"
+
 
 @dataclass
 class ExploreState:

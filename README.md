@@ -15,7 +15,7 @@
 - 流式展示思考过程和最终回答。
 - 内置工具调用：bash、文件读写/编辑、搜索/glob、网页抓取、Brave Search、TODO、子 agent。
 - 写文件/编辑文件前弹窗确认。
-- 托管异步任务：后台/长任务用 `task_start`（写临时输出文件、任务完成后通知 agent），用 `task_check` / `task_read` / `task_wait` / `task_kill` / `task_list` 管理；侧栏有任务面板。
+- 托管异步任务：后台/长任务用 `task_start`（写私有输出文件、按节奏通知 agent），用 `task_check` / `task_read` / `task_kill` / `task_list` 管理；侧栏有任务面板。
 - 会话 checkpoint：记录当前目标、证据、决策、blocker、active refs 和下一步。
 - 项目笔记：记录 repo-local runbook、坑点、验证过的命令和约定。
 - 子 agent 异步并发：可 spawn 多个子会话，在侧边栏和 tab 中观察状态。
@@ -360,15 +360,15 @@ claude mcp add ddtui -- ddtui-mcp --token-file ~/.ddtui/remote_token
 
 - shell（同步一次性）：`bash`
 - 交互式 Terminal：`terminal_start`、`terminal_send`、`terminal_read`、`terminal_interrupt`、`terminal_close`、`terminal_list`
-- 托管异步任务：`task_start`、`task_check`、`task_read`、`task_wait`、`task_kill`、`task_list`
+- 托管异步任务：`task_start`、`task_check`、`task_read`、`task_kill`、`task_list`（子 agent 另有 `task_pause`）
 - 临时探索：`explore_start`、`explore_end`、`explore_cancel`
 - 会话 checkpoint：`checkpoint_tool`、`checkpoint_get`、`checkpoint_clear`
 - 项目笔记：`project_note_add`、`project_note_search`、`project_note_list`、`project_note_read`、`project_note_update`、`project_note_delete`
-- 文件：`read_file`、`write_file`、`edit_file`、`edit_lines`、`multi_edit`
+- 文件：`read_file`、`read_doc`、`follow_doc_link`、`doc_route_status`、`write_file`、`edit_file`、`edit_lines`、`multi_edit`
 - 搜索：`list_files`、`glob_files`、`search_content`
 - Web：`web_fetch`、`web_search`
-- 任务进度：`todo_tool`
-- 子 agent：`spawn_agent`、`chat_agent`、`await_agent`、`end_agent`
+- 任务进度与证据：`todo_tool`、`experiment_start`、`experiment_record`、`experiment_status`
+- 子 agent：`spawn_agent`、`chat_agent`、`agent_check`、`end_agent`
 
 ### 交互式 Terminal
 
@@ -384,9 +384,19 @@ ssh -tt host 'tmux new -A -s ddtui-agent'
 
 ### 托管异步任务
 
-命令执行只有两种形态：同步快命令用 `bash`（前台跑完直接返回，≤120s）；需要放后台或耗时较长（测试、构建、下载、训练、profile 等完成状态很重要的工作）一律用 `task_start`。是否收完成通知由 `notify_on_complete` 决定——`true`（默认）在结束时推送异步通知，`false` 则是纯后台、由你自己 `task_check` / `task_wait`。
+命令执行只有两种形态：同步快命令用 `bash`（前台跑完直接返回，≤30s）；需要放后台或耗时较长（测试、构建、下载、训练、profile 等完成状态很重要的工作）一律用 `task_start`。是否收完成通知由 `notify_on_complete` 决定；`notice_time` 控制运行中通知节奏，设为 0 只保留最终完成通知。
 
-`task_start` 会返回 `task_id`、`output_path` 和 `status_path`。任务与 terminal 的输出/状态文件写在 `~/.ddtui/runtime/logs/`（目录 `chmod 700`，不再放世界可读的 `/tmp`；可用 `DDTUI_LOG_DIR` 覆盖）。agent 可以用 `task_check` 看 tail、用 `task_read` 按 offset 增量读输出，但它们只用于一次性检查当前输出是否会改变下一步行动。默认 `notify_on_complete=true`，任务完成后会向 agent 发送异步完成通知。严格规则：agent 可以在等待期间继续做别的事；做完其他事后不要调用 `task_wait`，也不要用反复 `task_check` / `task_read` 轮询来替代等待，而是记录 checkpoint（如有帮助）并暂停当前回复，等待通知自动唤醒。`task_wait` 正常用于 `notify_on_complete=false` 的任务；对 `notify_on_complete=true` 只应在用户明确要求阻塞，或任务明显快结束且只做一次短暂有界等待时使用。
+`task_start` 会返回 `task_id`、`output_path` 和 `status_path`。任务与 terminal 的输出/状态文件写在 `~/.ddtui/runtime/logs/`（目录 `chmod 700`；可用 `DDTUI_LOG_DIR` 覆盖）。agent 可以用 `task_check` 看 tail、用 `task_read` 按 offset 增量读输出，但它们只用于一次性检查当前输出是否会改变下一步行动，不能组成轮询循环；没有其他工作时，父 agent 结束当前回复等待通知，子 agent 用 `task_pause` 进入 waiting phase。
+
+`task_start(artifacts=[...], experiment_id=...)` 会在命令启动前计算本地文件 SHA-256，并把同一快照写入 start/status/completion 证据。文件在实验开始后改变时，旧 experiment 不能继续绑定新的 task。
+
+### 文档路线与实验证据
+
+长 Markdown 使用渐进式读取：`read_doc(path)` 先返回标题目录和显式链接；指定 `heading`/`anchor` 时只返回对应章节。`follow_doc_link` 只沿模型当前推理明确选择的一条链接前进，`doc_route_status` 保存已读章节、已跟随边和失效路径。它不会自动抓完整个链接图；`read_file` / `search_content` 仍是阅读任意源码的逃逸口。route receipt 跟随 autosave，并在 `/compact` 后继续保留。
+
+多候选实现使用 `experiment_start` 对候选文件做不可变 SHA-256 快照，并记录 candidate/fix 类型、失败边界和预算。`experiment_record` 把 correctness、performance、source gate 等证据绑定到对应 task/命令；同一 SHA 尚无有效 correctness 时，performance 会被保存但明确标为 invalid。`experiment_status` 给出可压缩、可恢复的总账。
+
+真实 task/subagent 通知由运行时作为带内部类型的 user event card 注入。普通 assistant 文本如果仿写 `[Async task complete]` 等保留前缀，会被改写为未验证状态声明；权威状态以 event card 或 `task_check` 为准。
 
 ### 会话 checkpoint
 
@@ -412,13 +422,13 @@ ssh -tt host 'tmux new -A -s ddtui-agent'
 
 - `spawn_agent` 创建会话并立即返回 `session_id`，后台继续跑。可选 `model` / `effort` 参数按会话覆盖（仅限当前 provider 的模型），搜索/只读类任务可以指定更便宜的模型。
 - `chat_agent` 给已有会话发送下一轮消息，也立即返回。
-- `await_agent(session_id, timeout?)` 立刻获取结果；超时不会取消子 agent。
-- 不 await 也可以：子 agent 完成后，未读结果会像任务完成通知一样**自动投递**给父 agent（`[Subagent result]` 消息）——父 agent 忙时在下一次模型调用边界注入，空闲时自动唤醒新回合。
+- `agent_check(session_id)` 非阻塞查看状态，并在结果已就绪时领取结果。
+- 不 check 也可以：子 agent 完成后，未读结果会像任务完成通知一样**自动投递**给父 agent（`[Subagent result]` 消息）——父 agent 忙时在下一次模型调用边界注入，空闲时自动唤醒新回合。
 - `end_agent(session_id)` 释放会话并清理后台 bash 任务。
 
 子 agent 使用独立的精简 system prompt——它知道自己是子 agent、结果会截断回传。项目级 `AGENTS.md` 和环境信息仍会注入，与父 agent 遵循同样的项目约定。
 
-子 agent 的工具面：有 bash、文件、搜索、web、todo、项目笔记、`compact_self`，**也有 `task_*` 和 `terminal_*`**——但任务完成通知只投递给父 agent，子 agent 的任务强制为纯后台模式（`notify_on_complete=false`），需要自己 `task_wait` / `task_check`；子 agent 的 terminal 没有顶部 tab 展示。**也有 explore**：explore 逻辑对会话参数化（`explore_core`），子 agent 在自己的消息历史上圈探索区间、收束成摘要，原始过程归档到同一会话目录下带 `sub-N-` 前缀的文件；探索区间开着时 `compact_self` 会被拒绝（消息索引会失效）。没有 checkpoint（其展示/恢复/自动收回都只挂在父会话上）、不能嵌套子 agent。
+子 agent 的工具面：有 bash、文件、搜索、web、todo、项目笔记、`compact_self`，**也有 `task_*` 和 `terminal_*`**。子 agent 启动 notified task 后可继续工作；无事可做时调用 `task_pause` 进入 waiting phase，运行中/完成通知会唤醒它，再用 `task_check` / `task_read` 检查。子 agent 的 terminal 没有顶部 tab 展示。**也有 explore**：explore 逻辑对会话参数化（`explore_core`），子 agent 在自己的消息历史上圈探索区间、收束成摘要，原始过程归档到同一会话目录下带 `sub-N-` 前缀的文件；探索区间开着时 `compact_self` 会被拒绝（消息索引会失效）。没有 checkpoint（其展示/恢复/自动收回都只挂在父会话上）、不能嵌套子 agent。
 
 限制：
 

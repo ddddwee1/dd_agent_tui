@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from .app_support import _merge_tool_call_delta
+from .runtime_messages import guard_assistant_runtime_claims
 from .state import ToolContext
 from .tools import (
     APP_DISPATCHED_TOOLS,
@@ -213,6 +214,7 @@ class TurnEngine:
             raise
         if usage is not None:
             await self.observer.on_usage(usage)
+        content, _guarded = guard_assistant_runtime_claims(content)
         msg: dict = {"role": "assistant", "content": content}
         if reasoning:
             self.provider.attach_reasoning(msg, reasoning)

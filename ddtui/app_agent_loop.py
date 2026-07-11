@@ -25,6 +25,7 @@ from textual.widgets import Static
 from .app_errors import _exception_block
 from .config import SUBAGENT_RESULT_MAX_CHARS
 from .engine import ToolOutcome, TurnEngine, TurnObserver
+from .runtime_messages import runtime_task_event_message
 from .tools import PARENT_TOOL_SCHEMAS
 from .widgets import (
     AssistantMessage,
@@ -125,6 +126,11 @@ class ParentTurnObserver(TurnObserver):
         self.app.counter.add(usage)
 
     async def on_assistant_message(self, msg: dict) -> None:
+        if (
+            self._answer is not None
+            and self._answer.text != (msg.get("content") or "")
+        ):
+            self._answer.set_text(msg.get("content") or "")
         if self._thinking is not None:
             self._thinking.finalize(self.app.counter.last_reasoning)
             if self._trace is not None:
@@ -207,7 +213,7 @@ class AppAgentLoopMixin:
         text = self._pop_task_event_text()
         if not text:
             return
-        self.messages.append({"role": "user", "content": text})
+        self.messages.append(runtime_task_event_message(text))
         await self._mount_task_event_notice(text)
 
     async def _start_task_event_turn(self) -> None:
@@ -220,12 +226,12 @@ class AppAgentLoopMixin:
         self._follow_bottom = True
         await self._mount_task_event_notice(text)
         self._agent_worker = self.run_worker(
-            self._agent_turn(text), exclusive=True
+            self._agent_turn(text, runtime_event=True), exclusive=True
         )
 
     # ── outer loop: one or more user turns ──
 
-    async def _agent_turn(self, user_text: str) -> None:
+    async def _agent_turn(self, user_text: str, runtime_event: bool = False) -> None:
         """Outer loop: drives one or more user turns end-to-end.
 
         Drains the queue between turns — every iteration commits one
@@ -234,6 +240,7 @@ class AppAgentLoopMixin:
         """
         self._set_busy(True)
         pending = user_text
+        pending_is_runtime = runtime_event
         try:
             while True:
                 self._ensure_autosave_path()
@@ -243,12 +250,17 @@ class AppAgentLoopMixin:
                     message_len_before_turn=len(self.messages),
                     tool_started=False,
                 )
-                self.messages.append({"role": "user", "content": pending})
+                user_message = (
+                    runtime_task_event_message(pending)
+                    if pending_is_runtime
+                    else {"role": "user", "content": pending}
+                )
+                self.messages.append(user_message)
                 try:
                     self._remote_emit(
                         "message.append",
                         {
-                            "message": {"role": "user", "content": pending},
+                            "message": user_message,
                             "source": "turn",
                         },
                     )
@@ -273,6 +285,7 @@ class AppAgentLoopMixin:
                     return
                 self._clear_turn_journal()
                 pending, parked = self._queued.pop(0)
+                pending_is_runtime = False
                 # Migrate the parked bubble into the conversation flow:
                 # remove it from #pending and mount a fresh one in
                 # #conversation so the user sees it "drop" out of the

@@ -29,6 +29,7 @@ from .runtime_state import (
     read_json,
     turn_journal_path,
 )
+from .runtime_messages import RUNTIME_TASK_EVENT_KIND
 from .state import TokenCounter
 from .tools import DIFF_STRIP_TOOLS
 from .tools_tasks import recover_tasks_for_session
@@ -49,6 +50,24 @@ from .widgets import (
 )
 
 
+def _next_ledger_id(entries: dict, saved_value, prefix: str) -> int:
+    """Restore a monotonic id counter without trusting stale history metadata."""
+    try:
+        saved = max(1, int(saved_value or 1))
+    except (TypeError, ValueError):
+        saved = 1
+    seen = 0
+    for key in entries:
+        text = str(key)
+        if not text.startswith(prefix):
+            continue
+        try:
+            seen = max(seen, int(text[len(prefix):]))
+        except ValueError:
+            continue
+    return max(saved, seen + 1)
+
+
 class AppHistoryMixin:
     def _history_payload(self) -> dict:
         return {
@@ -58,10 +77,35 @@ class AppHistoryMixin:
             "cwd": self.ctx.work_dir,
             "model": self.model,
             "checkpoint": self.ctx.checkpoint,
+            "doc_receipts": self.ctx.doc_receipts,
+            "doc_receipt_next_id": self.ctx.doc_receipt_next_id,
+            "experiments": self.ctx.experiments,
+            "experiment_next_id": self.ctx.experiment_next_id,
             "active_explore": self._explore_payload(),
             # list(): HistoryStore is deliberately not JSON-serializable.
             "messages": list(self.messages),
         }
+
+    def _restore_evidence_state(self, payload: dict) -> None:
+        """Restore route/experiment ledgers from a saved conversation."""
+        doc_receipts = payload.get("doc_receipts")
+        self.ctx.doc_receipts = (
+            doc_receipts if isinstance(doc_receipts, dict) else {}
+        )
+        self.ctx.doc_receipt_next_id = _next_ledger_id(
+            self.ctx.doc_receipts,
+            payload.get("doc_receipt_next_id"),
+            "doc-",
+        )
+        experiments = payload.get("experiments")
+        self.ctx.experiments = (
+            experiments if isinstance(experiments, dict) else {}
+        )
+        self.ctx.experiment_next_id = _next_ledger_id(
+            self.ctx.experiments,
+            payload.get("experiment_next_id"),
+            "exp-",
+        )
 
     def _turn_journal_path(self) -> Path:
         return turn_journal_path(self._session_id)
@@ -607,6 +651,7 @@ class AppHistoryMixin:
             self._todo_block.remove()
         self._todo_block = None
         self.ctx.checkpoint = None
+        self._restore_evidence_state(payload)
         if (
             self._checkpoint_block is not None
             and self._checkpoint_block.is_mounted
@@ -686,7 +731,9 @@ class AppHistoryMixin:
             content = m.get("content") or ""
             if role == "user":
                 trace = None
-                if content.startswith("[实时插话] "):
+                if m.get("ddtui_kind") == RUNTIME_TASK_EVENT_KIND:
+                    await self._mount_task_event_notice(content)
+                elif content.startswith("[实时插话] "):
                     await self._mount_widget(
                         SteerBubble(content[len("[实时插话] "):])
                     )
@@ -832,8 +879,10 @@ class AppHistoryMixin:
             "`task_start/check/read/kill/list` "
             "`explore_start/end/cancel` "
             "`checkpoint_tool/get/clear` "
+            "`experiment_start/record/status` "
             "`project_note_add/search/list/read/update/delete` "
-            "`read_file` `write_file` `edit_file` `edit_lines` `multi_edit` "
+            "`read_file` `read_doc/follow_doc_link/doc_route_status` "
+            "`write_file` `edit_file` `edit_lines` `multi_edit` "
             "`list_files` `glob_files` `search_content` `web_fetch` `web_search` "
             "`todo_tool` `spawn_agent` `chat_agent` `agent_check` `end_agent`\n"
             "\n"

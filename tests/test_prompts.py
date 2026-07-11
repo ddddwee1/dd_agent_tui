@@ -143,6 +143,22 @@ def test_schema_visibility():
     assert sub == schema_names - SUBAGENT_BLOCKED_TOOLS
 
 
+def test_evidence_tool_schemas_are_visible_and_task_binding_is_declared():
+    schemas = {tool["function"]["name"]: tool["function"] for tool in TOOLS}
+    for name in (
+        "read_doc",
+        "follow_doc_link",
+        "doc_route_status",
+        "experiment_start",
+        "experiment_record",
+        "experiment_status",
+    ):
+        assert name in schemas
+    task_props = schemas["task_start"]["parameters"]["properties"]
+    assert "artifacts" in task_props
+    assert "experiment_id" in task_props
+
+
 def test_spawn_agent_schema_has_model_effort():
     spawn = next(t for t in TOOLS if t["function"]["name"] == "spawn_agent")
     props = spawn["function"]["parameters"]["properties"]

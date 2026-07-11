@@ -60,6 +60,8 @@ def _status_payload(
         "output_path": spec.get("output_path"),
         "status_path": spec.get("status_path"),
         "notify_on_complete": bool(spec.get("notify_on_complete", True)),
+        "artifact_hashes": spec.get("artifact_hashes") or {},
+        "experiment_id": spec.get("experiment_id"),
     }
 
 

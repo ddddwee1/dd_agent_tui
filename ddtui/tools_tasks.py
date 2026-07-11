@@ -42,6 +42,7 @@ from .state import (
     async_task_status as _task_status,
 )
 from .tools_checkpoint import prune_checkpoint_refs
+from .tools_experiments import snapshot_artifacts, validate_experiment_snapshot
 from .tool_utils import (
     _check_dangerous,
     _safe_path,
@@ -140,6 +141,8 @@ def _task_registry_payload(task: AsyncTask) -> dict:
         "notify_on_complete": task.notify_on_complete,
         "notice_time": task.notice_time,
         "notice_count": task.notice_count,
+        "artifact_hashes": task.artifact_hashes,
+        "experiment_id": task.experiment_id,
         "next_notice_at": _iso_from_ts(
             time.time() + (task.next_notice_at - time.monotonic())
             if task.next_notice_at is not None else None
@@ -175,6 +178,8 @@ def _write_status(task: AsyncTask) -> None:
         "notify_on_complete": task.notify_on_complete,
         "notice_time": task.notice_time,
         "notice_count": task.notice_count,
+        "artifact_hashes": task.artifact_hashes,
+        "experiment_id": task.experiment_id,
     }
     tmp = task.status_path.with_name(
         f".{task.status_path.name}.{os.getpid()}.tmp"
@@ -265,6 +270,15 @@ def recover_tasks_for_session(ctx: ToolContext, session_id: str) -> list[AsyncTa
             notice_count=_clamp_int(
                 payload.get("notice_count"), 0, 0, 10**9
             ),
+            artifact_hashes={
+                str(key): str(value)
+                for key, value in (payload.get("artifact_hashes") or {}).items()
+            },
+            experiment_id=(
+                str(payload.get("experiment_id"))
+                if payload.get("experiment_id")
+                else None
+            ),
             session_id=session_id,
             registry_path=path,
             runner_pid=runner_pid,
@@ -299,6 +313,10 @@ def _format_task(task: AsyncTask, tail_lines: int) -> str:
         f"notify_on_complete: {task.notify_on_complete}\n"
         f"notice_time: {task.notice_time if task.notice_time else 'disabled'}"
     )
+    if task.experiment_id:
+        head += f"\nexperiment_id: {task.experiment_id}"
+    for path, sha in task.artifact_hashes.items():
+        head += f"\nartifact_sha256_at_start: {sha}  {path}"
     if status == "running" and task.notify_on_complete:
         if task.check_count >= 2:
             head += (
@@ -331,6 +349,11 @@ def _completion_event(task: AsyncTask) -> str:
         tail = _truncate_output(tail, TASK_EVENT_MAX_CHARS)
     else:
         tail = "(no output)"
+    evidence = ""
+    if task.experiment_id:
+        evidence += f"experiment_id: {task.experiment_id}\n"
+    for path, sha in task.artifact_hashes.items():
+        evidence += f"artifact_sha256_at_start: {sha}  {path}\n"
     return (
         "[Async task complete]\n"
         f"task_id: {task.id}\n"
@@ -340,6 +363,7 @@ def _completion_event(task: AsyncTask) -> str:
         f"duration: {elapsed:.1f}s\n"
         f"output_path: {task.output_path}\n"
         f"status_path: {task.status_path}\n"
+        f"{evidence}"
         f"\nlast {TASK_EVENT_TAIL_LINES} lines:\n{tail}"
     )
 
@@ -352,6 +376,11 @@ def _notice_event(task: AsyncTask) -> str:
         tail = _truncate_output(tail, TASK_EVENT_MAX_CHARS)
     else:
         tail = "(no output)"
+    evidence = ""
+    if task.experiment_id:
+        evidence += f"experiment_id: {task.experiment_id}\n"
+    for path, sha in task.artifact_hashes.items():
+        evidence += f"artifact_sha256_at_start: {sha}  {path}\n"
     return (
         "[Async task notice]\n"
         f"task_id: {task.id}\n"
@@ -362,6 +391,7 @@ def _notice_event(task: AsyncTask) -> str:
         f"notice_count: {task.notice_count}\n"
         f"output_path: {task.output_path}\n"
         f"status_path: {task.status_path}\n"
+        f"{evidence}"
         f"\nlast {TASK_EVENT_TAIL_LINES} lines:\n{tail}"
     )
 
@@ -407,6 +437,8 @@ def tool_task_start(
     description: str | None = None,
     notify_on_complete: bool = True,
     notice_time: float | int | None = None,
+    artifacts: list[str] | None = None,
+    experiment_id: str | None = None,
 ) -> str:
     """Start a managed asynchronous shell task."""
     err = _check_dangerous(command)
@@ -440,6 +472,15 @@ def tool_task_start(
             return err
     cwd = str(cwd_path)
 
+    artifact_hashes, artifact_error = snapshot_artifacts(ctx, artifacts)
+    if artifact_error:
+        return artifact_error
+    experiment_error = validate_experiment_snapshot(
+        ctx, experiment_id, artifact_hashes
+    )
+    if experiment_error:
+        return experiment_error
+
     task_id = ctx.alloc_task_id()
     task_name = (name or description or _short_command(command)).strip()
     if not task_name:
@@ -465,6 +506,8 @@ def tool_task_start(
         "status_path": str(status_path),
         "notify_on_complete": bool(notify_on_complete),
         "notice_time": notice_seconds,
+        "artifact_hashes": artifact_hashes,
+        "experiment_id": experiment_id,
         "started_wall": started_wall,
     }
     atomic_write_json(spec_path, spec)
@@ -501,6 +544,8 @@ def tool_task_start(
         started_wall=started_wall,
         notify_on_complete=bool(notify_on_complete),
         notice_time=notice_seconds,
+        artifact_hashes=artifact_hashes,
+        experiment_id=experiment_id,
         next_notice_at=(
             time.monotonic() + notice_seconds
             if notice_seconds is not None else None
@@ -546,6 +591,13 @@ def tool_task_start(
             "progress; start a new notified task instead of blocking if "
             "completion matters."
         )
+    evidence = ""
+    if task.experiment_id:
+        evidence += f"experiment_id: {task.experiment_id}\n"
+    evidence += "".join(
+        f"artifact_sha256_at_start: {sha}  {path}\n"
+        for path, sha in task.artifact_hashes.items()
+    )
     return (
         f"Started managed task {task_id}: {task.name}\n"
         "status: running\n"
@@ -555,6 +607,7 @@ def tool_task_start(
         f"status_path: {status_path}\n"
         f"notify_on_complete: {task.notify_on_complete}\n"
         f"notice_time: {task.notice_time if task.notice_time else 'disabled'}\n"
+        f"{evidence}"
         f"{wait_guidance}\n"
         f"Use task_check(\"{task_id}\") to inspect progress, "
         f"or task_read(\"{task_id}\", offset=0) for incremental output."

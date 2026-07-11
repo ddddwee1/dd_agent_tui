@@ -23,6 +23,7 @@ from .config import (
     SUBAGENT_SYSTEM_PROMPT,
 )
 from .engine import ToolOutcome, TurnEngine, TurnObserver
+from .runtime_messages import runtime_task_event_message
 from .state import (
     SubagentSession,
     ToolContext,
@@ -104,6 +105,7 @@ class SubagentTurnObserver(TurnObserver):
         pane = self.sess.pane
         if pane is not None:
             try:
+                pane.sync_answer(msg.get("content") or "")
                 pane.finalize_thinking(self.app.counter.last_reasoning)
                 pane.finalize_answer(keep_trace=bool(msg.get("tool_calls") or []))
                 pane.mark_round_committed()
@@ -174,7 +176,7 @@ class AppSubagentMixin:
                 events = sess.pending_events
                 sess.pending_events = []
                 for event in events:
-                    sess.messages.append({"role": "user", "content": event})
+                    sess.messages.append(runtime_task_event_message(event))
 
             sess.turn += 1
             sess.phase = "thinking"

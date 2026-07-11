@@ -32,6 +32,16 @@ from .tools_checkpoint import (
     tool_checkpoint_get,
     tool_checkpoint_tool,
 )
+from .tools_docs import (
+    tool_doc_route_status,
+    tool_follow_doc_link,
+    tool_read_doc,
+)
+from .tools_experiments import (
+    tool_experiment_record,
+    tool_experiment_start,
+    tool_experiment_status,
+)
 from .tools_files import (
     tool_apply_patch,
     tool_edit_file,
@@ -123,6 +133,11 @@ def _specs() -> list[ToolSpec]:
         S("terminal_list", tool_terminal_list, parallel=True),
         # files
         S("read_file", tool_read_file, parallel=True),
+        # Markdown navigation mutates a route-receipt ledger and stays
+        # serial so one model round cannot flood itself with many long docs.
+        S("read_doc", tool_read_doc),
+        S("follow_doc_link", tool_follow_doc_link),
+        S("doc_route_status", tool_doc_route_status),
         S("write_file", tool_write_file, confirm=True),
         S("edit_file", tool_edit_file, confirm=True, strip_diff=True),
         S("edit_lines", tool_edit_lines, confirm=True, strip_diff=True),
@@ -140,6 +155,9 @@ def _specs() -> list[ToolSpec]:
         S("web_search", tool_web_search, parallel=True),
         # progress / memory
         S("todo_tool", tool_todo_tool),
+        S("experiment_start", tool_experiment_start),
+        S("experiment_record", tool_experiment_record),
+        S("experiment_status", tool_experiment_status),
         S("checkpoint_tool", tool_checkpoint_tool, subagent=False),
         S("checkpoint_get", tool_checkpoint_get, parallel=True, subagent=False),
         S("checkpoint_clear", tool_checkpoint_clear, subagent=False),

@@ -122,6 +122,23 @@ TOOLS = [
                             "notification when notify_on_complete=true."
                         ),
                     },
+                    "artifacts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional local file paths to hash before launch. "
+                            "The immutable SHA-256 snapshot is repeated in task "
+                            "status and completion evidence. Maximum 8 files."
+                        ),
+                    },
+                    "experiment_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional id from experiment_start. When set, "
+                            "artifacts must include the experiment artifact at "
+                            "the exact recorded SHA-256."
+                        ),
+                    },
                 },
                 "required": ["command"],
             },
@@ -714,6 +731,98 @@ TOOLS = [
                     },
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_doc",
+            "description": (
+                "Read Markdown with progressive disclosure. With no heading/"
+                "anchor, returns a compact outline plus resolved explicit "
+                "links. With heading or anchor, returns only that section and "
+                "a persistent document receipt. Prefer this over loading a "
+                "whole long Markdown file. It does not choose which route or "
+                "technical strategy is relevant; use follow_doc_link only for "
+                "the explicit link selected by your current reasoning."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative Markdown file path.",
+                    },
+                    "heading": {
+                        "type": "string",
+                        "description": (
+                            "Exact or uniquely matching heading text. Mutually "
+                            "exclusive with anchor."
+                        ),
+                    },
+                    "anchor": {
+                        "type": "string",
+                        "description": (
+                            "Markdown heading anchor, with or without '#'. "
+                            "Mutually exclusive with heading."
+                        ),
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "follow_doc_link",
+            "description": (
+                "Follow one explicit Markdown link from a prior read_doc "
+                "receipt. Resolves the relative path and heading anchor, reads "
+                "only that target section (or its outline when no anchor was "
+                "present), and records the edge. Never crawls links "
+                "automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "receipt_id": {
+                        "type": "string",
+                        "description": "Document receipt id returned by read_doc.",
+                    },
+                    "link_id": {
+                        "type": "string",
+                        "description": "Exact link id such as link-1.",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Unique substring of the displayed link label.",
+                    },
+                },
+                "required": ["receipt_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "doc_route_status",
+            "description": (
+                "Show persistent Markdown route receipts, followed links, and "
+                "broken explicit targets. Use after compaction/resume or before "
+                "claiming that a selected documentation route was covered. "
+                "Unfollowed links are not automatically mandatory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "receipt_id": {
+                        "type": "string",
+                        "description": "Optional receipt to show; default all.",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -1546,6 +1655,127 @@ TOOLS = [
                     "reason": {
                         "type": "string",
                         "description": "Optional short reason for clearing.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "experiment_start",
+            "description": (
+                "Start a bounded implementation experiment and snapshot one "
+                "candidate artifact by SHA-256. Call after writing a candidate "
+                "and before validation. Every changed artifact needs a new "
+                "candidate or fix experiment. Budget overruns are recorded as "
+                "warnings rather than silently forgotten."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artifact_path": {
+                        "type": "string",
+                        "description": "Local candidate file to hash immutably.",
+                    },
+                    "hypothesis": {
+                        "type": "string",
+                        "description": "One falsifiable reason this attempt may help.",
+                    },
+                    "boundary": {
+                        "type": "string",
+                        "description": "Current failing or validation boundary.",
+                    },
+                    "attempt_type": {
+                        "type": "string",
+                        "enum": ["candidate", "fix"],
+                        "description": "Default candidate. Fix requires parent_id.",
+                    },
+                    "parent_id": {
+                        "type": "string",
+                        "description": "Parent experiment id for a same-boundary fix.",
+                    },
+                    "max_candidates": {
+                        "type": "integer",
+                        "description": "Declared candidate budget. Default 3.",
+                    },
+                    "max_same_boundary_fixes": {
+                        "type": "integer",
+                        "description": "Declared fix budget per boundary. Default 2.",
+                    },
+                },
+                "required": ["artifact_path", "hypothesis"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "experiment_record",
+            "description": (
+                "Record correctness, performance, source-gate, diagnostic, or "
+                "other evidence against one immutable experiment SHA. Bind "
+                "managed commands with task_id. Performance evidence is marked "
+                "invalid until correctness has passed for the same SHA; task "
+                "failure or artifact drift is also recorded explicitly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "experiment_id": {"type": "string"},
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "correctness", "performance", "source_gate",
+                            "diagnostic", "other",
+                        ],
+                    },
+                    "result": {
+                        "type": "string",
+                        "enum": ["pass", "fail", "inconclusive", "skipped"],
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Completed task bound to this experiment.",
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Command when no managed task was used.",
+                    },
+                    "evidence": {"type": "string"},
+                    "metric_name": {"type": "string"},
+                    "metric_value": {
+                        "type": "string",
+                        "description": (
+                            "Metric value as text, including units when useful "
+                            "(for example '13.2 us')."
+                        ),
+                    },
+                    "decision": {
+                        "type": "string",
+                        "enum": ["continue", "keep", "rollback", "stop"],
+                    },
+                },
+                "required": ["experiment_id", "kind", "result"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "experiment_status",
+            "description": (
+                "Show compact experiment budgets, immutable SHA-256 values, "
+                "evidence validity, and keep/rollback state. Use before final "
+                "claims and after compaction/resume."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "experiment_id": {
+                        "type": "string",
+                        "description": "Optional experiment to show; default all.",
                     },
                 },
                 "required": [],
