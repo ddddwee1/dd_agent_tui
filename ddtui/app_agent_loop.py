@@ -34,8 +34,7 @@ from .widgets import (
     SteerBubble,
     ThinkingBlock,
     TodoBlock,
-    TraceBlock,
-    ToolRunBlock,
+    ToolCallBlock,
     UserBubble,
 )
 
@@ -48,7 +47,7 @@ class ParentTurnObserver(TurnObserver):
     """Bridges TurnEngine events to the main-conversation UI, the
     remote relay, and history persistence (autosave + turn journal)."""
 
-    # Sidebar-rendered tools: no ToolRunBlock in the conversation flow,
+    # Sidebar-rendered tools: no ToolCallBlock in the conversation flow,
     # their UI lives in the sidebar (TodoBlock / CheckpointBlock).
     NO_BLOCK_TOOLS = frozenset({
         "todo_tool", "checkpoint_tool", "checkpoint_clear",
@@ -58,9 +57,7 @@ class ParentTurnObserver(TurnObserver):
         self.app = app
         self._thinking: ThinkingBlock | None = None
         self._answer: AssistantMessage | None = None
-        self._trace: TraceBlock | None = None
-        self._tool_run: ToolRunBlock | None = None
-        self._blocks: dict[str, ToolRunBlock] = {}
+        self._blocks: dict[str, ToolCallBlock] = {}
 
     def _scroll_view(self) -> VerticalScroll:
         return self.app.query_one("#conversation", VerticalScroll)
@@ -71,22 +68,13 @@ class ParentTurnObserver(TurnObserver):
         except Exception:
             pass
 
-    async def _ensure_trace(self) -> TraceBlock:
-        if self._trace is None:
-            self._trace = TraceBlock()
-            await self.app._mount_widget(self._trace)
-        return self._trace
-
     # ── streaming ──
 
     async def on_reasoning_delta(self, text: str) -> None:
         if self._thinking is None:
             self._thinking = ThinkingBlock()
-            trace = await self._ensure_trace()
-            await trace.mount_trace_widget(self._thinking)
+            await self.app._mount_widget(self._thinking)
         self._thinking.append_text(text)
-        if self._trace is not None:
-            self._trace.refresh_summary()
         self._emit("assistant.delta", {"kind": "reasoning", "text": text})
         if self.app._follow_bottom:
             self._scroll_view().scroll_end(animate=False)
@@ -110,17 +98,8 @@ class ParentTurnObserver(TurnObserver):
                     w.remove()
                 except Exception:
                     pass
-                if self._trace is not None:
-                    self._trace.discard_trace_widget(w)
         self._thinking = None
         self._answer = None
-        self._tool_run = None
-        if self._trace is not None and self._trace.is_empty:
-            try:
-                self._trace.remove()
-            except Exception:
-                pass
-        self._trace = None
 
     async def on_usage(self, usage) -> None:
         self.app.counter.add(usage)
@@ -133,8 +112,6 @@ class ParentTurnObserver(TurnObserver):
             self._answer.set_text(msg.get("content") or "")
         if self._thinking is not None:
             self._thinking.finalize(self.app.counter.last_reasoning)
-            if self._trace is not None:
-                self._trace.refresh_summary()
         self.app._refresh_status()
         if self.app._follow_bottom:
             view = self._scroll_view()
@@ -142,9 +119,6 @@ class ParentTurnObserver(TurnObserver):
         self._emit("message.append", {"message": msg, "source": "assistant"})
         self._thinking = None
         self._answer = None
-        self._tool_run = None
-        if not (msg.get("tool_calls") or []):
-            self._trace = None
 
     # ── tools ──
 
@@ -161,23 +135,16 @@ class ParentTurnObserver(TurnObserver):
             message_len_current=len(self.app.messages),
         )
         if name not in self.NO_BLOCK_TOOLS:
-            if self._tool_run is None:
-                self._tool_run = ToolRunBlock()
-                trace = await self._ensure_trace()
-                await trace.mount_trace_widget(self._tool_run)
-            self._tool_run.add_call(tc_id, name, args)
-            if self._trace is not None:
-                self._trace.refresh_summary()
-            self._blocks[tc_id or name] = self._tool_run
+            block = ToolCallBlock(name, args)
+            await self.app._mount_widget(block)
+            self._blocks[tc_id or name] = block
 
     async def on_tool_result(
         self, tc_id: str, name: str, args: dict, outcome: ToolOutcome
     ) -> None:
         block = self._blocks.pop(tc_id or name, None)
         if block is not None:
-            block.set_result(tc_id, outcome.content, blocked=not outcome.ok)
-            if self._trace is not None:
-                self._trace.refresh_summary()
+            block.set_result(outcome.content, blocked=not outcome.ok)
         if outcome.diff:
             await self.app._mount_widget(
                 DiffBlock(args.get("path", "?"), outcome.diff)

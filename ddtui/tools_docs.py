@@ -1,6 +1,7 @@
 """Section-aware Markdown navigation with compact route receipts.
 
-``read_file`` remains the raw escape hatch. These tools add only structure
+``read_file`` / ``read_files`` remain the raw escape hatches. These tools
+add only structure
 already present in Markdown: headings, explicit links, resolved targets, and
 which link was followed. They do not perform semantic retrieval or choose a
 technical route for the model.

@@ -43,8 +43,7 @@ from .widgets import (
     SteerBubble,
     ThinkingBlock,
     TodoBlock,
-    TraceBlock,
-    ToolRunBlock,
+    ToolCallBlock,
     UserBubble,
     _sanitize_table_pipes,
 )
@@ -719,7 +718,6 @@ class AppHistoryMixin:
                 if tcid:
                     tool_results[tcid] = m.get("content") or ""
 
-        trace: TraceBlock | None = None
         for m in self.messages:
             role = m.get("role")
             if role == "system":
@@ -730,7 +728,6 @@ class AppHistoryMixin:
                 continue
             content = m.get("content") or ""
             if role == "user":
-                trace = None
                 if m.get("ddtui_kind") == RUNTIME_TASK_EVENT_KIND:
                     await self._mount_task_event_notice(content)
                 elif content.startswith("[实时插话] "):
@@ -744,10 +741,6 @@ class AppHistoryMixin:
                 continue
 
             rc = m.get("reasoning_content")
-            has_tool_calls = bool(m.get("tool_calls") or [])
-            if (rc or has_tool_calls) and trace is None:
-                trace = TraceBlock()
-                await self._mount_widget(trace)
             if rc:
                 tb = ThinkingBlock()
                 tb.append_text(rc)
@@ -755,14 +748,12 @@ class AppHistoryMixin:
                 # ThinkingBlock is collapsed by default, so a freshly
                 # loaded conversation won't bury the user under walls of
                 # thought from earlier turns.
-                await trace.mount_trace_widget(tb)
+                await self._mount_widget(tb)
             if content:
                 am = AssistantMessage()
                 am.append_text(content)
                 await self._mount_widget(am)
 
-            tool_run: ToolRunBlock | None = None
-            diff_blocks: list[DiffBlock] = []
             for tc in (m.get("tool_calls") or []):
                 fn = tc.get("function") or {}
                 name = fn.get("name", "?")
@@ -814,16 +805,9 @@ class AppHistoryMixin:
                             await self._sync_checkpoint_block()
                     continue
 
-                if tool_run is None:
-                    tool_run = ToolRunBlock()
-                    if trace is None:
-                        trace = TraceBlock()
-                        await self._mount_widget(trace)
-                    await trace.mount_trace_widget(tool_run)
+                block = ToolCallBlock(name, args)
                 tcid = tc.get("id") or ""
-                tool_run.add_call(tcid, name, args)
-                if trace is not None:
-                    trace.refresh_summary()
+                await self._mount_widget(block)
                 result = tool_results.get(tcid)
                 if result is None:
                     continue
@@ -833,15 +817,11 @@ class AppHistoryMixin:
                     if sep and "@@" in diff:
                         diff_text = diff
                         result = head
-                tool_run.set_result(tcid, result)
-                if trace is not None:
-                    trace.refresh_summary()
+                block.set_result(result)
                 if diff_text:
-                    diff_blocks.append(DiffBlock(args.get("path", "?"), diff_text))
-            for diff_block in diff_blocks:
-                await self._mount_widget(diff_block)
-            if not has_tool_calls:
-                trace = None
+                    await self._mount_widget(
+                        DiffBlock(args.get("path", "?"), diff_text)
+                    )
 
     async def _show_help(self) -> None:
         md = (
@@ -855,7 +835,8 @@ class AppHistoryMixin:
             "- `/remote [status|on [url]|off|snapshot]` 管理 VPS 远控连接\n"
             "- `/list-history` 列出已保存对话\n"
             "- `/provider [deepseek|codex]` 查看 / 切换 provider\n"
-            "- `/model [<id>]` 查看 / 切换模型（下一轮请求生效）\n"
+            "- `/model [<id>]` 不带 id 列出当前 provider 的候选模型；"
+            "带 id 切换（下一轮请求生效）\n"
             "- `/effort [<level>]` 查看 / 切换 reasoning effort\n"
             "- `/rewind` 退回上一条用户消息（文本回填输入框）\n"
             "- `/rethink` 删除最近一轮助手回复，让模型重新思考\n"
@@ -864,6 +845,8 @@ class AppHistoryMixin:
             "### 快捷键\n"
             "- `Enter` 发送当前输入\n"
             "- `Option+Enter` 插入换行\n"
+            "- `Tab` 补全 slash 命令 / 参数候选的第一条"
+            "（弹窗没显示时仍是切换焦点）\n"
             "- `Cmd+Enter` 实时插话 steer（需 iTerm2 把 ⌘Return 转义为 CSI u；"
             "macOS 自带 Terminal.app 不支持，先 Option+Enter 换行后再 Enter 也可）\n"
             "- `ESC × 2` 中断当前任务\n"
@@ -881,7 +864,7 @@ class AppHistoryMixin:
             "`checkpoint_tool/get/clear` "
             "`experiment_start/record/status` "
             "`project_note_add/search/list/read/update/delete` "
-            "`read_file` `read_doc/follow_doc_link/doc_route_status` "
+            "`read_file/read_files` `read_doc/follow_doc_link/doc_route_status` "
             "`write_file` `edit_file` `edit_lines` `multi_edit` "
             "`list_files` `glob_files` `search_content` `web_fetch` `web_search` "
             "`todo_tool` `spawn_agent` `chat_agent` `agent_check` `end_agent`\n"

@@ -38,8 +38,7 @@ from .widgets import (
     TasksBlock,
     TerminalTabPane,
     ThinkingBlock,
-    TraceBlock,
-    ToolRunBlock,
+    ToolCallBlock,
     UserBubble,
 )
 
@@ -718,7 +717,7 @@ class AppUiMixin:
 
         Scan back to the most recent assistant message; for every
         unpaired tool_call id, append a stub `tool` message marking it
-        cancelled. Also flip any still-pending `ToolRunBlock` widget to
+        cancelled. Also flip any still-pending `ToolCallBlock` widget to
         a blocked state so the UI doesn't keep showing 「执行中…」.
 
         Returns the number of stub messages appended.
@@ -766,15 +765,9 @@ class AppUiMixin:
             for child in reversed(list(view.children)):
                 if isinstance(child, (UserBubble, SteerBubble)):
                     break
-                if isinstance(child, TraceBlock) and child.is_pending:
+                if isinstance(child, ToolCallBlock) and child.is_pending:
                     try:
-                        child.set_pending_results(cancel_note, blocked=True)
-                    except Exception:
-                        pass
-                    continue
-                if isinstance(child, ToolRunBlock) and child.is_pending:
-                    try:
-                        child.set_pending_results(cancel_note, blocked=True)
+                        child.set_result(cancel_note, blocked=True)
                     except Exception:
                         pass
         except Exception:

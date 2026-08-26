@@ -107,7 +107,7 @@ class SubagentTurnObserver(TurnObserver):
             try:
                 pane.sync_answer(msg.get("content") or "")
                 pane.finalize_thinking(self.app.counter.last_reasoning)
-                pane.finalize_answer(keep_trace=bool(msg.get("tool_calls") or []))
+                pane.finalize_answer()
                 pane.mark_round_committed()
             except Exception:
                 pass

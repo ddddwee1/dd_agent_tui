@@ -5,7 +5,7 @@ import asyncio
 
 import ddtui.app as app_mod
 from ddtui.providers import LLMProvider, LLMStreamEvent, ToolCallDelta
-from ddtui.widgets import AssistantMessage, ThinkingBlock, TraceBlock, ToolRunBlock
+from ddtui.widgets import AssistantMessage, ThinkingBlock, ToolCallBlock
 from tests.conftest import REPO_ROOT
 
 
@@ -78,12 +78,15 @@ def test_full_turn_through_engine(monkeypatch):
             assert "\t" in tool_msg["content"]  # numbered output
 
             assert app.messages[-1]["content"] == "已读取，完成。"
-            assert len(app.query(TraceBlock)) == 1
-            assert len(app.query(ThinkingBlock)) == 2
-            tool_runs = list(app.query(ToolRunBlock))
-            assert len(tool_runs) == 2
-            assert "2 calls" in tool_runs[0].title
-            assert "read_file x2" in tool_runs[0].title
+            thinking_blocks = list(app.query(ThinkingBlock))
+            tool_blocks = list(app.query(ToolCallBlock))
+            assert len(thinking_blocks) == 2
+            assert len(tool_blocks) == 3
+            assert all(block.collapsed for block in thinking_blocks)
+            assert all(block.collapsed for block in tool_blocks)
+            conversation = app.query_one("#conversation")
+            assert all(block.parent is conversation for block in thinking_blocks)
+            assert all(block.parent is conversation for block in tool_blocks)
             assert len(app.query(AssistantMessage)) == 1
             assert app._busy is False
 

@@ -48,6 +48,7 @@ from .tools_files import (
     tool_edit_lines,
     tool_multi_edit,
     tool_read_file,
+    tool_read_files,
     tool_write_file,
 )
 from .tools_notes import (
@@ -133,6 +134,7 @@ def _specs() -> list[ToolSpec]:
         S("terminal_list", tool_terminal_list, parallel=True),
         # files
         S("read_file", tool_read_file, parallel=True),
+        S("read_files", tool_read_files, parallel=True),
         # Markdown navigation mutates a route-receipt ledger and stays
         # serial so one model round cannot flood itself with many long docs.
         S("read_doc", tool_read_doc),

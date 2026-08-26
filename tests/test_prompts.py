@@ -32,13 +32,15 @@ def test_prompt_sections():
         "# 任务管理与记忆", "# 输出与验证", "# 注入消息格式",
     ]:
         assert section in SYSTEM_PROMPT, section
+    assert "优先用 read_files" in SYSTEM_PROMPT
+    assert "优先用 read_files" in SUBAGENT_SYSTEM_PROMPT
 
 
 def test_prompt_key_rules_present():
     assert "不要用 task_wait 或反复 task_check" in SYSTEM_PROMPT
     assert "结束回复不是放弃任务" in SYSTEM_PROMPT  # anti-polling assurance
     assert "replace_all=true 替换全部出现" in SYSTEM_PROMPT
-    assert "覆盖已存在文件前必须先 read_file" in SYSTEM_PROMPT
+    assert "覆盖已存在文件前必须先用 read_file/read_files" in SYSTEM_PROMPT
     assert "行号不是文件内容" in SYSTEM_PROMPT
     assert "回复和思考过程（reasoning）都默认使用中文" in SYSTEM_PROMPT
     assert "文件路径:行号" in SYSTEM_PROMPT
@@ -129,8 +131,22 @@ def test_derived_sets():
         "task_wait",
     })
     assert "read_file" in PARALLEL_SAFE_TOOLS
+    assert "read_files" in PARALLEL_SAFE_TOOLS
     assert "write_file" not in PARALLEL_SAFE_TOOLS
     assert "apply_patch" in TOOL_FUNCS
+
+
+def test_read_files_schema_is_bounded_and_visible():
+    schemas = {tool["function"]["name"]: tool["function"] for tool in TOOLS}
+    batch = schemas["read_files"]["parameters"]["properties"]["files"]
+    assert batch["minItems"] == 2
+    assert batch["maxItems"] == 8
+    assert "read_files" in {
+        tool["function"]["name"] for tool in PARENT_TOOL_SCHEMAS
+    }
+    assert "read_files" in {
+        tool["function"]["name"] for tool in SUBAGENT_TOOL_SCHEMAS
+    }
 
 
 def test_schema_visibility():

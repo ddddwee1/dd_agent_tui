@@ -706,7 +706,10 @@ TOOLS = [
                 "part of the file — never include them in edit_file/"
                 "multi_edit old_string. Very long lines are clipped and very "
                 "large results are capped with a hint for which offset to "
-                "continue from."
+                "continue from. For 2-8 already-identified files, prefer "
+                "read_files to reduce tool-call overhead. If separate "
+                "read_file calls are needed, emit them together in one "
+                "response; the runtime executes adjacent reads concurrently."
             ),
             "parameters": {
                 "type": "object",
@@ -731,6 +734,60 @@ TOOLS = [
                     },
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_files",
+            "description": (
+                "Read 2-8 already-identified text files or line ranges in "
+                "one tool call. Prefer this over multiple read_file calls "
+                "when the paths are already known. Results preserve input "
+                "order; one missing/invalid file does not block the others. "
+                "The combined output is capped at 64,000 characters and "
+                "large sections include a read_file resume hint. Use "
+                "list_files/glob_files/search_content first when paths are "
+                "not yet known. Output uses the same 1-indexed line-number "
+                "prefixes as read_file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "description": "Files/ranges to read, in result order.",
+                        "minItems": 2,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": (
+                                        "Absolute or project-relative path."
+                                    ),
+                                },
+                                "offset": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Optional 1-indexed starting line; "
+                                        "default 1."
+                                    ),
+                                },
+                                "limit": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Optional maximum lines; default 2000."
+                                    ),
+                                },
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                },
+                "required": ["files"],
             },
         },
     },
@@ -833,8 +890,8 @@ TOOLS = [
             "description": (
                 "Create a new file or intentionally overwrite a whole file. "
                 "Overwriting an EXISTING file is refused unless you have "
-                "read it with read_file in this session and it has not "
-                "changed on disk since — read first, then overwrite. For "
+                "read it with read_file/read_files in this session and it "
+                "has not changed on disk since — read first, then overwrite. For "
                 "small or localized changes prefer edit_file or multi_edit "
                 "so the edit is incremental and reviewable."
             ),

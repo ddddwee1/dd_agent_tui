@@ -126,9 +126,15 @@ export CODEX_REASONING_EFFORT="xhigh"
 /provider
 /provider deepseek
 /provider codex
+/model
 /model <model-id>
 /effort <level>
 ```
+
+不带参数的 `/model` 会列出当前 provider 的候选模型：DeepSeek 是内置的
+`deepseek-v4-pro` / `deepseek-v4-flash`（均为 1M 上下文、384K 最大输出，
+flash 便宜约 3 倍）；Codex 则从 `~/.codex/models_cache.json` 里读服务端返回的
+模型目录，所以 Codex 侧新增模型不用等 ddtui 发版。
 
 切换 provider/model/effort 后，从下一轮请求开始生效。
 
@@ -166,7 +172,7 @@ ddtui
 - `/remote [status|on [url]|off|snapshot]`：管理 VPS 远程控制连接。
 - `/list-history`：列出已保存对话。
 - `/provider [deepseek|codex]`：查看 / 切换 provider。
-- `/model [<id>]`：查看 / 切换模型。
+- `/model [<id>]`：不带 id 列出当前 provider 的候选模型（含上下文窗口等信息，当前模型标 `●`）；带 id 切换。输入 `/model ` 后输入框上方的弹窗会列出候选并按前缀过滤。id 不在候选列表里也会照常发给 API，只是会提示一句。
 - `/effort [<level>]`：查看 / 切换 reasoning effort。
 - `/rewind`：退回上一条用户消息，并把文本回填到输入框。
 - `/rethink`：删除最近一轮助手回复，让模型重新思考。
@@ -364,11 +370,16 @@ claude mcp add ddtui -- ddtui-mcp --token-file ~/.ddtui/remote_token
 - 临时探索：`explore_start`、`explore_end`、`explore_cancel`
 - 会话 checkpoint：`checkpoint_tool`、`checkpoint_get`、`checkpoint_clear`
 - 项目笔记：`project_note_add`、`project_note_search`、`project_note_list`、`project_note_read`、`project_note_update`、`project_note_delete`
-- 文件：`read_file`、`read_doc`、`follow_doc_link`、`doc_route_status`、`write_file`、`edit_file`、`edit_lines`、`multi_edit`
+- 文件：`read_file`、`read_files`、`read_doc`、`follow_doc_link`、`doc_route_status`、`write_file`、`edit_file`、`edit_lines`、`multi_edit`
 - 搜索：`list_files`、`glob_files`、`search_content`
 - Web：`web_fetch`、`web_search`
 - 任务进度与证据：`todo_tool`、`experiment_start`、`experiment_record`、`experiment_status`
 - 子 agent：`spawn_agent`、`chat_agent`、`agent_check`、`end_agent`
+
+`read_files(files=[{"path": "a.py"}, {"path": "b.py", "offset": 40,
+"limit": 120}])` 可在一次工具调用中读取 2–8 个已知文件/行区间。
+结果按输入顺序返回，单个文件失败不影响其他项；整批输出共享
+64,000 字符上限，大文件会保留可续读的 `read_file(offset=...)` 提示。
 
 ### 交互式 Terminal
 
@@ -469,7 +480,7 @@ export BRAVE_API_KEY_FILE="$HOME/brave_apikey.txt"
 
 父 agent 和子 agent 的写操作共用同一套确认；并发确认会排队逐个弹出，不会叠窗。注意：远程（`/remote`）会话触发的写操作也会等待**本地**弹窗确认。
 
-另外，`write_file` 覆盖**已存在**文件前要求模型本会话内先 `read_file` 读过该文件（或刚编辑过它），且文件此后未被外部修改；否则会被拒绝并提示先读。新建文件不受影响。这可以防止模型在没看过旧内容的情况下整文件覆盖掉你的东西。
+另外，`write_file` 覆盖**已存在**文件前要求模型本会话内先用 `read_file` / `read_files` 读过该文件（或刚编辑过它），且文件此后未被外部修改；否则会被拒绝并提示先读。新建文件不受影响。这可以防止模型在没看过旧内容的情况下整文件覆盖掉你的东西。
 
 如果确认弹窗打扰到你（完全信任本机环境），可以关闭：
 

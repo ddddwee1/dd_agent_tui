@@ -21,6 +21,32 @@ class AppInputMixin:
             return
         popup.update_for_text(event.text_area.text)
 
+    def on_multiline_input_completion_requested(
+        self, _event: "MultilineInput.CompletionRequested"
+    ) -> None:
+        """Tab: accept the slash popup's top row.
+
+        With no popup showing there's nothing to complete, so Tab keeps
+        its default meaning and moves focus onward.
+        """
+        try:
+            popup = self.query_one("#slash-popup", SlashPopup)
+            inp = self.query_one("#user-input", MultilineInput)
+        except Exception:
+            return
+        completion = popup.completion()
+        if completion is None:
+            self.screen.focus_next()
+            return
+        if completion != inp.text:
+            inp.text = completion
+        # `text = ...` reloads the document and parks the cursor at the
+        # top; put it back where the user is typing.
+        inp.move_cursor(inp.document.end)
+        # The reload posts Changed asynchronously; refresh the popup now
+        # so the candidate list matches the completed text immediately.
+        popup.update_for_text(completion)
+
     async def on_multiline_input_submitted(
         self, event: "MultilineInput.Submitted"
     ) -> None:
@@ -172,11 +198,7 @@ class AppInputMixin:
             inp.text = ""
             arg = text[len("/model"):].strip()
             if not arg:
-                await self._mount_widget(Static(Text(
-                    f"当前 model: {self.model}\n"
-                    "用法：/model <id>  （下一轮请求开始生效）",
-                    style="dim",
-                )))
+                await self._mount_widget(Static(self._model_choices_text()))
             else:
                 old = self.model
                 self.model = arg
@@ -186,10 +208,22 @@ class AppInputMixin:
                 limit = self._context_limit()
                 if limit:
                     limit_note = f"；ctx={limit:,}"
-                await self._mount_widget(Static(Text(
-                    f"⚙ model: {old} → {self.model}（下一轮请求生效{limit_note}）",
+                body = Text(
+                    f"⚙ model: {old} → {self.model}"
+                    f"（下一轮请求生效{limit_note}）",
                     style="bold #66d9ef",
-                )))
+                )
+                known = {c.id for c in self.provider.available_models()}
+                # Unknown ids still go through as typed — the catalog can
+                # lag the service — but flag it, since otherwise a typo
+                # only surfaces as an API error mid-turn.
+                if known and arg not in known:
+                    body.append(
+                        f"\n⚠ 不在 {self.provider_name} 候选列表里，"
+                        "仍按原样发送；打错的话下一轮会报 API 错误。",
+                        style="bold #fd971f",
+                    )
+                await self._mount_widget(Static(body))
             return
         if text == "/effort" or text.startswith("/effort "):
             inp.text = ""
@@ -269,6 +303,52 @@ class AppInputMixin:
             self.screen.set_focus(inp)
         except Exception:
             inp.focus()
+
+    def _slash_arg_candidates(self, name: str) -> list[tuple[str, str]]:
+        """Argument candidates for the slash popup, resolved on demand.
+
+        Only `/model` has a catalog to offer today; unknown commands
+        return nothing, which hides the popup once a space is typed —
+        the behaviour every command had before.
+        """
+        if name == "/model":
+            return [
+                (choice.id, choice.note)
+                for choice in self.provider.available_models()
+            ]
+        return []
+
+    def _model_choices_text(self) -> Text:
+        """Render the `/model` candidate list for the active provider.
+
+        Providers with no catalog (empty list) degrade to just the
+        current model plus usage, which is what `/model` showed before.
+        """
+        t = Text()
+        t.append("当前 model: ", style="dim")
+        t.append(self.model, style="bold #a6e22e")
+        choices = self.provider.available_models()
+        if choices:
+            t.append(f"\n{self.provider.label} 可选模型：", style="dim")
+            width = max(len(choice.id) for choice in choices)
+            for choice in choices:
+                active = choice.id == self.model
+                t.append("\n  ")
+                t.append(
+                    "●" if active else "○",
+                    style="bold #a6e22e" if active else "dim",
+                )
+                t.append(" ")
+                t.append(
+                    choice.id.ljust(width),
+                    style="bold #a6e22e" if active else "bold #66d9ef",
+                )
+                if choice.note:
+                    t.append(f"  {choice.note}", style="dim")
+        t.append(
+            "\n用法：/model <id>  （下一轮请求开始生效）", style="dim"
+        )
+        return t
 
     async def on_multiline_input_steer_submitted(
         self, event: "MultilineInput.SteerSubmitted"

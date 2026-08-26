@@ -9,6 +9,8 @@ from .config import (
     READ_FILE_MAX_LINE_CHARS,
     READ_FILE_MAX_LINES,
     READ_FILE_MAX_TOTAL_CHARS,
+    READ_FILES_MAX_FILES,
+    READ_FILES_MAX_TOTAL_CHARS,
 )
 from .state import ToolContext
 from .tool_utils import _safe_path, _sandbox_error, _unified_diff
@@ -17,9 +19,10 @@ from .tool_utils import _safe_path, _sandbox_error, _unified_diff
 def _note_file_known(ctx: ToolContext, p: Path) -> None:
     """Record that the model has current knowledge of *p*'s contents.
 
-    Called after a successful read_file AND after every successful
-    write/edit (the model knows what it just wrote), so the natural
-    read → edit → write_file flow never trips the overwrite guard.
+    Called after a successful read_file/read_files item AND after every
+    successful write/edit (the model knows what it just wrote), so the
+    natural read → edit → write_file flow never trips the overwrite
+    guard.
     """
     try:
         ctx.read_files[str(p)] = p.stat().st_mtime
@@ -39,7 +42,8 @@ def _overwrite_error(ctx: ToolContext, p: Path) -> str | None:
     if recorded is None:
         return (
             f"Error: {p} already exists and you have not read it in this "
-            "session. read_file it first so you know what you are "
+            "session. Read it with read_file or read_files first so you know "
+            "what you are "
             "replacing, or use edit_file/multi_edit for incremental "
             "changes."
         )
@@ -52,7 +56,7 @@ def _overwrite_error(ctx: ToolContext, p: Path) -> str | None:
     if current != recorded:
         return (
             f"Error: {p} changed on disk after you last read it. "
-            "read_file it again before overwriting."
+            "Read it again with read_file or read_files before overwriting."
         )
     return None
 
@@ -124,6 +128,153 @@ def tool_read_file(
         )
     _note_file_known(ctx, p)
     return out
+
+
+def _fair_output_budgets(lengths: list[int], total: int) -> list[int]:
+    """Share *total* fairly while redistributing space unused by short items."""
+    budgets = [0] * len(lengths)
+    pending = list(range(len(lengths)))
+    remaining = max(0, total)
+    while pending:
+        share, extra = divmod(remaining, len(pending))
+        small = [i for i in pending if lengths[i] <= share]
+        if not small:
+            for position, i in enumerate(pending):
+                budgets[i] = share + (1 if position < extra else 0)
+            break
+        for i in small:
+            budgets[i] = lengths[i]
+            remaining -= lengths[i]
+            pending.remove(i)
+    return budgets
+
+
+def _clip_batch_result(
+    result: str,
+    budget: int,
+    path: str,
+    offset: int,
+) -> str:
+    """Clip one batch section on a complete line and add a resume hint."""
+    if len(result) <= budget:
+        return result
+    if budget <= 0:
+        return ""
+
+    path_preview = path if len(path) <= 240 else "…" + path[-239:]
+    next_offset = offset
+    hint = ""
+    prefix = ""
+    # The offset changes the hint width, so calculate twice to keep the
+    # returned section inside its exact allocation.
+    for _ in range(2):
+        hint = (
+            "…[read_files batch cap; continue with "
+            f"read_file(path={path_preview!r}, offset={next_offset})]"
+        )
+        prefix_budget = max(0, budget - len(hint) - 1)
+        prefix = result[:prefix_budget]
+        if len(prefix) < len(result) and "\n" in prefix:
+            prefix = prefix.rsplit("\n", 1)[0]
+        for line in prefix.splitlines():
+            number, tab, _content = line.partition("\t")
+            if tab and number.strip().isdigit():
+                next_offset = int(number.strip()) + 1
+
+    clipped = f"{prefix}\n{hint}" if prefix else hint
+    return clipped[:budget]
+
+
+def tool_read_files(ctx: ToolContext, files: list[dict]) -> str:
+    """Read several already-identified text files in one bounded result.
+
+    Every item is attempted independently and retains read_file's line
+    numbering, pagination, clipping, and read-before-overwrite receipt.
+    When the combined results are too large, the fixed batch budget is
+    shared fairly: short files return in full and long files receive a
+    resumable slice, so one large file cannot crowd every later file out.
+    """
+    if not isinstance(files, list):
+        return "Error: read_files.files must be an array"
+    if not files:
+        return "Error: read_files.files must contain at least one item"
+    if len(files) > READ_FILES_MAX_FILES:
+        return (
+            f"Error: read_files accepts at most {READ_FILES_MAX_FILES} files "
+            f"per call; received {len(files)}"
+        )
+
+    sections: list[tuple[str, int, str, bool]] = []
+    for index, item in enumerate(files, start=1):
+        if not isinstance(item, dict):
+            sections.append((
+                f"item {index}",
+                1,
+                f"Error: read_files item {index} must be an object",
+                False,
+            ))
+            continue
+        path = item.get("path")
+        if not isinstance(path, str) or not path.strip():
+            sections.append((
+                f"item {index}",
+                1,
+                f"Error: read_files item {index} requires a non-empty path",
+                False,
+            ))
+            continue
+        offset = item.get("offset", 1)
+        limit = item.get("limit", READ_FILE_MAX_LINES)
+        if type(offset) is not int or type(limit) is not int:
+            sections.append((
+                path,
+                1,
+                (
+                    f"Error: read_files item {index} offset and limit "
+                    "must be integers"
+                ),
+                False,
+            ))
+            continue
+        try:
+            result = tool_read_file(ctx, path, offset=offset, limit=limit)
+        except Exception as e:
+            result = f"Error reading {path}: {e}"
+        succeeded = not (
+            result.startswith("Error:")
+            or result.startswith("Error reading ")
+            or result.startswith("File has ")
+        )
+        sections.append((path, max(1, offset), result, succeeded))
+
+    success_count = sum(1 for section in sections if section[3])
+    if success_count:
+        header = (
+            f"[read_files] {success_count}/{len(sections)} "
+            "files read successfully"
+        )
+    else:
+        header = (
+            "Error: read_files could not read any of "
+            f"{len(sections)} requested files"
+        )
+    outputs = [result for _path, _offset, result, _ok in sections]
+    combined = "\n\n".join([header, *outputs])
+    if len(combined) <= READ_FILES_MAX_TOTAL_CHARS:
+        return combined
+
+    # There is one two-character separator between the header and every
+    # section. Allocate only the remaining characters to section bodies.
+    available = max(
+        0,
+        READ_FILES_MAX_TOTAL_CHARS - len(header) - (2 * len(outputs)),
+    )
+    budgets = _fair_output_budgets([len(output) for output in outputs], available)
+    clipped = [
+        _clip_batch_result(result, budget, path, offset)
+        for (path, offset, result, _ok), budget in zip(sections, budgets)
+    ]
+    return "\n\n".join([header, *clipped])[:READ_FILES_MAX_TOTAL_CHARS]
 
 
 def tool_write_file(

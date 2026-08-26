@@ -14,6 +14,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Callable
 
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown
@@ -801,272 +802,6 @@ class ToolCallBlock(Collapsible):
         return Group(*parts)
 
 
-class ToolRunBlock(Collapsible):
-    """One assistant tool round, grouped into a single folded row."""
-
-    DEFAULT_CSS = """
-    ToolRunBlock {
-        margin: 0 0 1 0;
-        background: #272822;
-        border-left: thick #fd971f;
-        padding-bottom: 0;
-        padding-left: 0;
-    }
-    ToolRunBlock > CollapsibleTitle { color: #a86612; }
-    ToolRunBlock > CollapsibleTitle:hover {
-        background: #3e3d32;
-        color: #ffb454;
-    }
-    ToolRunBlock > CollapsibleTitle:focus {
-        background: #49483e;
-        color: #ffd28a;
-    }
-    ToolRunBlock > Contents { padding: 0 0 0 2; }
-    ToolRunBlock #toolrun-body { color: #b9b39f; }
-    """
-
-    def __init__(self) -> None:
-        self._calls: list[dict] = []
-        self._body = Static(self._build_body(), id="toolrun-body", markup=False)
-        super().__init__(self._body, title=self._build_title(), collapsed=True)
-
-    def add_call(self, tool_call_id: str, name: str, args: dict) -> None:
-        self._calls.append({
-            "id": tool_call_id or f"call_{len(self._calls)}",
-            "name": name,
-            "args": args,
-            "result": None,
-            "blocked": False,
-        })
-        self._refresh()
-
-    def set_result(
-        self, tool_call_id: str, result: str, blocked: bool = False
-    ) -> None:
-        if tool_call_id:
-            for call in self._calls:
-                if call["id"] != tool_call_id:
-                    continue
-                call["result"] = result
-                call["blocked"] = blocked
-                self._refresh()
-                return
-        elif self._calls:
-            for call in reversed(self._calls):
-                if call["result"] is None:
-                    call["result"] = result
-                    call["blocked"] = blocked
-                    self._refresh()
-                    return
-        self.add_call(tool_call_id or f"orphan_{len(self._calls)}", "?", {})
-        self._calls[-1]["result"] = result
-        self._calls[-1]["blocked"] = blocked
-        self._refresh()
-
-    def set_pending_results(self, result: str, blocked: bool = False) -> int:
-        changed = 0
-        for call in self._calls:
-            if call["result"] is None:
-                call["result"] = result
-                call["blocked"] = blocked
-                changed += 1
-        if changed:
-            self._refresh()
-        return changed
-
-    @property
-    def is_pending(self) -> bool:
-        return any(call["result"] is None for call in self._calls)
-
-    @property
-    def call_count(self) -> int:
-        return len(self._calls)
-
-    @property
-    def result_chars(self) -> int:
-        return self._result_chars()
-
-    @property
-    def has_blocked(self) -> bool:
-        return any(call["blocked"] for call in self._calls)
-
-    def _refresh(self) -> None:
-        self._body.update(self._build_body())
-        self.title = self._build_title()
-
-    def _name_summary(self) -> str:
-        counts: dict[str, int] = {}
-        for call in self._calls:
-            name = str(call["name"])
-            counts[name] = counts.get(name, 0) + 1
-        parts = [
-            name if count == 1 else f"{name} x{count}"
-            for name, count in counts.items()
-        ]
-        if len(parts) > 4:
-            extra = len(parts) - 4
-            parts = parts[:4] + [f"+{extra} kinds"]
-        return ", ".join(parts) if parts else "waiting"
-
-    def _status(self) -> str:
-        if any(call["result"] is None for call in self._calls):
-            return "执行中..."
-        if any(call["blocked"] for call in self._calls):
-            return "⊘ 有拦截/错误"
-        return "✓"
-
-    def _result_chars(self) -> int:
-        return sum(
-            len(call["result"])
-            for call in self._calls
-            if isinstance(call["result"], str)
-        )
-
-    def _build_title(self) -> str:
-        count = len(self._calls)
-        noun = "call" if count == 1 else "calls"
-        chars = self._result_chars()
-        title = (
-            f"tools · {count} {noun} · {self._name_summary()} · "
-            f"{chars:,} chars · {self._status()}"
-        )
-        return title.replace('[', '\\[')
-
-    @staticmethod
-    def _format_args(args: dict) -> str:
-        try:
-            return json.dumps(args, ensure_ascii=False, indent=2)
-        except Exception:
-            return str(args)
-
-    @staticmethod
-    def _format_result(result: str) -> str:
-        if len(result) <= 4000:
-            return result
-        return result[:4000] + f"\n...[+{len(result) - 4000} chars]"
-
-    def _build_body(self) -> RenderableType:
-        if not self._calls:
-            return Text("等待工具调用...", style="italic dim")
-
-        parts: list[RenderableType] = []
-        for idx, call in enumerate(self._calls, start=1):
-            result = call["result"]
-            status = "执行中..." if result is None else (
-                "已拦截/错误" if call["blocked"] else "完成"
-            )
-            header = Text(f"{idx}. {call['name']} · {status}", style="bold")
-            parts.append(header)
-            parts.append(Text("args:", style="dim"))
-            parts.append(Text(self._format_args(call["args"])))
-            parts.append(Text("result:", style="dim"))
-            if result is None:
-                parts.append(Text("执行中...", style="italic dim"))
-            else:
-                parts.append(Text(self._format_result(result)))
-            if idx != len(self._calls):
-                parts.append(Text(""))
-        return Group(*parts)
-
-
-class TraceBlock(Collapsible):
-    """Collapsed container for interleaved thinking and tool rounds."""
-
-    DEFAULT_CSS = """
-    TraceBlock {
-        margin: 0 0 1 0;
-        background: #272822;
-        border-left: thick #66d9ef;
-        padding-bottom: 0;
-        padding-left: 0;
-    }
-    TraceBlock > CollapsibleTitle { color: #66d9ef; }
-    TraceBlock > CollapsibleTitle:hover {
-        background: #3e3d32;
-        color: #a6e22e;
-    }
-    TraceBlock > CollapsibleTitle:focus {
-        background: #49483e;
-        color: #f8f8f2;
-    }
-    TraceBlock > Contents { padding: 0 0 0 2; }
-    TraceBlock #trace-body { padding: 0; }
-    """
-
-    def __init__(self) -> None:
-        self._body = Vertical(id="trace-body")
-        self._thinking_blocks: list[ThinkingBlock] = []
-        self._tool_runs: list[ToolRunBlock] = []
-        super().__init__(self._body, title=self._build_title(), collapsed=True)
-
-    async def mount_trace_widget(self, widget) -> None:
-        self._track(widget)
-        await self._body.mount(widget)
-        self.refresh_summary()
-
-    def mount_trace_widget_sync(self, widget) -> None:
-        self._track(widget)
-        self._body.mount(widget)
-        self.refresh_summary()
-
-    def refresh_summary(self) -> None:
-        self.title = self._build_title()
-
-    def discard_trace_widget(self, widget) -> None:
-        if isinstance(widget, ThinkingBlock):
-            try:
-                self._thinking_blocks.remove(widget)
-            except ValueError:
-                pass
-        elif isinstance(widget, ToolRunBlock):
-            try:
-                self._tool_runs.remove(widget)
-            except ValueError:
-                pass
-        self.refresh_summary()
-
-    @property
-    def is_pending(self) -> bool:
-        return any(run.is_pending for run in self._tool_runs)
-
-    @property
-    def is_empty(self) -> bool:
-        return not self._thinking_blocks and not self._tool_runs
-
-    def set_pending_results(self, result: str, blocked: bool = False) -> int:
-        changed = 0
-        for run in self._tool_runs:
-            changed += run.set_pending_results(result, blocked=blocked)
-        if changed:
-            self.refresh_summary()
-        return changed
-
-    def _track(self, widget) -> None:
-        if isinstance(widget, ThinkingBlock):
-            self._thinking_blocks.append(widget)
-        elif isinstance(widget, ToolRunBlock):
-            self._tool_runs.append(widget)
-
-    def _build_title(self) -> str:
-        thinking_count = len(self._thinking_blocks)
-        thinking_chars = sum(len(block.text) for block in self._thinking_blocks)
-        tool_rounds = len(self._tool_runs)
-        tool_calls = sum(run.call_count for run in self._tool_runs)
-        tool_chars = sum(run.result_chars for run in self._tool_runs)
-        if any(run.is_pending for run in self._tool_runs):
-            status = "执行中..."
-        elif any(run.has_blocked for run in self._tool_runs):
-            status = "⊘ 有拦截/错误"
-        else:
-            status = "✓"
-        title = (
-            f"trace · {thinking_count} thinking/{thinking_chars:,} chars · "
-            f"{tool_rounds} rounds/{tool_calls} tools · "
-            f"{tool_chars:,} tool chars · {status}"
-        )
-        return title.replace('[', '\\[')
-
-
 class DiffBlock(Collapsible):
     """Standalone diff view shown right after a successful edit_file or
     edit_lines call. Default expanded — the change is the headline; the
@@ -1432,14 +1167,14 @@ class SubagentTabPane(VerticalScroll):
 
     Lives inside a TabPane in the top-level TabbedContent. Renders
     `sess.messages` as the same widget vocabulary the main conversation
-    uses (UserBubble / ThinkingBlock / AssistantMessage / ToolRunBlock)
+    uses (UserBubble / ThinkingBlock / AssistantMessage / ToolCallBlock)
     so the parent's "what did the subagent do?" view feels familiar.
 
     Two complementary paths populate it:
 
     1. **Live streaming** — `_run_subagent_round` pushes reasoning /
        content chunks into `_live_thinking` / `_live_answer` as they
-       arrive and mounts/updates a ToolRunBlock as tool calls land,
+       arrive and mounts a ToolCallBlock as each tool call lands,
        so the user sees token-level output in real time. After each
        message commits to `sess.messages`, the round runner calls
        `mark_round_committed()` to advance `_rendered_idx` so the
@@ -1450,7 +1185,7 @@ class SubagentTabPane(VerticalScroll):
        `sess.messages` that hasn't been live-mounted (e.g. the user
        prompt, or content from a state restore).
 
-    `_tool_blocks` maps tool_call_id → ToolRunBlock so a later
+    `_tool_blocks` maps tool_call_id → ToolCallBlock so a later
     `role=tool` message in the replay path can attach its result to
     the right block. The live path uses the same map so tool result
     set after async tool execution finds the block created at
@@ -1469,14 +1204,11 @@ class SubagentTabPane(VerticalScroll):
         super().__init__()
         self.sess = sess
         self._rendered_idx = 0
-        self._tool_blocks: dict[str, "ToolRunBlock"] = {}
+        self._tool_blocks: dict[str, "ToolCallBlock"] = {}
         # Live-stream widgets owned by the in-flight round. Cleared at
         # round end (finalize_*) or on stream error (remove_live_blocks).
         self._live_thinking: ThinkingBlock | None = None
         self._live_answer: AssistantMessage | None = None
-        self._live_trace: TraceBlock | None = None
-        self._live_tool_run: ToolRunBlock | None = None
-        self._replay_trace: TraceBlock | None = None
         # Widgets created before on_mount runs (spawn-time race). Flushed
         # in order by on_mount AFTER refresh_from_session has rendered
         # the user prompt, so the DOM order ends up user → thinking →
@@ -1508,40 +1240,21 @@ class SubagentTabPane(VerticalScroll):
         if self._live_thinking is not None:
             return
         self._live_thinking = ThinkingBlock()
-        trace = self._ensure_live_trace()
-        trace.mount_trace_widget_sync(self._live_thinking)
         if self.is_mounted:
-            self.scroll_end(animate=False)
-
-    def _ensure_live_trace(self) -> TraceBlock:
-        if self._live_trace is None:
-            self._live_trace = TraceBlock()
-            if self.is_mounted:
-                self.mount(self._live_trace)
-            else:
-                self._pending_mounts.append(self._live_trace)
-        return self._live_trace
-
-    def _ensure_replay_trace(self) -> TraceBlock:
-        if self._replay_trace is None:
-            self._replay_trace = TraceBlock()
-            self.mount(self._replay_trace)
-        return self._replay_trace
+            self.mount(self._live_thinking)
+        else:
+            self._pending_mounts.append(self._live_thinking)
 
     def append_thinking(self, text: str) -> None:
         if self._live_thinking is None:
             return
         self._live_thinking.append_text(text)
-        if self._live_trace is not None:
-            self._live_trace.refresh_summary()
         if self.is_mounted:
             self.scroll_end(animate=False)
 
     def finalize_thinking(self, reasoning_tokens: int) -> None:
         if self._live_thinking is not None:
             self._live_thinking.finalize(reasoning_tokens)
-            if self._live_trace is not None:
-                self._live_trace.refresh_summary()
             self._live_thinking = None
 
     def start_answer(self) -> None:
@@ -1565,30 +1278,23 @@ class SubagentTabPane(VerticalScroll):
         if self._live_answer is not None and self._live_answer.text != text:
             self._live_answer.set_text(text)
 
-    def finalize_answer(self, *, keep_trace: bool = False) -> None:
+    def finalize_answer(self) -> None:
         # Just drop the ref — the widget stays mounted as historical
         # content. Same shape as ThinkingBlock.finalize but no title
         # to refresh.
         self._live_answer = None
-        self._live_tool_run = None
-        if not keep_trace:
-            self._live_trace = None
 
     def add_tool_block(
         self, tool_call_id: str, name: str, args: dict
-    ) -> "ToolRunBlock":
-        if self._live_tool_run is None:
-            self._live_tool_run = ToolRunBlock()
-            trace = self._ensure_live_trace()
-            trace.mount_trace_widget_sync(self._live_tool_run)
-        block = self._live_tool_run
-        block.add_call(tool_call_id, name, args)
+    ) -> "ToolCallBlock":
+        block = ToolCallBlock(name, args)
         if tool_call_id:
             self._tool_blocks[tool_call_id] = block
-        if self._live_trace is not None:
-            self._live_trace.refresh_summary()
         if self.is_mounted:
+            self.mount(block)
             self.scroll_end(animate=False)
+        else:
+            self._pending_mounts.append(block)
         return block
 
     def set_tool_result(
@@ -1596,11 +1302,7 @@ class SubagentTabPane(VerticalScroll):
     ) -> None:
         block = self._tool_blocks.get(tool_call_id)
         if block is not None:
-            block.set_result(tool_call_id, result, blocked=blocked)
-            if self._live_trace is not None:
-                self._live_trace.refresh_summary()
-            if self._replay_trace is not None:
-                self._replay_trace.refresh_summary()
+            block.set_result(result, blocked=blocked)
 
     def remove_live_blocks(self) -> None:
         """Drop the in-flight ThinkingBlock / AssistantMessage on a
@@ -1612,8 +1314,6 @@ class SubagentTabPane(VerticalScroll):
                 self._live_thinking.remove()
             except Exception:
                 pass
-            if self._live_trace is not None:
-                self._live_trace.discard_trace_widget(self._live_thinking)
             self._live_thinking = None
         if self._live_answer is not None:
             try:
@@ -1621,13 +1321,6 @@ class SubagentTabPane(VerticalScroll):
             except Exception:
                 pass
             self._live_answer = None
-        self._live_tool_run = None
-        if self._live_trace is not None and self._live_trace.is_empty:
-            try:
-                self._live_trace.remove()
-            except Exception:
-                pass
-        self._live_trace = None
         # Also drop anything that was queued pre-mount but not yet
         # flushed — that's the same in-flight content.
         self._pending_mounts.clear()
@@ -1670,16 +1363,10 @@ class SubagentTabPane(VerticalScroll):
             # not interesting in a transcript view.
             return
         if role == "user":
-            self._replay_trace = None
             self.mount(UserBubble(m.get("content") or ""))
             return
         if role == "assistant":
             rc = m.get("reasoning_content")
-            has_tool_calls = bool(m.get("tool_calls") or [])
-            if rc or has_tool_calls:
-                trace = self._ensure_replay_trace()
-            else:
-                trace = None
             if rc:
                 tb = ThinkingBlock()
                 tb.append_text(rc)
@@ -1689,13 +1376,12 @@ class SubagentTabPane(VerticalScroll):
                 # the main conversation) — the count in the title signals
                 # there's reasoning to unfold.
                 tb.finalize(0)
-                trace.mount_trace_widget_sync(tb)
+                self.mount(tb)
             content = m.get("content") or ""
             if content:
                 am = AssistantMessage()
                 am.append_text(content)
                 self.mount(am)
-            tool_run: ToolRunBlock | None = None
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
                 name = fn.get("name", "?")
@@ -1704,29 +1390,18 @@ class SubagentTabPane(VerticalScroll):
                     args = json.loads(raw_args)
                 except json.JSONDecodeError:
                     args = {"_raw": raw_args}
-                if tool_run is None:
-                    tool_run = ToolRunBlock()
-                    if trace is None:
-                        trace = self._ensure_replay_trace()
-                    trace.mount_trace_widget_sync(tool_run)
-                blk = tool_run
-                blk.add_call(tc.get("id") or "", name, args)
-                if trace is not None:
-                    trace.refresh_summary()
+                blk = ToolCallBlock(name, args)
+                self.mount(blk)
                 tcid = tc.get("id") or ""
                 if tcid:
                     self._tool_blocks[tcid] = blk
-            if not has_tool_calls:
-                self._replay_trace = None
             return
         if role == "tool":
             tcid = m.get("tool_call_id") or ""
             content = m.get("content") or ""
             blk = self._tool_blocks.get(tcid)
             if blk is not None:
-                blk.set_result(tcid, content)
-                if self._replay_trace is not None:
-                    self._replay_trace.refresh_summary()
+                blk.set_result(content)
             else:
                 # Shouldn't happen — every tool message follows an
                 # assistant tool_call with the same id. Render a
@@ -1788,13 +1463,25 @@ class TasksBlock(Static):
 class SlashPopup(Static):
     """Auto-shown command hint above the input box.
 
-    Pure display: appears when the input starts with ``/`` and contains
-    no whitespace, listing every slash command whose name still matches
-    the current prefix. Vanishes the moment the user types a space (or
-    away from ``/...`` form), since at that point they've moved on to
-    arguments. There's no keyboard navigation — the user keeps typing
-    in the input and reads the popup as a hint.
+    Pure display, in two modes. Before the first space it lists every
+    slash command whose name still matches the typed prefix. After it,
+    for commands that declare candidates (see `arg_candidates`), it
+    switches to filtering those — so ``/model dee`` narrows to matching
+    model ids. Anything else hides it. There's no keyboard navigation:
+    the user keeps typing in the input and reads the popup as a hint,
+    or presses Tab to accept the top row (see `completion`).
     """
+
+    #: Resolves argument candidates for a command name, e.g. "/model" →
+    #: [(id, note), ...]; returns [] for commands without any. A
+    #: callback rather than a static table because the candidates are
+    #: live state — model ids depend on the active provider.
+    arg_candidates: Callable[[str], list[tuple[str, str]]] | None = None
+
+    #: Input text that accepting the top row would produce, or None
+    #: when the popup is hidden. A class attribute (not set in
+    #: __init__) so it exists even before the widget is mounted.
+    _completion: str | None = None
 
     DEFAULT_CSS = """
     SlashPopup {
@@ -1819,7 +1506,7 @@ class SlashPopup(Static):
         ("/remote [status|on|off]", "管理 VPS 远控连接"),
         ("/list-history", "列出已保存对话"),
         ("/provider [deepseek|codex]", "查看 / 切换 provider"),
-        ("/model [<id>]", "查看 / 切换模型（下一轮请求生效）"),
+        ("/model [<id>]", "列出候选 / 切换模型（下一轮请求生效）"),
         ("/effort [<level>]", "查看 / 切换 reasoning effort"),
         ("/rewind", "退回上一条用户消息（文本回填输入框）"),
         ("/rethink", "删除最近一轮助手回复，让模型重新思考"),
@@ -1829,8 +1516,13 @@ class SlashPopup(Static):
 
     def update_for_text(self, text: str) -> None:
         """Show/hide and filter based on current input text."""
-        if not text.startswith("/") or any(c.isspace() for c in text):
+        # A newline means the user is composing a prompt, not a command.
+        if not text.startswith("/") or "\n" in text:
             self._hide()
+            return
+        name, sep, arg = text.partition(" ")
+        if sep:
+            self._show_arguments(name, arg)
             return
         matches = [
             (cmd, desc) for cmd, desc in self.COMMANDS
@@ -1839,22 +1531,82 @@ class SlashPopup(Static):
         if not matches:
             self._hide()
             return
+        top = matches[0][0]
+        head, sep, _ = top.partition(" ")
+        # A display form like "/save <name>" carries a placeholder, so
+        # land the cursor past a space and straight into argument mode;
+        # bare commands like "/clear" complete to just themselves.
+        self._completion = f"{head} " if sep else head
+        self._paint(
+            "Slash 命令", "  (Tab 补全 · 继续输入过滤 · Enter 发送)", matches
+        )
+
+    def _show_arguments(self, name: str, arg: str) -> None:
+        """Filter one command's argument candidates by what's typed."""
+        typed = arg.strip()
+        # Only the first token is a candidate; past that the user is
+        # writing free text (`/save my notes`) and hints stop helping.
+        if any(c.isspace() for c in typed):
+            self._hide()
+            return
+        matches = [
+            (value, note) for value, note in self._candidates_for(name)
+            if value.startswith(typed)
+        ]
+        if not matches:
+            self._hide()
+            return
+        self._completion = f"{name} {matches[0][0]}"
+        self._paint(
+            f"{name} 候选", "  (Tab 补全 · 继续输入过滤 · Enter 发送)", matches
+        )
+
+    def _candidates_for(self, name: str) -> list[tuple[str, str]]:
+        if self.arg_candidates is None:
+            return []
+        try:
+            return list(self.arg_candidates(name))
+        except Exception:
+            # Candidates come from live state (provider catalogs, disk
+            # caches); a hint popup must never take the input box down
+            # with it.
+            return []
+
+    def _paint(
+        self,
+        title: str,
+        subtitle: str,
+        rows: list[tuple[str, str]],
+    ) -> None:
+        # Don't name this `_render` — that's a Textual Widget hook that
+        # takes no arguments and must return a Visual; overriding it
+        # crashes the moment the popup becomes visible.
         # Align descriptions on a single column so the list reads as a
         # table rather than a ragged left edge.
-        width = max(len(cmd) for cmd, _ in matches)
+        width = max(len(left) for left, _ in rows)
         t = Text()
-        t.append("Slash 命令", style="bold #66d9ef")
-        t.append("  (继续输入过滤 · Enter 发送)", style="dim")
-        for cmd, desc in matches:
+        t.append(title, style="bold #66d9ef")
+        t.append(subtitle, style="dim")
+        for left, right in rows:
             t.append("\n  ")
-            t.append(cmd.ljust(width), style="bold #66d9ef")
-            t.append("  ")
-            t.append(desc, style="dim")
+            t.append(left.ljust(width), style="bold #66d9ef")
+            if right:
+                t.append("  ")
+                t.append(right, style="dim")
         self.update(t)
         if not self.display:
             self.display = True
 
+    def completion(self) -> str | None:
+        """Input text that accepting the top row would produce.
+
+        None when there's nothing to accept (popup hidden), which is
+        the caller's cue to let Tab do whatever it normally does.
+        """
+        return self._completion
+
     def _hide(self) -> None:
+        self._completion = None
         if self.display:
             self.display = False
 
@@ -1864,6 +1616,8 @@ class MultilineInput(TextArea):
 
     User-facing key bindings:
       Enter           → submit (start a new turn / queue if busy)
+      Tab             → accept the slash popup's top row; falls back
+                        to normal focus movement when it's hidden
       Option+Enter    → insert literal newline   (textual: alt+enter)
       Cmd+Enter       → submit as STEER          (textual: ctrl+enter,
                         via iTerm2 escape `[13;5u` for ⌘ Return)
@@ -1879,6 +1633,9 @@ class MultilineInput(TextArea):
 
     BINDINGS = [
         Binding("enter", "do_submit", show=False, priority=True),
+        # priority: plain `tab` is App-level focus_next, and TextArea
+        # only swallows it under tab_behavior="indent" (not our case).
+        Binding("tab", "do_complete", show=False, priority=True),
         # alt+enter ≡ Option+Enter on macOS
         Binding("alt+enter", "do_newline", show=False, priority=True),
         # ctrl+enter ≡ Cmd+Enter once iTerm2 maps ⌘ Return → [13;5u
@@ -1927,6 +1684,11 @@ class MultilineInput(TextArea):
             self.value = value
             super().__init__()
 
+    class CompletionRequested(Message):
+        """Tab pressed. The app owns the popup, so it decides whether
+        there's a completion to accept or whether Tab should fall
+        through to focus movement."""
+
     def action_do_submit(self) -> None:
         # Demote Enter to "insert newline" while a paste is in flight —
         # see the _PASTE_DETECT_GAP comment above.
@@ -1945,6 +1707,9 @@ class MultilineInput(TextArea):
 
     def action_do_steer(self) -> None:
         self.post_message(self.SteerSubmitted(self.text))
+
+    def action_do_complete(self) -> None:
+        self.post_message(self.CompletionRequested())
 
     def _fit_height(self) -> None:
         # Use wrapped_document.height (visible lines AFTER soft-wrap),

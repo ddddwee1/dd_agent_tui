@@ -1136,66 +1136,40 @@
         const fn = tc.function || {};
         if (tc.id && fn.name) toolCallNames[tc.id] = fn.name;
       }
+      if (message.reasoning_content) {
+        appendMessageBlock(
+          "reasoning",
+          message.reasoning_content,
+          "reasoning",
+          "thinking"
+        );
+      }
       const content = message.content || "";
       if (content) {
         appendMessageBlock("assistant", content, "assistant");
       }
-      appendTraceBlock(message, toolMessages);
-    }
-
-    function toolRunLabel(toolCalls, toolMessages = []) {
-      const counts = new Map();
-      for (const tc of toolCalls) {
-        const name = ((tc.function || {}).name) || "?";
-        counts.set(name, (counts.get(name) || 0) + 1);
-      }
-      let names = [...counts.entries()].map(([name, count]) =>
-        count === 1 ? name : `${name} x${count}`
-      );
-      if (names.length > 4) {
-        names = [...names.slice(0, 4), `+${names.length - 4} kinds`];
-      }
-      const chars = toolMessages.reduce(
-        (n, msg) => n + String(msg.content || "").length,
-        0
-      );
-      const pending = toolMessages.length < toolCalls.length;
-      return `tools · ${toolCalls.length} ${toolCalls.length === 1 ? "call" : "calls"} · ${names.join(", ")} · ${chars.toLocaleString()} chars · ${pending ? "running" : "✓"}`;
-    }
-
-    function traceLabel(message, toolMessages = []) {
-      const reasoningChars = String(message.reasoning_content || "").length;
-      return `trace · ${reasoningChars.toLocaleString()} thinking chars · ${toolRunLabel(message.tool_calls || [], toolMessages)}`;
-    }
-
-    function formatToolRunContent(toolCalls, toolMessages = []) {
       const byId = new Map();
       for (const msg of toolMessages) byId.set(msg.tool_call_id || "", msg);
-      return toolCalls.map((tc, index) => {
+      for (const tc of message.tool_calls || []) {
         const result = byId.get(tc.id || "");
         const resultText = result ? String(result.content || "") : "running...";
-        return [
-          `${index + 1}. ${formatToolCall(tc)}`,
-          `result (${result ? resultText.length.toLocaleString() : 0} chars):`,
+        const summary = formatToolCall(tc);
+        const shortSummary = summary.length > 120
+          ? `${summary.slice(0, 120)}…`
+          : summary;
+        const body = [
+          summary,
+          "",
+          "result:",
           resultText,
         ].join("\n");
-      }).join("\n\n");
-    }
-
-    function appendTraceBlock(message, toolMessages = []) {
-      const sections = [];
-      if (message.reasoning_content) {
-        sections.push(`thinking:\n${message.reasoning_content}`);
+        appendMessageBlock(
+          "tool",
+          body,
+          "tool",
+          `tool · ${shortSummary} · ${result ? "✓" : "running"}`
+        );
       }
-      sections.push(
-        `tools:\n${formatToolRunContent(message.tool_calls || [], toolMessages)}`
-      );
-      appendMessageBlock(
-        "tool",
-        sections.join("\n\n"),
-        "tool",
-        traceLabel(message, toolMessages)
-      );
     }
 
     function renderMessage(message) {
@@ -1205,7 +1179,12 @@
         return;
       }
       if (message.reasoning_content) {
-        appendMessageBlock("reasoning", message.reasoning_content, "reasoning");
+        appendMessageBlock(
+          "reasoning",
+          message.reasoning_content,
+          "reasoning",
+          "thinking"
+        );
       }
       if (message.tool_calls) {
         for (const tc of message.tool_calls) {
@@ -1443,7 +1422,9 @@
       if (!streamingNodes) streamingNodes = {};
       if (kind === "reasoning") {
         if (!streamingNodes.reasoningText) {
-          const block = createMessageBlock("reasoning", "", "reasoning");
+          const block = createMessageBlock(
+            "reasoning", "", "reasoning", "thinking"
+          );
           streamingNodes.reasoningRoot = block.root;
           streamingNodes.reasoningText = block.text;
           streamingNodes.reasoningCount = block.count;

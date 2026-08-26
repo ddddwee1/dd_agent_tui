@@ -302,11 +302,16 @@ class AgentApp(
                     with TabPane("main", id="tab-main"):
                         yield VerticalScroll(id="conversation")
                 yield Static(
-                    "Enter 发送 · Option+Enter 换行 · Cmd+Enter steer · 点击下方排队/steer 气泡可编辑/删除 · ESC×2 中断 · Ctrl+X 全部取消 · Ctrl+L 清空 · Ctrl+Q 退出",
+                    "Enter 发送 · Option+Enter 换行 · Cmd+Enter steer · Tab 补全 slash 命令 · 点击下方排队/steer 气泡可编辑/删除 · ESC×2 中断 · Ctrl+X 全部取消 · Ctrl+L 清空 · Ctrl+Q 退出",
                     id="hint",
                 )
                 yield Vertical(id="pending")
-                yield SlashPopup(id="slash-popup")
+                popup = SlashPopup(id="slash-popup")
+                # Argument hints need live state (the active provider's
+                # model catalog), so the popup pulls them through a
+                # callback instead of holding a static table.
+                popup.arg_candidates = self._slash_arg_candidates
+                yield popup
                 yield MultilineInput(id="user-input")
                 yield StatusBar(self.ctx.work_dir, id="status")
             yield Vertical(id="sidebar")

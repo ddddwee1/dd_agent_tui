@@ -44,6 +44,18 @@ class ProviderUsage:
 
 
 @dataclass
+class ModelChoice:
+    """One entry in a provider's `/model` candidate list.
+
+    `note` is free-form display text (context window, price, effort
+    levels) — it is never parsed, only shown.
+    """
+
+    id: str
+    note: str = ""
+
+
+@dataclass
 class ToolCallDelta:
     index: int
     id: str | None = None
@@ -84,6 +96,15 @@ class LLMProvider:
         metadata; None means "unknown, let caller use its fallback".
         """
         return self.default_context_limit
+
+    def available_models(self) -> list[ModelChoice]:
+        """Return the models `/model` offers as candidates.
+
+        An empty list means "no catalog available" — callers must keep
+        free-form ids working rather than blocking the switch, since a
+        provider can serve models this build has never heard of.
+        """
+        return []
 
     def attach_reasoning(self, msg: dict, reasoning: str) -> None:
         """Attach streamed reasoning to an assistant message in this
@@ -137,6 +158,24 @@ class DeepSeekProvider(LLMProvider):
     default_model = DEEPSEEK_MODEL
     default_effort = DEEPSEEK_REASONING_EFFORT
     default_context_limit = DEEPSEEK_CONTEXT_LIMIT
+
+    # DeepSeek publishes no catalog endpoint, so the candidates are
+    # inline; specs from the official pricing docs (both models: 1M
+    # context, 384K max output). Prices are per 1M tokens, cache-miss
+    # input / output.
+    MODELS: tuple[ModelChoice, ...] = (
+        ModelChoice(
+            "deepseek-v4-pro",
+            "1M ctx · 384K out · $0.435 in / $0.87 out",
+        ),
+        ModelChoice(
+            "deepseek-v4-flash",
+            "1M ctx · 384K out · $0.14 in / $0.28 out — 便宜 ~3x",
+        ),
+    )
+
+    def available_models(self) -> list[ModelChoice]:
+        return list(self.MODELS)
 
     def __init__(self) -> None:
         self.client = AsyncOpenAI(
@@ -223,6 +262,16 @@ class CodexResponsesProvider(LLMProvider):
         except Exception:
             return None
         return _find_model_context_limit(data, model)
+
+    def available_models(self) -> list[ModelChoice]:
+        # Same cache as context_limit_for_model: the service's own
+        # catalog, so a Codex-side model change shows up without a
+        # ddtui release.
+        try:
+            data = json.loads(CODEX_MODELS_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return _codex_model_choices(data)
 
     async def complete_text(
         self, messages: list[dict], model: str, effort: str
@@ -521,6 +570,29 @@ def _positive_int(value: Any) -> int | None:
     return number if number > 0 else None
 
 
+def _entry_context_limit(entry: dict[str, Any]) -> int | None:
+    """Read a context window off one catalog entry.
+
+    The Codex cache shape can change between CLI versions, so accept the
+    common server key spellings rather than one.
+    """
+    for key in (
+        "context_window",
+        "contextWindow",
+        "max_context_window",
+        "maxContextWindow",
+        "context_length",
+        "contextLength",
+        "max_context_tokens",
+        "maxContextTokens",
+        "model_context_window",
+    ):
+        limit = _positive_int(entry.get(key))
+        if limit is not None:
+            return limit
+    return None
+
+
 def _find_model_context_limit(data: Any, model: str) -> int | None:
     """Best-effort search through Codex model-catalog JSON shapes.
 
@@ -539,28 +611,11 @@ def _find_model_context_limit(data: Any, model: str) -> int | None:
                 return value.strip().lower()
         return None
 
-    def _entry_limit(entry: dict[str, Any]) -> int | None:
-        for key in (
-            "context_window",
-            "contextWindow",
-            "max_context_window",
-            "maxContextWindow",
-            "context_length",
-            "contextLength",
-            "max_context_tokens",
-            "maxContextTokens",
-            "model_context_window",
-        ):
-            limit = _positive_int(entry.get(key))
-            if limit is not None:
-                return limit
-        return None
-
     def _walk(value: Any) -> int | None:
         if isinstance(value, dict):
             name = _entry_name(value)
             if name == wanted:
-                limit = _entry_limit(value)
+                limit = _entry_context_limit(value)
                 if limit is not None:
                     return limit
             for child in value.values():
@@ -575,6 +630,46 @@ def _find_model_context_limit(data: Any, model: str) -> int | None:
         return None
 
     return _walk(data)
+
+
+def _codex_model_choices(data: Any) -> list[ModelChoice]:
+    """Build `/model` candidates from the Codex model-catalog cache.
+
+    The catalog also carries hidden and internal-only slugs, so offer
+    only what the service marks listable *and* usable over the API.
+    Ordering follows the catalog's own `priority` so the newest models
+    land at the top.
+    """
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+    ranked: list[tuple[int, ModelChoice]] = []
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        slug = entry.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        if entry.get("visibility") != "list":
+            continue
+        if entry.get("supported_in_api") is False:
+            continue
+        notes: list[str] = []
+        limit = _entry_context_limit(entry)
+        if limit:
+            notes.append(f"{limit:,} ctx")
+        efforts = [
+            str(level.get("effort"))
+            for level in entry.get("supported_reasoning_levels") or []
+            if isinstance(level, dict) and level.get("effort")
+        ]
+        if efforts:
+            notes.append("effort " + "/".join(efforts))
+        # Unranked entries sort last rather than ahead of everything.
+        priority = _positive_int(entry.get("priority")) or 10_000
+        ranked.append((priority, ModelChoice(slug.strip(), " · ".join(notes))))
+    ranked.sort(key=lambda item: item[0])
+    return [choice for _, choice in ranked]
 
 
 def load_deepseek_api_key() -> str:

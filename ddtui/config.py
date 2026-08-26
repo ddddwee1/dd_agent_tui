@@ -135,6 +135,10 @@ READ_FILE_MAX_LINES = 2000        # default limit for read_file
 # MAX_TOTAL_CHARS (the model is told which line to resume from).
 READ_FILE_MAX_LINE_CHARS = 2000
 READ_FILE_MAX_TOTAL_CHARS = 64_000
+# One read_files call should stay roughly within the same context footprint
+# as one maximally-sized read_file call, even when it contains many files.
+READ_FILES_MAX_FILES = 8
+READ_FILES_MAX_TOTAL_CHARS = 64_000
 AGENTS_MD_FILENAME = "AGENTS.md"
 AGENTS_MD_MAX_CHARS = 16_000      # cap project guidelines so prompt stays sane
 # Force the pure-Python search/glob fallback even when a ripgrep binary
@@ -378,8 +382,8 @@ SYSTEM_PROMPT = """\
 # 工具使用
 - 命令执行只有两种：同步快命令用 bash（≤30s）；耗时或需后台的工作（测试、构建、下载、训练，以及任何完成状态重要的事）一律 task_start，并按需要设置 notice_time 获取运行中通知。任务默认完成时推送通知：等待期间去做其他有用的事，或记录 checkpoint 后直接结束当前回复、等通知唤醒；不要用 task_wait 或反复 task_check/task_read 轮询来替代等待（细则见工具说明）。结束回复不是放弃任务——通知会自动开启新回合，你在新回合里接着做剩余步骤（收尾、总结等），用户交给你的多步骤任务不会因此丢失。
 - 需要长期保持的交互式会话（ssh、tmux、REPL、debugger）用 terminal_start 开常驻终端、terminal_send 输入、terminal_read 观察；不要反复用 bash 执行 ssh 'cmd' 做连续远端操作。
-- 文件编辑：单处精确替换用 edit_file（replace_all=true 替换全部出现），同一文件多处替换用 multi_edit，只有精确替换不适用（按行号大段插入/删除）才用 edit_lines；write_file 只用于新建文件或明确的整文件覆盖，覆盖已存在文件前必须先 read_file 读过它。不要用 bash 拼接重定向改文件，除非编辑工具无法完成。
-- read_file 输出每行带行号前缀；行号不是文件内容，写 old_string 时不要带上。
+- 文件编辑：单处精确替换用 edit_file（replace_all=true 替换全部出现），同一文件多处替换用 multi_edit，只有精确替换不适用（按行号大段插入/删除）才用 edit_lines；write_file 只用于新建文件或明确的整文件覆盖，覆盖已存在文件前必须先用 read_file/read_files 读过它。不要用 bash 拼接重定向改文件，除非编辑工具无法完成。
+- 已知需读取 2–8 个文件时优先用 read_files 一次读取；仍需分开调用 read_file 时要在同一轮一起发出，引擎会并行执行。read_file/read_files 输出每行带行号前缀；行号不是文件内容，写 old_string 时不要带上。
 - 长 Markdown 先用 read_doc 看目录/目标章节，再用 follow_doc_link 沿当前推理明确选中的链接前进；不要自动遍历整棵文档树，源码仍可用 read_file/search_content 按需逃逸。
 - 子 agent 是异步的：spawn_agent/chat_agent 立即返回、不直接给答案。结果完成后会像任务通知一样自动送达（[Subagent result] 消息）；需要查看状态/领取已就绪输出时用非阻塞 agent_check(session_id)，不要阻塞等待。要并行就连发多个 spawn_agent；子 agent 跨轮保留记忆，同一任务复用会话、别反复 spawn；用完 end_agent 释放。
 
@@ -438,8 +442,8 @@ SUBAGENT_SYSTEM_PROMPT = f"""\
 # 工具使用
 - 同步快命令用 bash（≤30s）；更长的命令（测试、构建、下载等）用 task_start，并设置合适的 notice_time。注意：你是子 agent，也不要阻塞等待：启动后台任务后先继续做其他有用工作；如果没有其他工作，调用 task_pause 进入 waiting phase。运行时会把 [Async task notice] / [Async task complete] 注入回你的对话并自动唤醒你；醒来后用 task_check/task_read 检查输出并继续。
 - 需要长期保持的交互式会话（ssh、tmux、REPL、debugger）用 terminal_start + terminal_send/terminal_read；不要反复用 bash 执行 ssh 'cmd'。
-- 文件编辑：单处精确替换用 edit_file（replace_all=true 替换全部出现），同一文件多处替换用 multi_edit，只有按行号大段插入/删除才用 edit_lines；write_file 只用于新建文件或明确的整文件覆盖，覆盖已存在文件前必须先 read_file 读过它。
-- read_file 输出每行带行号前缀；行号不是文件内容，写 old_string 时不要带上。
+- 文件编辑：单处精确替换用 edit_file（replace_all=true 替换全部出现），同一文件多处替换用 multi_edit，只有按行号大段插入/删除才用 edit_lines；write_file 只用于新建文件或明确的整文件覆盖，覆盖已存在文件前必须先用 read_file/read_files 读过它。
+- 已知需读取 2–8 个文件时优先用 read_files 一次读取；仍需分开调用 read_file 时要在同一轮一起发出，引擎会并行执行。read_file/read_files 输出每行带行号前缀；行号不是文件内容，写 old_string 时不要带上。
 - 长 Markdown 优先用 read_doc 读取目录/目标章节，并只跟随当前证据选中的显式链接；不要自动遍历所有链接。
 - 对项目特定命令、环境不确定时先 project_note_search；多步骤任务可用 todo_tool 管理进度。
 - 你没有 checkpoint，也不能再派生子 agent；需要等待后台任务时用 task_pause，不要用 task_wait。
