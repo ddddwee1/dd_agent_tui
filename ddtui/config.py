@@ -91,7 +91,7 @@ API_KEY_PATH = _setting_str(
     "DEEPSEEK_API_KEY_FILE", str(Path.home() / "deepseek_apikey.txt")
 )
 BASE_URL = "https://api.deepseek.com"
-MODEL = _setting_str("DEEPSEEK_MODEL", "deepseek-v4-pro")
+MODEL = _setting_str("DEEPSEEK_MODEL", "deepseek-v4-flash")
 REASONING_EFFORT = _setting_str("DEEPSEEK_REASONING_EFFORT", "max")
 
 DEFAULT_PROVIDER = _setting_str("DDTUI_PROVIDER", "deepseek").strip().lower()

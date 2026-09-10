@@ -66,7 +66,7 @@ python agent.py
 # ~/.ddtui/config.toml
 DDTUI_AUTO_COMPACT_THRESHOLD = 0.85
 DDTUI_CONFIRM_WRITES = false
-DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 DDTUI_REMOTE_AUTO = true
 ```
 
@@ -90,7 +90,7 @@ API key 读取顺序：
 
 ```bash
 export DEEPSEEK_API_KEY="sk-..."
-export DEEPSEEK_MODEL="deepseek-v4-pro"
+export DEEPSEEK_MODEL="deepseek-v4-flash"
 export DEEPSEEK_REASONING_EFFORT="max"
 export DEEPSEEK_BASE_URL="https://api.deepseek.com"
 ```
