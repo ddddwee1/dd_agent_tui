@@ -183,7 +183,9 @@ def test_compact_self_keeps_list_identity(playground):
         app = FakeApp(playground)
         app.provider = CompactProvider()
 
-        async def fake_compact(messages):
+        async def fake_compact(messages, **kwargs):
+            assert kwargs["ctx"] is app._live_subagents["sub-1"].ctx
+            assert kwargs["model"] == "parent-model"
             kept = [m for m in messages if m["role"] == "system"]
             kept.append({"role": "system", "content": "# 历史摘要\n（压缩）"})
             return kept, {"before_n": len(messages), "after_n": len(kept), "saved": 12345}

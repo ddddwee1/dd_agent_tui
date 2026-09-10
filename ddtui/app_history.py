@@ -12,10 +12,10 @@ from rich.text import Text
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Static
 
-from .app_support import _render_history_for_summary
+from . import explore_core
+from .context_compaction import auto_compact, compact_history
 from .config import (
     AUTO_COMPACT_THRESHOLD,
-    COMPACT_KEEP_RECENT_TURNS,
     HISTORY_DIR,
     MAX_LIVE_SUBAGENTS,
     SUBAGENT_IDLE_TIMEOUT_SEC,
@@ -31,7 +31,7 @@ from .runtime_state import (
 )
 from .runtime_messages import RUNTIME_TASK_EVENT_KIND
 from .state import TokenCounter
-from .tools import DIFF_STRIP_TOOLS
+from .tools import DIFF_STRIP_TOOLS, PARENT_TOOL_SCHEMAS, SUBAGENT_TOOL_SCHEMAS
 from .tools_tasks import recover_tasks_for_session
 from .tools_checkpoint import tool_checkpoint_clear, tool_checkpoint_tool
 from .widgets import (
@@ -147,7 +147,8 @@ class AppHistoryMixin:
         )
         modified = False
         input_text: str | None = None
-        if not tool_started and before is not None and 0 <= before <= len(msgs):
+        if (not tool_started and not journal.get("context_compacted")
+                and before is not None and 0 <= before <= len(msgs)):
             msgs = msgs[:before]
             input_text = pending or None
             notice = (
@@ -155,6 +156,11 @@ class AppHistoryMixin:
                 "并把当时的用户输入放回输入框。"
             )
             modified = True
+        elif journal.get("context_compacted"):
+            notice = (
+                "检测到上次会话在上下文压缩后断开；已保留归档后的工作状态和近期交互。"
+                "不会依据压缩前的消息下标回滚或自动重跑工具，请检查状态后继续。"
+            )
         else:
             notice = (
                 "检测到上次会话在工具执行后/执行中断开；不会自动重跑工具。"
@@ -270,242 +276,76 @@ class AppHistoryMixin:
         return entries
 
     async def _compact_messages(
-        self, messages: list[dict]
+        self, messages, *, ctx=None, model=None, effort=None, explore=None
     ) -> tuple[list[dict], dict]:
-        """Run /compact-style summarization on a list of messages and
-        return (new_messages, stats).
-
-        Leading system messages are kept verbatim; the last
-        COMPACT_KEEP_RECENT_TURNS user→assistant turns are kept verbatim;
-        everything in between is replaced by one summary system message
-        produced by a single `provider.complete_text` call.
-
-        Raises ValueError if there's nothing worth compacting (caller
-        should leave the source untouched and tell the user). Raises
-        any other exception from the summarizer (likewise — caller
-        leaves the source untouched).
-
-        Reused by the main /compact slash command and by the
-        subagent-only `compact_self` tool, so it must not touch UI or
-        `self.messages` directly.
-        """
-        prefix_end = 0
-        for i, m in enumerate(messages):
-            if m.get("role") == "system":
-                prefix_end = i + 1
-            else:
-                break
-        user_idxs = [
-            i for i, m in enumerate(messages)
-            if m.get("role") == "user"
-        ]
-        if len(user_idxs) <= COMPACT_KEEP_RECENT_TURNS:
-            raise ValueError(
-                f"对话还不够长，无需压缩（user 消息数 ≤ "
-                f"{COMPACT_KEEP_RECENT_TURNS}）。"
-            )
-        cut_at = user_idxs[-COMPACT_KEEP_RECENT_TURNS]
-        to_compact = messages[prefix_end:cut_at]
-        keep_recent = messages[cut_at:]
-        if not to_compact:
-            raise ValueError("没有可压缩的历史段。")
-
-        rendered = _render_history_for_summary(to_compact)
-        summary = await self.provider.complete_text(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是一个对话历史摘要助手。直接输出中文摘要，"
-                        "不要执行任何工具调用，不要回答用户问题，"
-                        "不要假装继续对话。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "下面是一段 agent 与用户的对话历史，需要被压缩成简明摘要，"
-                        "供后续轮次作为上下文使用。请按以下结构输出（用 markdown 标题）：\n"
-                        "## 用户目标\n"
-                        "## 已完成的工作\n"
-                        "## 阅读过的文档及其路径\n"
-                        "## 改动过的文件 / 关键决定\n"
-                        "## 悬而未决的问题或下一步\n\n"
-                        "要求：保留具体函数名、文件路径、行号等可定位的事实；"
-                        "不要复述完整代码、完整命令输出；"
-                        "不要遗漏待办事项。\n\n"
-                        f"---\n{rendered}\n---"
-                    ),
-                },
-            ],
-            self.model,
-            self.effort,
+        """Build an archived, bounded candidate without changing live history."""
+        ctx = ctx or self.ctx
+        model = model or self.model
+        effort = self.effort if effort is None else effort
+        limit = self.provider.context_limit_for_model(model)
+        protected = explore_core.resolve_start_index(explore, messages) if explore else 0
+        return await compact_history(
+            messages, provider=self.provider, ctx=ctx, model=model, effort=effort,
+            context_limit=limit, tools=SUBAGENT_TOOL_SCHEMAS if ctx.is_subagent else PARENT_TOOL_SCHEMAS,
+            protected_prefix=protected,
         )
-        if not summary:
-            raise RuntimeError("摘要返回为空")
-
-        before_n = len(messages)
-        before_chars = sum(
-            len(m.get("content") or "") for m in messages
-        )
-        new_messages = (
-            messages[:prefix_end]
-            + [
-                {
-                    "role": "system",
-                    "content": (
-                        "# 历史摘要（来自 /compact，覆盖此前若干轮对话）\n\n"
-                        f"{summary}"
-                    ),
-                }
-            ]
-            + keep_recent
-        )
-        after_n = len(new_messages)
-        after_chars = sum(
-            len(m.get("content") or "") for m in new_messages
-        )
-        stats = {
-            "before_n": before_n,
-            "after_n": after_n,
-            "before_chars": before_chars,
-            "after_chars": after_chars,
-            "saved": max(0, before_chars - after_chars),
-        }
-        return new_messages, stats
 
     async def _compact_worker(self) -> None:
-        """Replace the early portion of message history with a single
-        summary message, leaving COMPACT_KEEP_RECENT_TURNS user→assistant
-        turns intact at the tail. System messages are preserved.
-
-        On error, the original history is left untouched and a red
-        message is mounted asking the user to retry.
-        """
         self._set_busy(True)
         try:
-            # Cheap pre-check so we don't flash "compacting…" when
-            # there's nothing to do — the helper would raise
-            # ValueError but the spinner UX would be misleading.
-            user_count = sum(
-                1 for m in self.messages if m.get("role") == "user"
-            )
-            if self._active_explore is not None:
-                active_id = self._active_explore.get("id", "?")
-                await self._mount_widget(
-                    Static(Text(
-                        f"探索 {active_id} 仍在进行中；先让 agent 调用 "
-                        "explore_end 或 explore_cancel，再 /compact。",
-                        style="dim",
-                    ))
-                )
-                return
-            if user_count <= COMPACT_KEEP_RECENT_TURNS:
-                await self._mount_widget(
-                    Static(Text(
-                        f"对话还不够长，无需压缩（user 消息数 ≤ "
-                        f"{COMPACT_KEEP_RECENT_TURNS}）。",
-                        style="dim",
-                    ))
-                )
-                return
-
-            await self._mount_widget(
-                Static(Text("📦 正在压缩历史…", style="bold #66d9ef"))
-            )
-
+            await self._mount_widget(Static(Text("📦 正在归档并压缩历史…", style="bold #66d9ef")))
             try:
-                new_messages, stats = await self._compact_messages(
-                    self.messages
+                candidate, stats = await self._compact_messages(
+                    self.messages, explore=self._active_explore
                 )
-            except ValueError as e:
-                await self._mount_widget(
-                    Static(Text(str(e), style="dim"))
-                )
+            except Exception as exc:
+                await self._mount_widget(Static(Text(
+                    f"压缩未应用，原上下文保留：{exc}", style="bold #f92672"
+                )))
                 return
-            except Exception as e:
-                await self._mount_widget(
-                    Static(Text(
-                        f"❌ 压缩失败：{e}\n请稍后再试 /compact。",
-                        style="bold #f92672",
-                    ))
-                )
-                return
-
-            self.messages = new_messages
+            self.messages[:] = candidate
+            self.ctx.context_last_prompt = 0
+            self.ctx.context_last_estimate = 0
+            self.ctx.compact_retry_after = 0
             await self._autosave_conversation()
-            await self._mount_widget(
-                Static(Text(
-                    f"📦 已压缩：{stats['before_n']} → {stats['after_n']} 条消息，"
-                    f"约 -{stats['saved']:,} 字符（保留最近 "
-                    f"{COMPACT_KEEP_RECENT_TURNS} 轮原文）",
-                    style="bold #66d9ef",
-                ))
-            )
+            await self._show_compaction_stats(stats, automatic=False)
         finally:
             self._set_busy(False)
             self._refresh_status()
 
-    async def _auto_compact_if_needed(self) -> None:
-        """Opportunistic compaction at quiet turn boundaries.
+    async def _show_compaction_stats(self, stats: dict, *, automatic: bool) -> None:
+        label = "自动压缩" if automatic else "压缩"
+        mode = "移出旧工具输出" if stats["mode"] == "tool_eviction" else "更新工作状态摘要"
+        residual = "；仍超过目标预算，保留了必要原文" if not stats["target_met"] else ""
+        await self._mount_widget(Static(Text(
+            f"📦 已{label}：{stats['before_n']} → {stats['after_n']} 条消息，"
+            f"估算 {stats['before_tokens']:,} → {stats['after_tokens']:,} tokens；"
+            f"{mode}，原始历史可用 history_search/history_read 恢复{residual}",
+            style="bold #66d9ef",
+        )))
 
-        Called by `_agent_turn` right before its normal return — the
-        worker still holds busy, so user input queues instead of racing
-        the history swap. `counter.last_prompt` is the previous
-        request's measured prompt size; after a compaction the next
-        turn's request re-measures against the shrunken history, so
-        pressure drops well below the threshold and this cannot
-        re-trigger in a loop. Failures are cosmetic: the original
-        history is left untouched and the conversation continues.
-        """
-        if AUTO_COMPACT_THRESHOLD <= 0:
-            return
-        limit = self._context_limit()
-        if not limit or not self.counter.last_prompt:
-            return
-        pressure = self.counter.last_prompt / limit
-        if pressure < AUTO_COMPACT_THRESHOLD:
-            return
-        if self._active_explore is not None:
-            # An open explore span pins message indices — same reason
-            # /compact refuses; try again after explore_end/cancel.
-            return
-        user_count = sum(1 for m in self.messages if m.get("role") == "user")
-        if user_count <= COMPACT_KEEP_RECENT_TURNS:
-            return
-
-        await self._mount_widget(
-            Static(Text(
-                f"📦 上下文压力 {pressure:.0%} ≥ "
-                f"{AUTO_COMPACT_THRESHOLD:.0%}，自动压缩历史…",
-                style="bold #66d9ef",
-            ))
-        )
+    async def _auto_compact_if_needed(self, *, model=None, effort=None) -> None:
+        """Check before model requests and at quiet boundaries, never mid-batch."""
         try:
-            new_messages, stats = await self._compact_messages(self.messages)
-        except Exception as e:
-            await self._mount_widget(
-                Static(Text(
-                    f"自动压缩失败（对话不受影响，可稍后手动 /compact）：{e}",
-                    style="dim",
-                ))
+            protected = explore_core.resolve_start_index(self._active_explore, self.messages) if self._active_explore else 0
+            stats = await auto_compact(
+                self.messages, provider=self.provider, ctx=self.ctx, model=model or self.model,
+                effort=self.effort if effort is None else effort, tools=PARENT_TOOL_SCHEMAS,
+                context_limit=self.provider.context_limit_for_model(model) if model else self._context_limit(),
+                threshold=AUTO_COMPACT_THRESHOLD,
+                protected_prefix=protected,
             )
+        except Exception as exc:
+            await self._mount_widget(Static(Text(
+                f"自动压缩未应用，原上下文保留：{exc}", style="dim"
+            )))
             return
-        # In-place: same rule as explore_end/compact_self — never rebind
-        # self.messages anywhere a TurnEngine might share the list. The
-        # current call site sits after the engine loop exits, but slice
-        # assignment keeps this safe if that ever changes.
-        self.messages[:] = new_messages
-        await self._autosave_conversation()
-        await self._mount_widget(
-            Static(Text(
-                f"📦 已自动压缩：{stats['before_n']} → "
-                f"{stats['after_n']} 条消息，约 -{stats['saved']:,} 字符"
-                f"（保留最近 {COMPACT_KEEP_RECENT_TURNS} 轮原文；"
-                "阈值可用 DDTUI_AUTO_COMPACT_THRESHOLD 调整，0 关闭）",
-                style="bold #66d9ef",
-            ))
-        )
+        if stats:
+            # A pre-compaction journal index cannot be used to truncate this
+            # new view after a crash. Recovery must preserve the committed view.
+            self._write_turn_journal(context_compacted=True)
+            await self._autosave_conversation()
+            await self._show_compaction_stats(stats, automatic=True)
 
     async def _save_conversation(self, raw_name: str) -> None:
         """Dump self.messages (plus a small metadata header) to
@@ -624,6 +464,9 @@ class AppHistoryMixin:
         self._clear_turn_journal()
         self._session_id = session_id
         self.ctx.session_id = session_id
+        self.ctx.context_last_prompt = 0
+        self.ctx.context_last_estimate = 0
+        self.ctx.compact_retry_after = 0
         self.ctx.tasks.clear()
         self.ctx.task_next_id = 1
         recover_tasks_for_session(self.ctx, session_id)
@@ -827,7 +670,7 @@ class AppHistoryMixin:
         md = (
             "### Slash 命令\n"
             "- `/clear` 清空对话（保留 system prompt + AGENTS.md）\n"
-            "- `/compact` 压缩历史，保留最近两轮原文\n"
+            "- `/compact` 归档并压缩历史，按预算保留近期交互，原文可检索恢复\n"
             "- `/save <name>` 保存到 `~/.ddtui/history/<name>.json`\n"
             "- `/load <name>` 读回保存的对话\n"
             "- `/resume [name]` 恢复对话；不带 name 时打开选择窗口\n"

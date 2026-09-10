@@ -77,6 +77,7 @@ from .tools_terminal import (
     tool_terminal_start,
 )
 from .tools_todo import tool_todo_tool
+from .tools_history import tool_history_read, tool_history_search
 from .tools_web import tool_web_fetch, tool_web_search
 
 __all__ = [
@@ -157,6 +158,8 @@ def _specs() -> list[ToolSpec]:
         S("web_search", tool_web_search, parallel=True),
         # progress / memory
         S("todo_tool", tool_todo_tool),
+        S("history_search", tool_history_search, parallel=True),
+        S("history_read", tool_history_read, parallel=True),
         S("experiment_start", tool_experiment_start),
         S("experiment_record", tool_experiment_record),
         S("experiment_status", tool_experiment_status),

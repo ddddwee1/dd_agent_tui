@@ -1,119 +1,136 @@
-"""Auto-compact: threshold gate, guards, history swap, failure safety."""
+"""Request-boundary budgeting, low-cost eviction and failure backoff."""
 
 import asyncio
+import copy
 
-import pytest
-
-import ddtui.app_history as ah
+import ddtui.context_compaction as cc
 from ddtui.app_history import AppHistoryMixin
-from ddtui.config import COMPACT_KEEP_RECENT_TURNS
-from ddtui.state import TokenCounter
+from ddtui.engine import TurnEngine
+from ddtui.providers import LLMProvider, LLMStreamEvent, ProviderUsage, ToolCallDelta
+from ddtui.state import ToolContext
+from tests.test_context_compaction import Provider, long_task
 
 
-@pytest.fixture(autouse=True)
-def _pin_threshold(monkeypatch):
-    # Scenarios below assert against a fixed 75% threshold so changing
-    # the shipped default doesn't silently change what they test.
-    monkeypatch.setattr(ah, "AUTO_COMPACT_THRESHOLD", 0.75)
+def run(messages, ctx, provider=None, *, threshold=.75, limit=100_000, tools=()):
+    return asyncio.run(cc.auto_compact(messages, provider=provider or Provider(), ctx=ctx,
+                                      model="m", effort="low", tools=tools,
+                                      context_limit=limit, threshold=threshold))
 
 
-def _messages(n_user=5):
-    msgs = [{"role": "system", "content": "sys"}]
-    for i in range(n_user):
-        msgs.append({"role": "user", "content": f"u{i}"})
-        msgs.append({"role": "assistant", "content": f"a{i}"})
-    return msgs
+def test_single_user_long_turn_evicts_outputs_without_llm_call():
+    messages = long_task(12, 5000)
+    ctx = ToolContext(work_dir=".", session_id="long")
+    provider = Provider()
+    shared = messages
+    stats = run(messages, ctx, provider)
+    assert stats["mode"] == "tool_eviction"
+    assert not provider.calls
+    assert stats["after_tokens"] <= stats["target_tokens"]
+    assert messages is shared
+    assert len([m for m in messages if m["role"] == "user"]) == 1
+    assert any(m.get("ddtui_history_ref") for m in messages)
+    assert cc.safe_boundaries(messages)[-1] == len(messages)
 
 
-class FakeApp(AppHistoryMixin):
-    def __init__(self, *, limit=100_000, last_prompt=0, n_user=5):
-        self.counter = TokenCounter()
-        self.counter.last_prompt = last_prompt
-        self.messages = _messages(n_user)
-        self._active_explore = None
-        self._limit = limit
-        self.mounted = []
-        self.compact_calls = 0
-        self.autosaved = 0
-
-    def _context_limit(self):
-        return self._limit
-
-    async def _mount_widget(self, w):
-        # Static stores its renderable in a name-mangled private slot;
-        # good enough for asserting notice text without an app context.
-        self.mounted.append(str(getattr(w, "_Static__content", w)))
-
-    async def _autosave_conversation(self):
-        self.autosaved += 1
-
-    async def _compact_messages(self, messages):
-        self.compact_calls += 1
-        kept = [m for m in messages if m["role"] == "system"]
-        kept.append({"role": "system", "content": "# 历史摘要\n..."})
-        kept.extend(messages[-2:])
-        return kept, {"before_n": len(messages), "after_n": len(kept), "saved": 999}
+def test_below_threshold_and_disabled_do_not_archive_or_summarize():
+    ctx = ToolContext(work_dir=".", session_id="disabled")
+    provider = Provider()
+    assert run(long_task(1, 10), ctx, provider) is None
+    assert run(long_task(), ctx, provider, threshold=0) is None
+    assert run(long_task(), ctx, provider, limit=None) is None
+    assert not provider.calls
+    assert ctx.compact_retry_after == 0
 
 
-def run(app):
-    asyncio.run(app._auto_compact_if_needed())
-    return app
+def test_new_tool_output_triggers_before_next_request_without_usage():
+    ctx = ToolContext(work_dir=".", session_id="growth")
+    messages = long_task(1, 10)
+    assert run(messages, ctx) is None
+    messages.extend(long_task(10, 5000)[2:])
+    assert run(messages, ctx)
 
 
-def test_triggers_above_threshold(monkeypatch):
-    app = FakeApp(limit=100_000, last_prompt=80_000)  # 80% > 75%
-    run(app)
-    assert app.compact_calls == 1
-    assert app.autosaved == 1
-    assert any("# 历史摘要" in (m.get("content") or "") for m in app.messages)
-    assert any("自动压缩" in s for s in app.mounted)
+def test_usage_calibration_and_tool_schema_budget_are_counted():
+    ctx = ToolContext(work_dir=".", session_id="calibrated")
+    messages = long_task(1, 10)
+    ctx.context_last_estimate = cc.history_tokens(messages)
+    ctx.context_last_prompt = 50_000
+    before, available = cc.request_pressure(ctx, messages, [], 100_000)
+    assert before >= 50_000
+    after, _ = cc.request_pressure(ctx, messages, [{"schema": "x" * 5000}], 100_000)
+    assert after > before
+    assert available == 90_000
 
 
-def test_below_threshold_no_op():
-    app = FakeApp(limit=100_000, last_prompt=50_000)  # 50% < 75%
-    run(app)
-    assert app.compact_calls == 0 and app.mounted == []
+def test_huge_latest_result_can_be_evicted():
+    messages = long_task(1, 60000)
+    ctx = ToolContext(work_dir=".", session_id="huge")
+    stats = run(messages, ctx)
+    assert stats and stats["after_tokens"] < 100_000
+    assert messages[-1]["tool_call_id"] == "c0"
+    assert "FAILED sentinel-0" in messages[-1]["content"]
 
 
-def test_disabled_by_zero_threshold(monkeypatch):
-    monkeypatch.setattr(ah, "AUTO_COMPACT_THRESHOLD", 0.0)
-    app = FakeApp(limit=100_000, last_prompt=99_000)
-    run(app)
-    assert app.compact_calls == 0
-
-
-def test_no_limit_or_no_usage_no_op():
-    app = FakeApp(limit=None, last_prompt=80_000)
-    run(app)
-    assert app.compact_calls == 0
-    app = FakeApp(limit=100_000, last_prompt=0)
-    run(app)
-    assert app.compact_calls == 0
-
-
-def test_open_explore_blocks():
-    app = FakeApp(limit=100_000, last_prompt=90_000)
-    app._active_explore = {"id": "exp-1"}
-    run(app)
-    assert app.compact_calls == 0
-
-
-def test_short_history_blocks():
-    app = FakeApp(limit=100_000, last_prompt=90_000,
-                  n_user=COMPACT_KEEP_RECENT_TURNS)
-    run(app)
-    assert app.compact_calls == 0
-
-
-def test_failure_leaves_history_untouched():
-    app = FakeApp(limit=100_000, last_prompt=90_000)
-    before = list(app.messages)
-
-    async def boom(messages):
+def test_failure_leaves_history_and_backs_off(monkeypatch):
+    calls = []
+    async def fail(*a, **k):
+        calls.append(1)
         raise RuntimeError("summarizer down")
+    monkeypatch.setattr(cc, "compact_history", fail)
+    ctx = ToolContext(work_dir=".", session_id="failed")
+    messages = long_task()
+    before = copy.deepcopy(messages)
+    try:
+        run(messages, ctx)
+    except RuntimeError:
+        pass
+    assert messages == before
+    assert run(messages, ctx) is None
+    assert len(calls) == 1
 
-    app._compact_messages = boom
-    run(app)
-    assert app.messages == before
-    assert any("自动压缩失败" in s for s in app.mounted)
-    assert app.autosaved == 0
+
+def test_model_loop_compacts_between_tools_and_next_request():
+    async def scenario():
+        ctx = ToolContext(work_dir=".", session_id="engine")
+        messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "one long task"}]
+        class StreamProvider(LLMProvider):
+            rounds = 0
+            async def stream(self, messages, tools, model, effort):
+                self.rounds += 1
+                if self.rounds == 1:
+                    yield LLMStreamEvent(tool_call=ToolCallDelta(index=0, id="c1", type="function", name="bash", arguments="{}"))
+                    yield LLMStreamEvent(usage=ProviderUsage(prompt_tokens=100))
+                else:
+                    assert messages[-1]["role"] == "tool"
+                    assert messages[-1].get("ddtui_history_ref")
+                    cc.safe_boundaries(messages)
+                    yield LLMStreamEvent(content="continued")
+        provider = StreamProvider()
+        async def before_round():
+            await cc.auto_compact(messages, provider=provider, ctx=ctx, model="m", effort="low",
+                                  tools=[], context_limit=100_000, threshold=.75)
+        engine = TurnEngine(provider=provider, ctx=ctx, messages=messages, tools=[], model="m", effort="low",
+                            before_round=before_round, executor=lambda *args: "log " * 100000 + "\nFAILED end")
+        await engine.run_turn()
+        assert provider.rounds == 2
+        assert messages[-1]["content"] == "continued"
+    asyncio.run(scenario())
+
+
+def test_parent_wrapper_saves_and_marks_journal_after_success():
+    class App(AppHistoryMixin):
+        def __init__(self):
+            self.messages = long_task()
+            self.ctx = ToolContext(work_dir=".", session_id="host")
+            self.provider = Provider()
+            self.model, self.effort = "m", "low"
+            self._active_explore = None
+            self.saved, self.journal, self.mounted = 0, {}, []
+        def _context_limit(self): return 100_000
+        async def _autosave_conversation(self): self.saved += 1
+        def _write_turn_journal(self, **kwargs): self.journal.update(kwargs)
+        async def _mount_widget(self, widget): self.mounted.append(widget)
+    app = App()
+    asyncio.run(app._auto_compact_if_needed())
+    assert app.saved == 1 and app.journal["context_compacted"]
+    assert app.mounted

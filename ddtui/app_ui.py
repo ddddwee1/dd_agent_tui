@@ -529,6 +529,9 @@ class AppUiMixin:
         self._clear_turn_journal()
         self._session_id = new_session_id()
         self.ctx.session_id = self._session_id
+        self.ctx.context_last_prompt = 0
+        self.ctx.context_last_estimate = 0
+        self.ctx.compact_retry_after = 0
         self.ctx.task_next_id = 1
         self._autosave_path = None
         if hasattr(self, "_remote_on_session_reset"):

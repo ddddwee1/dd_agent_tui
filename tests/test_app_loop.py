@@ -91,3 +91,46 @@ def test_full_turn_through_engine(monkeypatch):
             assert app._busy is False
 
     asyncio.run(run())
+
+
+def test_long_single_turn_auto_compacts_and_continues(monkeypatch, tmp_path):
+    """Exercise the real parent pre-round hook, autosave and tool dispatch."""
+    import ddtui.app_history as history
+    import ddtui.runtime_state as runtime
+    from ddtui.context_compaction import safe_boundaries
+    from ddtui.history_archive import search_archive
+    from ddtui.tools import TOOL_FUNCS
+
+    async def run():
+        class LongProvider(FakeProvider):
+            def __init__(self):
+                self.rounds = 0
+            async def stream(self, messages, tools, model, effort):
+                self.rounds += 1
+                if self.rounds == 1:
+                    yield LLMStreamEvent(tool_call=ToolCallDelta(
+                        index=0, id="large-output", type="function", name="bash", arguments="{}"))
+                else:
+                    assert any(m.get("ddtui_history_ref") for m in messages)
+                    assert safe_boundaries(messages)[-1] == len(messages)
+                    yield LLMStreamEvent(content="已接续长任务")
+            async def complete_text(self, *args):
+                raise AssertionError("Large-output eviction should not need an LLM summary")
+
+        fake = LongProvider()
+        monkeypatch.setattr(app_mod, "build_provider", lambda name: fake)
+        monkeypatch.setattr(history, "HISTORY_DIR", tmp_path / "history")
+        monkeypatch.setattr(runtime, "RUNTIME_DIR", tmp_path / "runtime")
+        monkeypatch.setitem(TOOL_FUNCS, "bash", lambda ctx, **kwargs: "log " * 90000 + "\nFAILED exact-end")
+        app = app_mod.AgentApp(provider_name="fake")
+        async with app.run_test() as pilot:
+            app.run_worker(app._agent_turn("持续排查，保留公共接口"), exclusive=True)
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            assert fake.rounds == 2
+            assert app.messages[-1]["content"] == "已接续长任务"
+            assert app._busy is False
+            assert search_archive(app.ctx.session_id, "exact-end")["matches"]
+            assert app._ensure_autosave_path().is_file()
+            assert not runtime.turn_journal_path(app.ctx.session_id).exists()
+    asyncio.run(run())

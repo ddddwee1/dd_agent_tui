@@ -35,6 +35,7 @@ from typing import Awaitable, Callable
 
 from .app_support import _merge_tool_call_delta
 from .runtime_messages import guard_assistant_runtime_claims
+from .context_compaction import history_tokens
 from .state import ToolContext
 from .tools import (
     APP_DISPATCHED_TOOLS,
@@ -189,6 +190,7 @@ class TurnEngine:
     # ── streaming ──
 
     async def _stream_once(self) -> dict:
+        request_estimate = history_tokens(self.messages, self.tools)
         content = ""
         reasoning = ""
         tool_calls: dict[int, dict] = {}
@@ -213,6 +215,9 @@ class TurnEngine:
             self.observer.on_stream_aborted()
             raise
         if usage is not None:
+            self.ctx.context_last_prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+            self.ctx.context_last_estimate = request_estimate
+            self.ctx.context_model = self.model
             await self.observer.on_usage(usage)
         content, _guarded = guard_assistant_runtime_claims(content)
         msg: dict = {"role": "assistant", "content": content}

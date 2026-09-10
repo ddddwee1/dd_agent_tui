@@ -253,6 +253,12 @@ class ToolContext:
     # Candidate/evidence ledger for bounded implementation experiments.
     experiments: dict[str, dict] = field(default_factory=dict)
     experiment_next_id: int = 1
+    # Ephemeral request-size calibration. Never restore provider usage from a
+    # previous process/model, or retry compaction every round on the same input.
+    context_last_prompt: int = 0
+    context_last_estimate: int = 0
+    context_model: str = ""
+    compact_retry_after: int = 0
 
     def alloc_terminal_id(self) -> str:
         """Reserve and return the next terminal id ('term-N')."""

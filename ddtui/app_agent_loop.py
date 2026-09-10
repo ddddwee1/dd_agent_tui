@@ -17,6 +17,7 @@ with subagents). This module owns the parent-specific glue:
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 
 from rich.text import Text
 from textual.containers import Vertical, VerticalScroll
@@ -216,6 +217,7 @@ class AppAgentLoopMixin:
                     pending_user_text=pending,
                     message_len_before_turn=len(self.messages),
                     tool_started=False,
+                    context_compacted=False,
                 )
                 user_message = (
                     runtime_task_event_message(pending)
@@ -244,11 +246,10 @@ class AppAgentLoopMixin:
                     self._refresh_status()
                     return
                 if not self._queued:
-                    self._clear_turn_journal()
-                    # Quiet boundary: turn done, queue drained, busy
-                    # still held — the only safe moment to auto-compact
-                    # without racing user input.
+                    # Final quiet check; request-boundary checks inside the
+                    # engine also cover growth during a single long turn.
                     await self._auto_compact_if_needed()
+                    self._clear_turn_journal()
                     return
                 self._clear_turn_journal()
                 pending, parked = self._queued.pop(0)
@@ -301,7 +302,7 @@ class AppAgentLoopMixin:
 
     # ── inner loop: TurnEngine host ──
 
-    async def _before_round(self) -> None:
+    async def _before_round(self, *, model=None, effort=None) -> None:
         """Pre-round hook: deliver managed-task completions and steer
         interjections at model-call boundaries, then journal."""
         await self._drain_task_events_to_messages()
@@ -336,6 +337,7 @@ class AppAgentLoopMixin:
                 await self._mount_widget(SteerBubble(s))
             self._refresh_status()
 
+        await self._auto_compact_if_needed(model=model, effort=effort)
         self._write_turn_journal(
             phase="streaming",
             message_len_current=len(self.messages),
@@ -358,7 +360,7 @@ class AppAgentLoopMixin:
             observer=ParentTurnObserver(self),
             tool_confirm=self.tool_confirm,
             meta_handler=self._parent_meta_handler,
-            before_round=self._before_round,
+            before_round=partial(self._before_round, model=self.model, effort=self.effort),
         )
         try:
             await engine.run_turn()

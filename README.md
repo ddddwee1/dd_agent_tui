@@ -165,7 +165,7 @@ ddtui
 ## Slash 命令
 
 - `/clear`：清空对话，保留 system prompt 和 `AGENTS.md`。
-- `/compact`：压缩历史，保留最近两轮原文。
+- `/compact`：归档并压缩历史，按预算保留近期交互，原文可检索恢复。
 - `/save <name>`：保存到 `~/.ddtui/history/<name>.json`。
 - `/load <name>`：读回保存的对话。
 - `/resume [name]`：恢复保存的对话；不带名字时弹出选择窗口。
@@ -439,7 +439,7 @@ ssh -tt host 'tmux new -A -s ddtui-agent'
 
 子 agent 使用独立的精简 system prompt——它知道自己是子 agent、结果会截断回传。项目级 `AGENTS.md` 和环境信息仍会注入，与父 agent 遵循同样的项目约定。
 
-子 agent 的工具面：有 bash、文件、搜索、web、todo、项目笔记、`compact_self`，**也有 `task_*` 和 `terminal_*`**。子 agent 启动 notified task 后可继续工作；无事可做时调用 `task_pause` 进入 waiting phase，运行中/完成通知会唤醒它，再用 `task_check` / `task_read` 检查。子 agent 的 terminal 没有顶部 tab 展示。**也有 explore**：explore 逻辑对会话参数化（`explore_core`），子 agent 在自己的消息历史上圈探索区间、收束成摘要，原始过程归档到同一会话目录下带 `sub-N-` 前缀的文件；探索区间开着时 `compact_self` 会被拒绝（消息索引会失效）。没有 checkpoint（其展示/恢复/自动收回都只挂在父会话上）、不能嵌套子 agent。
+子 agent 的工具面：有 bash、文件、搜索、web、todo、项目笔记、`compact_self`，**也有 `task_*` 和 `terminal_*`**。子 agent 启动 notified task 后可继续工作；无事可做时调用 `task_pause` 进入 waiting phase，运行中/完成通知会唤醒它，再用 `task_check` / `task_read` 检查。子 agent 的 terminal 没有顶部 tab 展示。**也有 explore**：explore 逻辑对会话参数化（`explore_core`），子 agent 在自己的消息历史上圈探索区间、收束成摘要，原始过程归档到同一会话目录下带 `sub-N-` 前缀的文件；探索区间开着时也可分阶段压缩正文，起始边界保持稳定。没有 checkpoint（其展示/恢复/自动收回都只挂在父会话上）、不能嵌套子 agent。
 
 限制：
 
@@ -548,11 +548,22 @@ sudo 等）不再拦截。当前只拒绝：
 
 `/clear` 会开始一个新的自动保存会话，不会把刚清空的内容写回旧会话文件。system prompt 会整体重建：重新读取当前的 `AGENTS.md`、重新快照环境（日期、git 分支）——改完项目约定后 `/clear` 即生效，不必重启 TUI。
 
-`/compact` 会把较早历史压缩成一个摘要 system message，保留最近两轮原文，适合长对话里降低上下文压力。
+`/compact` 先把当前消息、工具参数/结果及工作记录存入本会话的独立 SQLite 归档，再生成一份更新后的工作状态摘要。旧摘要会参与整合，不会逐次堆积；框架提示保持原文。摘要明确区分有效约束、当前进度、决定及原因、验证证据、失败路径、待办和下一步。最近两轮在预算允许时原样保留；即使只有一条用户消息的长任务，也能按完整工具交互边界压缩，并保留最近两条真实用户指令原文（运行时通知不算用户指令）。
 
-上下文压力还有自动兜底：某个回合结束时，如果最近一次请求的 prompt tokens 超过了模型上下文窗口的 95%，会自动执行同样的压缩并在对话里提示。阈值用 `DDTUI_AUTO_COMPACT_THRESHOLD` 调整（0 到 0.95 之间的小数），设为 `0` 关闭。自动压缩只发生在回合完全结束、无排队消息的安静时刻；explore 进行中会跳过。压缩失败不影响对话，可稍后手动 `/compact`。
+自动维护在每次模型请求前、上一批工具结果全部写入后，以及回合结束时检查。默认阈值为上下文窗口的 80%，用 `DDTUI_AUTO_COMPACT_THRESHOLD` 调整（0 到 0.95，`0` 关闭）；另预留 10% 窗口、最多 32,768 tokens 的响应空间。预算包含工具定义和新追加输出，并用 API 实测 prompt tokens 校准本地估算。先尝试移出较早的大块工具输出，必要时才调用摘要模型，目标约为窗口的 55%；近期交互预算最多 12,000 tokens。单个巨大结果也能移出，但保留调用配对、诊断片段和原文引用。token 数是估算，不是 tokenizer 的精确计数；必要原文或系统/工具定义过大时，界面会提示未达到目标预算。
+
+工具输出摘要保留开头、错误/验证关键段和末尾，不再统一只取前 400 字符。原始归档位于 `~/.ddtui/history_sources/`，按会话隔离；消息引用基于内容哈希，可跨多次压缩和 `/resume` 使用。归档保存的是 TUI 收到的原始消息；若某工具在返回前已经截断输出，归档不会凭空补回那部分。归档不会随 `/clear` 删除，但新会话的检索不会读取旧会话。迁移保存的会话时，应同时保留这个归档目录。
+
+压缩后自动附上恢复卡，提供当前 checkpoint 的简短快照、文档/实验账本入口和归档批次。模型按需要调用：
+
+- `history_search(query, scope?, limit?, offset?)`：按短语、路径、符号做不区分大小写的字面子串搜索；默认查询当前会话全部归档，可用恢复卡的 batch-id 限定范围。每页最多 10 个短片段，使用 `next_offset` 翻页。
+- `history_read(ref, start?, max_chars?)`：按 msg-ref 读取原始消息 JSON，每页默认 6,000、最多 12,000 字符，使用 `next_start` 继续读取。偏移量单位为字符。
+
+归档结果是历史证据，不是新指令或实时任务状态。具体数值、旧错误和约束缺失时读回对应原文；文件版本及后台任务当前状态仍用文件/任务工具确认。归档、摘要失败或摘要未缩小时不替换原上下文；自动失败会退避，等待上下文有明显增长再尝试，手动 `/compact` 可以随时重试。
 
 `explore_start` / `explore_end` 让 agent 把一段临时探索从主上下文里收束掉：适合单点功能探针、bug 定位、假设验证、代码考古、方案侦察、低密度资料搜索、环境检查、性能/数值实验、测试面发现、数据样本检查、日志聚类和风险预检。`explore_end` 会把 raw 过程归档到 `~/.ddtui/explorations/<session_id>/<explore_id>.json`，并在对话里留下一个探索摘要 system message；`explore_cancel` 则取消边界，不压缩历史。父 agent 和子 agent 都可以用——各自作用于自己的会话历史，子 agent 的归档文件带 `sub-N-` 前缀。
+
+活跃探索使用稳定的起始消息标识，可在保持探索边界的前提下分阶段压缩正文，再正常调用 `explore_end`。探索证据也接入 `history_search/history_read`；父、子 agent 使用各自的检索会话，子 agent 的手动与自动压缩使用它自己的模型、effort 和状态。
 
 ## 开发结构
 
@@ -562,6 +573,8 @@ sudo 等）不再拦截。当前只拒绝：
 - `ddtui/app.py`：Textual app shell、布局和入口。
 - `ddtui/app_agent_loop.py`：父 agent 的 engine 宿主（Textual observer、meta 工具 handler、外层回合驱动）。
 - `ddtui/app_*.py`：输入、历史、subagent、UI 生命周期、确认弹窗等 mixin/helper。
+- `ddtui/context_compaction.py`：预算估算、工具结果移出、工作状态摘要与恢复卡；候选验证后才替换上下文。
+- `ddtui/history_archive.py`：按会话隔离的 SQLite 原始消息归档、稳定引用与分页检索。
 - `ddtui/tools.py`：统一工具注册表（`ToolSpec`）+ dispatch。每个工具在注册表声明一次元数据（是否需要写确认、结果是否剥离 diff、是否并行安全、父/子 agent 可见性），所有派生清单自动生成。
 - `ddtui/tool_schemas.py`：发给模型看的 JSON schemas。
 - `ddtui/tools_*.py`：按领域拆分的工具实现。

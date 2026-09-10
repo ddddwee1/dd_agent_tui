@@ -10,7 +10,6 @@ from pathlib import Path
 from .config import (
     AGENTS_MD_FILENAME,
     AGENTS_MD_MAX_CHARS,
-    COMPACT_TOOL_SNIPPET_CHARS,
 )
 from .providers import ToolCallDelta
 
@@ -58,37 +57,9 @@ def build_env_block(work_dir: str, provider_label: str, model: str) -> str:
 
 
 def _render_history_for_summary(messages: list) -> str:
-    """Flatten a slice of message history to plain text for the
-    summarizer prompt. Drops reasoning_content (only useful at the time
-    it was produced) and truncates tool results. Ordinary system messages
-    are skipped because leading system prompts are preserved, but
-    non-leading exploration summaries need to survive later compaction."""
-    lines: list[str] = []
-    for m in messages:
-        role = m.get("role")
-        content = m.get("content") or ""
-        if role == "user":
-            lines.append(f"=== USER ===\n{content}")
-        elif role == "system" and m.get("ddtui_kind") == "explore_summary":
-            lines.append(f"=== EXPLORE SUMMARY ===\n{content}")
-        elif role == "assistant":
-            block = ["=== ASSISTANT ==="]
-            if content:
-                block.append(content)
-            for tc in m.get("tool_calls") or []:
-                fn = tc.get("function") or {}
-                name = fn.get("name", "?")
-                args_str = (fn.get("arguments") or "")[:200]
-                block.append(f"  [tool_call] {name}({args_str})")
-            lines.append("\n".join(block))
-        elif role == "tool":
-            snippet = content[:COMPACT_TOOL_SNIPPET_CHARS]
-            if len(content) > COMPACT_TOOL_SNIPPET_CHARS:
-                snippet += " …[truncated]"
-            lines.append(f"=== TOOL RESULT ===\n{snippet}")
-        # Other system messages are intentionally skipped — leading
-        # system prompts are preserved across compaction.
-    return "\n\n".join(lines)
+    """Shared evidence-aware rendering for full and exploration compaction."""
+    from .context_compaction import render_history
+    return render_history(messages)
 
 
 def _merge_tool_call_delta(

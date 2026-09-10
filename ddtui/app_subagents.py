@@ -15,7 +15,7 @@ import time
 from . import explore_core
 from .app_support import build_env_block, load_agents_md
 from .config import (
-    COMPACT_KEEP_RECENT_TURNS,
+    AUTO_COMPACT_THRESHOLD,
     MAX_LIVE_SUBAGENTS,
     POST_SYSTEM_PROMPT,
     SUBAGENT_READY_NOTIFY_DELAY,
@@ -23,6 +23,7 @@ from .config import (
     SUBAGENT_SYSTEM_PROMPT,
 )
 from .engine import ToolOutcome, TurnEngine, TurnObserver
+from .context_compaction import auto_compact
 from .runtime_messages import runtime_task_event_message
 from .state import (
     SubagentSession,
@@ -178,6 +179,18 @@ class AppSubagentMixin:
                 for event in events:
                     sess.messages.append(runtime_task_event_message(event))
 
+            try:
+                protected = explore_core.resolve_start_index(sess.explore.active, sess.messages) if sess.explore.active else 0
+                await auto_compact(
+                    sess.messages, provider=self.provider, ctx=sess.ctx,
+                    model=sess.model or self.model, effort=sess.effort or self.effort,
+                    tools=sess.sub_tools, context_limit=sess.context_limit,
+                    threshold=AUTO_COMPACT_THRESHOLD, protected_prefix=protected,
+                )
+            except Exception as exc:
+                sess.messages.append({"role": "system", "ddtui_kind": "context_recovery",
+                                      "content": f"上下文压缩未应用，原历史保留：{exc}"})
+
             sess.turn += 1
             sess.phase = "thinking"
             sess.last_tool = None
@@ -234,16 +247,11 @@ class AppSubagentMixin:
                 # Subagent-only meta-tool: rewrite the session's own
                 # messages with a summary. Reuses _compact_messages so
                 # /compact and compact_self share the same prompt / cut
-                # policy. No tool_confirm — memory-only, no side effects.
-                if sess.explore.active is not None:
-                    return (
-                        "Error: an exploration span is open and pins "
-                        "message indices. Call explore_end or "
-                        "explore_cancel before compact_self."
-                    )
+                # policy. Archives are local conversation state.
                 try:
                     new_messages, stats = await self._compact_messages(
-                        sess.messages
+                        sess.messages, ctx=sess.ctx, model=sess.model,
+                        effort=sess.effort, explore=sess.explore.active,
                     )
                 except ValueError as e:
                     return f"Error: {e}"
@@ -255,11 +263,14 @@ class AppSubagentMixin:
                 # Slice-assign, NOT rebind: the engine holds a reference
                 # to this exact list object.
                 sess.messages[:] = new_messages
+                sess.ctx.context_last_prompt = 0
+                sess.ctx.context_last_estimate = 0
+                sess.ctx.compact_retry_after = 0
                 return (
                     f"已压缩：{stats['before_n']} → "
                     f"{stats['after_n']} 条消息，约 "
-                    f"-{stats['saved']:,} 字符（保留最近 "
-                    f"{COMPACT_KEEP_RECENT_TURNS} 轮原文）。"
+                    f"-{stats['saved']:,} 字符。原始历史可用 "
+                    "history_search/history_read 恢复。"
                 )
             return None
 
@@ -476,9 +487,8 @@ class AppSubagentMixin:
         sub_messages.append({"role": "user", "content": prompt})
 
         # Subagent-visible schemas come straight from the registry:
-        # no spawn_* (no recursive forking), no explore_* (the impl
-        # compacts the PARENT's history), no checkpoint_* (no consumer
-        # for a subagent). task_* and terminal_* ARE available (own ctx
+        # no spawn_* (no recursive forking), no checkpoint_* (no consumer
+        # for a subagent). Explore, task_* and terminal_* use their own ctx
         # tables, cleaned up by end_agent/reaper); task events wake a
         # parked subagent through task_pause.
         sub_tools = list(SUBAGENT_TOOL_SCHEMAS)

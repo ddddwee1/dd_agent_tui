@@ -44,7 +44,7 @@ def load_config(tmp_path):
 def test_defaults_when_no_file(load_config):
     c = load_config()
     assert c.DEEPSEEK_MODEL == "deepseek-v4-flash"
-    assert c.AUTO_COMPACT_THRESHOLD == 0.95
+    assert c.AUTO_COMPACT_THRESHOLD == 0.80
     assert c.CONFIG_FILE_KEY_COUNT == 0
     assert c.CONFIG_FILE_ERROR == ""
     assert c.CONFIG_FILE_UNUSED_KEYS == ()

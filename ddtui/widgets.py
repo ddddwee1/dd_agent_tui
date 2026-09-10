@@ -1499,7 +1499,7 @@ class SlashPopup(Static):
     # token so the placeholder doesn't break prefix matching.
     COMMANDS: tuple[tuple[str, str], ...] = (
         ("/clear", "清空对话（保留 system prompt + AGENTS.md）"),
-        ("/compact", "压缩历史，保留最近两轮原文"),
+        ("/compact", "归档并压缩历史，原文可检索恢复"),
         ("/save <name>", "保存到 ~/.ddtui/history/<name>.json"),
         ("/load <name>", "读回保存的对话"),
         ("/resume [name]", "恢复对话；不带 name 时打开选择窗口"),

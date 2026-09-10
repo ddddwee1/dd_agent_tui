@@ -182,6 +182,9 @@ class AppInputMixin:
             self.provider_name = new_provider.key
             self.model = new_provider.default_model
             self.effort = new_provider.default_effort
+            self.ctx.context_last_prompt = 0
+            self.ctx.context_last_estimate = 0
+            self.ctx.compact_retry_after = 0
             self._update_subtitle()
             limit_note = ""
             limit = self._context_limit()
@@ -202,6 +205,9 @@ class AppInputMixin:
             else:
                 old = self.model
                 self.model = arg
+                self.ctx.context_last_prompt = 0
+                self.ctx.context_last_estimate = 0
+                self.ctx.compact_retry_after = 0
                 self._update_subtitle()
                 self._refresh_status()
                 limit_note = ""
