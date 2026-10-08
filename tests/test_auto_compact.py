@@ -3,6 +3,8 @@
 import asyncio
 import copy
 
+import pytest
+
 import ddtui.context_compaction as cc
 from ddtui.app_history import AppHistoryMixin
 from ddtui.engine import TurnEngine
@@ -40,6 +42,26 @@ def test_below_threshold_and_disabled_do_not_archive_or_summarize():
     assert run(long_task(), ctx, provider, limit=None) is None
     assert not provider.calls
     assert ctx.compact_retry_after == 0
+
+
+@pytest.mark.parametrize("limit, trigger", [
+    (700_000, 500_000),
+    (1_000_000, 500_000),
+    (100_000, 90_000),
+])
+def test_token_threshold_and_response_reserve(monkeypatch, limit, trigger):
+    ctx = ToolContext(work_dir=".", session_id="token-threshold")
+    provider = Provider()
+    messages = long_task()
+    _, available = cc.request_pressure(ctx, messages, (), limit)
+    pressure = trigger - 1
+    monkeypatch.setattr(cc, "request_pressure", lambda *args: (pressure, available))
+    assert run(messages, ctx, provider, threshold=500_000, limit=limit) is None
+    assert not any(m.get("ddtui_history_ref") for m in messages)
+    pressure = trigger
+    stats = run(messages, ctx, provider, threshold=500_000, limit=limit)
+    assert stats["after_tokens"] < stats["before_tokens"]
+    assert any(m.get("ddtui_history_ref") for m in messages)
 
 
 def test_new_tool_output_triggers_before_next_request_without_usage():

@@ -19,12 +19,12 @@ from .config import (
     BASH_TIMEOUT,
 )
 from .state import ToolContext
+from .tool_output import limit_tool_output
 from .tool_utils import (
     _BASH_HARD_CHAR_CAP,
     _check_dangerous,
     _safe_path,
     _sandbox_error,
-    _truncate_output,
 )
 
 
@@ -34,7 +34,7 @@ def tool_bash(
     workdir: str | None = None,
     max_output_chars: int | None = None,
 ) -> str:
-    """Run a shell command with safety checks, timeout, and output truncation."""
+    """Run a command and archive large output before returning a bounded preview."""
     err = _check_dangerous(command)
     if err:
         return f"Error: {err}"
@@ -42,7 +42,7 @@ def tool_bash(
     cap = BASH_OUTPUT_MAX_CHARS
     if max_output_chars is not None:
         try:
-            cap = max(1, min(_BASH_HARD_CHAR_CAP, int(max_output_chars)))
+            cap = max(512, min(_BASH_HARD_CHAR_CAP, int(max_output_chars)))
         except (TypeError, ValueError):
             return f"Error: max_output_chars must be an integer, got {max_output_chars!r}"
 
@@ -76,9 +76,9 @@ def tool_bash(
 
     parts = []
     if result.stdout:
-        parts.append(f"STDOUT:\n{_truncate_output(result.stdout, cap)}")
+        parts.append(f"STDOUT:\n{result.stdout}")
     if result.stderr:
-        parts.append(f"STDERR:\n{_truncate_output(result.stderr, cap)}")
+        parts.append(f"STDERR:\n{result.stderr}")
     parts.append(f"Exit code: {result.returncode}")
     if elapsed >= BASH_SLOW_COMMAND_SECONDS:
         # Teach at the moment of the mistake: the model just blocked the
@@ -88,4 +88,5 @@ def tool_bash(
             "blocked everything else. Next time, run commands in this "
             "range with task_start so you can keep working while they run."
         )
-    return "\n".join(parts)
+    return limit_tool_output(ctx, "\n".join(parts), name="bash",
+                             arguments={"command": command, "workdir": cwd}, max_chars=cap)

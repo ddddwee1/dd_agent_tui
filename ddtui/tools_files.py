@@ -13,6 +13,7 @@ from .config import (
     READ_FILES_MAX_TOTAL_CHARS,
 )
 from .state import ToolContext
+from .tool_output import limit_tool_output
 from .tool_utils import _safe_path, _sandbox_error, _unified_diff
 
 
@@ -101,20 +102,30 @@ def tool_read_file(
     chunk = lines[start : start + limit]
 
     body_parts: list[str] = []
+    source_parts: list[str] = []
     body_chars = 0
     shown = 0
     budget_hit = False
+    clipped_lines = False
+    # Leave room for the path/range, continuation hint and archive reference.
+    body_budget = max(1, READ_FILE_MAX_TOTAL_CHARS - len(str(p)) - 400)
+    # A configured total cap can be smaller than the per-line cap. Keep the
+    # first line inside the page too, without losing its continuation hint.
+    line_cap = min(READ_FILE_MAX_LINE_CHARS, max(1, body_budget - 80))
     for i, line in enumerate(chunk):
-        if len(line) > READ_FILE_MAX_LINE_CHARS:
+        original = f"{offset + i:6d}\t{line}"
+        if len(line) > line_cap:
             line = (
-                line[:READ_FILE_MAX_LINE_CHARS]
+                line[:line_cap]
                 + f" …[line clipped; {len(line)} chars total]"
             )
         numbered = f"{offset + i:6d}\t{line}"
-        if body_chars + len(numbered) > READ_FILE_MAX_TOTAL_CHARS and shown > 0:
+        if body_chars + len(numbered) > body_budget and shown > 0:
             budget_hit = True
             break
         body_parts.append(numbered)
+        source_parts.append(original)
+        clipped_lines = clipped_lines or original != numbered
         body_chars += len(numbered) + 1  # +1 for the joining newline
         shown += 1
 
@@ -125,6 +136,14 @@ def tool_read_file(
         out += (
             f"\n…[output capped at {READ_FILE_MAX_TOTAL_CHARS} chars; "
             f"continue with offset={end_line + 1}]"
+        )
+    elif end_line < total:
+        out += f"\n…[more lines; continue with offset={end_line + 1}]"
+    if clipped_lines:
+        out = limit_tool_output(
+            ctx, header + "\n" + "\n".join(source_parts), name="read_file",
+            arguments={"path": path, "offset": offset, "limit": limit},
+            preview=out, max_chars=READ_FILE_MAX_TOTAL_CHARS,
         )
     _note_file_known(ctx, p)
     return out
@@ -267,14 +286,17 @@ def tool_read_files(ctx: ToolContext, files: list[dict]) -> str:
     # section. Allocate only the remaining characters to section bodies.
     available = max(
         0,
-        READ_FILES_MAX_TOTAL_CHARS - len(header) - (2 * len(outputs)),
+        READ_FILES_MAX_TOTAL_CHARS - len(header) - (2 * len(outputs)) - 256,
     )
     budgets = _fair_output_budgets([len(output) for output in outputs], available)
     clipped = [
         _clip_batch_result(result, budget, path, offset)
         for (path, offset, result, _ok), budget in zip(sections, budgets)
     ]
-    return "\n\n".join([header, *clipped])[:READ_FILES_MAX_TOTAL_CHARS]
+    return limit_tool_output(
+        ctx, combined, name="read_files", arguments={"files": files},
+        preview="\n\n".join([header, *clipped]), max_chars=READ_FILES_MAX_TOTAL_CHARS,
+    )
 
 
 def tool_write_file(

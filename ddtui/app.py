@@ -65,6 +65,7 @@ class AgentApp(
     #body { height: 1fr; layout: horizontal; }
     #main { width: 1fr; layout: vertical; }
     #sidebar {
+        height: 1fr;
         width: 26%;
         min-width: 30;
         max-width: 60;
@@ -314,7 +315,7 @@ class AgentApp(
                 yield popup
                 yield MultilineInput(id="user-input")
                 yield StatusBar(self.ctx.work_dir, id="status")
-            yield Vertical(id="sidebar")
+            yield VerticalScroll(id="sidebar")
 
 
 def main() -> None:

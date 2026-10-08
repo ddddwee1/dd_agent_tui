@@ -614,7 +614,7 @@ class AppHistoryMixin:
                         else []
                     )
                     try:
-                        sidebar = self.query_one("#sidebar", Vertical)
+                        sidebar = self.query_one("#sidebar", VerticalScroll)
                     except Exception:
                         sidebar = None
                     if sidebar is not None and items:

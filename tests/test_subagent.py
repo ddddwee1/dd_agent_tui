@@ -354,3 +354,125 @@ def test_await_first_no_double_delivery(playground):
         sess.last_active_at -= 3.0
         assert app._collect_ready_subagent_events() == []
     asyncio.run(run())
+
+
+# No long sleeps: expire monotonic deadlines directly to exercise timeout wakes.
+def _pause_test_session(app, monkeypatch):
+    import time
+    from types import SimpleNamespace
+    import ddtui.app_subagents as module
+    from ddtui.state import SubagentSession
+    monkeypatch.setattr(module, "async_task_status", lambda task: ("running", None, 0.0))
+    monkeypatch.setattr(module, "collect_task_events", lambda ctx: [])
+    ctx = ToolContext(work_dir=app.ctx.work_dir, session_id="pause-test", is_subagent=True)
+    ctx.tasks["task-1"] = SimpleNamespace(notify_on_complete=True)
+    sess = SubagentSession(id="sub-pause", prompt_preview="wait", started_at=time.monotonic(),
+                          last_active_at=time.monotonic(), messages=[], ctx=ctx, sub_tools=[])
+    app._live_subagents[sess.id] = sess
+    return sess
+
+
+def test_pause_default_timeout_wakes_without_task_events(playground, monkeypatch):
+    import time
+    async def run():
+        app = FakeApp(playground)
+        sess = _pause_test_session(app, monkeypatch)
+        before = time.monotonic()
+        answer = app._subagent_task_pause(sess, {"next_action": "inspect logs"})
+        assert "timeout=60s" in answer
+        assert sess.waiting_deadline is None  # tool batch has not finished yet
+        sess.task = asyncio.create_task(app._run_subagent_task(sess))
+        await _wait_round(sess)
+        assert sess.phase == "waiting"
+        assert before + 60 <= sess.waiting_deadline <= time.monotonic() + 60
+        assert "wake_in=" in app._check_subagent(sess.id)
+        assert app._poll_subagent_task_events() == 0
+        assert not app.provider.stream_calls
+        sess.waiting_deadline = time.monotonic() - 1
+        assert app._poll_subagent_task_events() == 1
+        assert sess.waiting_deadline is None
+        wake_task = sess.task
+        assert app._poll_subagent_task_events() == 0
+        assert sess.task is wake_task
+        await _wait_round(sess)
+        assert sess.phase == "ready" and sess.last_result == "done"
+        assert len(app.provider.stream_calls) == 1
+        notice = next(m for m in sess.messages if m.get("ddtui_kind") == "runtime_task_event")
+        assert "timed out after 60s" in notice["content"]
+        assert "inspect logs" in notice["content"] and "task-1" in notice["content"]
+        assert "not task completion or failure" in notice["content"]
+        assert "task-1" in sess.ctx.tasks  # no task cleanup/kill on timeout
+    asyncio.run(run())
+
+
+def test_pause_custom_timeout_and_rearm(playground, monkeypatch):
+    import time
+    async def run():
+        app = FakeApp(playground)
+        sess = _pause_test_session(app, monkeypatch)
+        for timeout in (5, 120):
+            sess.last_result = None
+            before = time.monotonic()
+            answer = app._subagent_task_pause(sess, {"task_ids": ["task-1"], "timeout": timeout})
+            assert f"timeout={timeout}s" in answer
+            sess.task = asyncio.create_task(app._run_subagent_task(sess))
+            await _wait_round(sess)
+            assert before + timeout <= sess.waiting_deadline <= time.monotonic() + timeout
+            sess.waiting_deadline = time.monotonic() - 1
+            assert app._poll_subagent_task_events() == 1
+            await _wait_round(sess)
+        assert len(app.provider.stream_calls) == 2
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 3601, float("nan"), float("inf"), "60", True, None])
+def test_pause_rejects_invalid_timeout(playground, monkeypatch, timeout):
+    app = FakeApp(playground)
+    sess = _pause_test_session(app, monkeypatch)
+    answer = app._subagent_task_pause(sess, {"timeout": timeout})
+    assert answer.startswith("Error: timeout")
+    assert not sess.park_requested and sess.phase == "thinking"
+    assert sess.waiting_deadline is None
+
+
+def test_task_event_wins_over_expired_pause_deadline(playground, monkeypatch):
+    import time
+    import ddtui.app_subagents as module
+    async def run():
+        app = FakeApp(playground)
+        sess = _pause_test_session(app, monkeypatch)
+        app._subagent_task_pause(sess, {})
+        sess.task = asyncio.create_task(app._run_subagent_task(sess))
+        await _wait_round(sess)
+        sess.waiting_deadline = time.monotonic() - 1
+        notices = [["[Async task complete] task-1 finished"], []]
+        monkeypatch.setattr(module, "collect_task_events", lambda ctx: notices.pop(0))
+        assert app._poll_subagent_task_events() == 1
+        assert app._poll_subagent_task_events() == 0
+        await _wait_round(sess)
+        assert not any("timed out" in m.get("content", "") for m in sess.messages)
+        assert len(app.provider.stream_calls) == 1
+    asyncio.run(run())
+
+
+def test_event_queued_before_park_wakes_without_another_event(playground, monkeypatch):
+    import ddtui.app_subagents as module
+    async def run():
+        app = FakeApp(playground)
+        sess = _pause_test_session(app, monkeypatch)
+        app._subagent_task_pause(sess, {})
+        sess.task = asyncio.create_task(app._run_subagent_task(sess))
+        await _wait_round(sess)
+        # Simulate a notice arriving while the just-ending round still owns
+        # sess.task. The following tick must consume its already queued event.
+        sess.task = asyncio.current_task()
+        notices = [["[Async task notice] task-1 running"], []]
+        monkeypatch.setattr(module, "collect_task_events", lambda ctx: notices.pop(0))
+        assert app._poll_subagent_task_events() == 1
+        assert sess.task is asyncio.current_task()
+        sess.task = None
+        assert app._poll_subagent_task_events() == 0  # no newly collected notice
+        assert sess.task is not None and sess.waiting_deadline is None
+        await _wait_round(sess)
+        assert sess.phase == "ready" and len(app.provider.stream_calls) == 1
+    asyncio.run(run())

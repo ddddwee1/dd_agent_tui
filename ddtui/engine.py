@@ -36,7 +36,9 @@ from typing import Awaitable, Callable
 from .app_support import _merge_tool_call_delta
 from .runtime_messages import guard_assistant_runtime_claims
 from .context_compaction import history_tokens
-from .state import ToolContext
+from .tool_output import limit_tool_output, trim_tool_history
+from .tool_loop_guard import ToolLoopGuard, result_digest
+from .state import ToolContext, TOOL_ERROR_PREFIXES
 from .tools import (
     APP_DISPATCHED_TOOLS,
     CONFIRM_TOOLS,
@@ -48,7 +50,7 @@ from .tools import (
 
 # Single authority for "did this tool call fail" — the string-prefix
 # convention previously re-implemented at four call sites.
-_ERROR_PREFIXES = ("Error:", "Blocked:", "⛔")
+_ERROR_PREFIXES = TOOL_ERROR_PREFIXES
 
 BLOCKED_BY_CONFIRM = (
     "Tool execution blocked by user policy / confirmation dialog."
@@ -173,11 +175,14 @@ class TurnEngine:
         # interjections and async-task events into `messages` here.
         self.before_round = before_round
         self.executor = executor
+        self._loop_guard = ToolLoopGuard()
 
     async def run_turn(self) -> None:
         while True:
+            trim_tool_history(self.messages, self.ctx)
             if self.before_round is not None:
                 await self.before_round()
+            self._loop_guard.sync_context(self.messages)
             msg = await self._stream_once()
             self.messages.append(msg)
             await self.observer.on_assistant_message(msg)
@@ -342,11 +347,29 @@ class TurnEngine:
     async def _commit(
         self, tc: dict, name: str, args: dict, outcome: ToolOutcome
     ) -> None:
+        digest = result_digest(outcome.content)
+        # Retrieval tools already paginate exact JSON. Re-excerpting their
+        # results would hide next_start and create recursive archive reads.
+        if name not in {"history_read", "history_search"}:
+            outcome.content = limit_tool_output(
+                self.ctx, outcome.content, name=name, call_id=tc.get("id"), arguments=args,
+            )
+        outcome.content = self._loop_guard.observe(
+            self.ctx, name=name, args=args, call_id=tc.get("id"),
+            content=outcome.content, digest=digest, ok=outcome.ok,
+        )
+        if name not in {"history_read", "history_search"}:
+            outcome.content = limit_tool_output(
+                self.ctx, outcome.content, name=name, call_id=tc.get("id"), arguments=args,
+            )
         msg = {
             "role": "tool",
             "tool_call_id": tc.get("id"),
-            "content": outcome.content,
+            "content": str(outcome.content),
         }
+        if getattr(outcome.content, "ref", None):
+            msg["ddtui_history_ref"] = outcome.content.ref
+            msg["ddtui_output_chars"] = outcome.content.original_chars
         self.messages.append(msg)
         await self.observer.on_tool_result(tc.get("id"), name, args, outcome)
         await self.observer.on_history_appended(msg, "tool")

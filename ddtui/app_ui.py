@@ -29,6 +29,7 @@ from .tools_terminal import drain_terminal_output
 from .widgets import (
     CheckpointBlock,
     CollapsedHistoryMarker,
+    DiffBlock,
     EditPendingScreen,
     MultilineInput,
     StatusBar,
@@ -39,6 +40,7 @@ from .widgets import (
     TerminalTabPane,
     ThinkingBlock,
     ToolCallBlock,
+    ToolCallGroup,
     UserBubble,
 )
 
@@ -185,7 +187,7 @@ class AppUiMixin:
         tasks = list(self.ctx.tasks.values())
         running = [task for task in tasks if task.proc.poll() is None]
         try:
-            sidebar = self.query_one("#sidebar", Vertical)
+            sidebar = self.query_one("#sidebar", VerticalScroll)
         except Exception:
             return
         if not running:
@@ -209,7 +211,7 @@ class AppUiMixin:
 
     async def _mount_task_block(self) -> None:
         try:
-            sidebar = self.query_one("#sidebar", Vertical)
+            sidebar = self.query_one("#sidebar", VerticalScroll)
         except Exception:
             return
         if self._tasks_block is None:
@@ -230,7 +232,7 @@ class AppUiMixin:
         sessions from the dict, which is what unmounts the panel."""
         sessions = list(self._live_subagents.values())
         try:
-            sidebar = self.query_one("#sidebar", Vertical)
+            sidebar = self.query_one("#sidebar", VerticalScroll)
         except Exception:
             return
         if not sessions:
@@ -262,7 +264,7 @@ class AppUiMixin:
 
     async def _mount_subagent_block(self) -> None:
         try:
-            sidebar = self.query_one("#sidebar", Vertical)
+            sidebar = self.query_one("#sidebar", VerticalScroll)
         except Exception:
             return
         if self._subagent_block is None:
@@ -345,7 +347,7 @@ class AppUiMixin:
     async def _sync_checkpoint_block(self) -> None:
         """Mirror ctx.checkpoint into the sidebar."""
         try:
-            sidebar = self.query_one("#sidebar", Vertical)
+            sidebar = self.query_one("#sidebar", VerticalScroll)
         except Exception:
             return
         checkpoint = self.ctx.checkpoint
@@ -369,7 +371,7 @@ class AppUiMixin:
 
     def _refresh_sidebar_visibility(self) -> None:
         try:
-            sidebar = self.query_one("#sidebar", Vertical)
+            sidebar = self.query_one("#sidebar", VerticalScroll)
         except Exception:
             return
         has_visible = any(child.is_mounted for child in sidebar.children)
@@ -619,14 +621,18 @@ class AppUiMixin:
         self.notify("没有选中文本可复制（退出请用 Ctrl+Q）", timeout=2)
 
     def action_toggle_thinking(self) -> None:
-        """Fold every ThinkingBlock if any is currently expanded; else
-        unfold every block. One key, mirrors the user's intent."""
+        """Toggle reasoning details together with their enclosing groups."""
         blocks = list(self.query(ThinkingBlock))
         if not blocks:
             return
-        target_collapsed = any(not b.collapsed for b in blocks)
+        target_collapsed = any(
+            not b.collapsed and (b._tool_group is None or not b._tool_group.collapsed)
+            for b in blocks
+        )
         for b in blocks:
             b.collapsed = target_collapsed
+            if b._tool_group is not None:
+                b._tool_group.collapsed = target_collapsed
 
     def action_cancel_pending(self) -> None:
         """Ctrl+X: drop everything that hasn't started running yet.
@@ -768,11 +774,13 @@ class AppUiMixin:
             for child in reversed(list(view.children)):
                 if isinstance(child, (UserBubble, SteerBubble)):
                     break
-                if isinstance(child, ToolCallBlock) and child.is_pending:
-                    try:
-                        child.set_result(cancel_note, blocked=True)
-                    except Exception:
-                        pass
+                calls = child.tool_calls if isinstance(child, ToolCallGroup) else (child,)
+                for block in calls:
+                    if isinstance(block, ToolCallBlock) and block.is_pending:
+                        try:
+                            block.set_result(cancel_note, blocked=True)
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -805,7 +813,20 @@ class AppUiMixin:
 
     async def _mount_widget(self, widget) -> None:
         view = self.query_one("#conversation", VerticalScroll)
-        await view.mount(widget)
+        last = view.children[-1] if view.children else None
+        if isinstance(widget, (ThinkingBlock, ToolCallBlock)):
+            group = last if isinstance(last, ToolCallGroup) and last.display else ToolCallGroup()
+            if group is not last:
+                await view.mount(group)
+            mounted = group.add_block(widget)
+            if mounted is not None:
+                await mounted
+        elif isinstance(widget, DiffBlock) and isinstance(last, ToolCallGroup):
+            mounted = last.add_block(widget)
+            if mounted is not None:
+                await mounted
+        else:
+            await view.mount(widget)
         if self._follow_bottom:
             view.scroll_end(animate=False)
 

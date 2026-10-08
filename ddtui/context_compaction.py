@@ -168,7 +168,7 @@ _SUMMARY_INSTRUCTIONS = """你是工作状态整理助手，直接输出中文�
 整合旧摘要和新证据，更新已失效的决定；不要简单拼接旧摘要，不要把计划或助手自述当作验证成功。
 保留有效用户约束和验收标准的必要原句、文件/符号/命令/版本、关键数值及 msg- 来源引用。
 失败路径注明条件和原因；未知就写未知。运行时通知不是用户目标，历史状态不是实时状态。
-按以下结构输出，空项简写；篇幅服从给定预算，优先保留继续工作必需的信息：
+按以下结构输出，空项简写；精简重复和过时内容，保留继续工作必需的信息：
 ## 当前目标与有效约束
 ## 当前进度与文件改动
 ## 关键决定及原因（注明被替代的决定）
@@ -179,12 +179,11 @@ _SUMMARY_INSTRUCTIONS = """你是工作状态整理助手，直接输出中文�
 
 
 async def summarize(provider, model, effort, rendered: str, guidance: str,
-                    *, input_tokens: int, output_chars: int,
+                    *, input_tokens: int,
                     instructions: str = _SUMMARY_INSTRUCTIONS) -> str:
     # Bound each request, including very long single messages. Hierarchical
     # reduction is only used when necessary; raw sources remain recoverable.
-    instruction = {"role": "system", "content": instructions +
-                   f"\n输出最多 {output_chars} 字符。"}
+    instruction = {"role": "system", "content": instructions}
     overhead = estimate_tokens(instruction) + estimate_tokens(guidance) + 200
     # Even four-byte Unicode characters fit this estimated input budget.
     chunk_chars = max(1, (input_tokens - overhead) * 3 // 4)
@@ -196,8 +195,6 @@ async def summarize(provider, model, effort, rendered: str, guidance: str,
         result = await provider.complete_text([instruction, {"role": "user", "content": prompt}], model, effort)
         if not result or not result.strip():
             raise RuntimeError("摘要返回为空")
-        if len(result) > output_chars:
-            raise ValueError("摘要超过工作状态预算，保留原上下文")
         return result.strip()
 
     while len(rendered) > chunk_chars:
@@ -263,9 +260,8 @@ async def compact_history(messages, *, provider, ctx, model, effort,
                     evidence_excerpt(json.dumps(state_snapshot(ctx), ensure_ascii=False), 4000) +
                     f"\n原始消息已归档，批次 {batch}，可用 history_search/history_read 恢复。\n待整理历史：\n")
         input_budget = max(1024, int((context_limit or 100_000) * 0.6))
-        output_chars = max(800, min(10000, target // 3))
         summary = await summarize(provider, model, effort, rendered, guidance,
-                                  input_tokens=input_budget, output_chars=output_chars)
+                                  input_tokens=input_budget)
         memory = {"role": "system", "ddtui_kind": "explore_summary" if protected_prefix else "history_summary",
                   "content": "# 历史摘要（当前工作状态；原始证据可检索）\n\n" + summary,
                   "history_batch": batch}
@@ -306,7 +302,7 @@ async def auto_compact(messages, *, provider, ctx, model, effort, tools,
         ctx.compact_retry_after = 0
     ctx.context_model = model
     estimate, available = request_pressure(ctx, messages, tools, context_limit)
-    trigger = min(int(context_limit * threshold), available)
+    trigger = min(int(context_limit * threshold) if threshold <= 1 else int(threshold), available)
     if estimate < trigger or estimate < ctx.compact_retry_after:
         return None
     # Avoid repeated failed summaries on unchanged or irreducible input. New

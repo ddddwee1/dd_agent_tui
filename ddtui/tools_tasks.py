@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import signal
 import subprocess
@@ -141,6 +142,7 @@ def _task_registry_payload(task: AsyncTask) -> dict:
         "notify_on_complete": task.notify_on_complete,
         "notice_time": task.notice_time,
         "notice_count": task.notice_count,
+        "last_notice_output": task.last_notice_output,
         "artifact_hashes": task.artifact_hashes,
         "experiment_id": task.experiment_id,
         "next_notice_at": _iso_from_ts(
@@ -270,6 +272,7 @@ def recover_tasks_for_session(ctx: ToolContext, session_id: str) -> list[AsyncTa
             notice_count=_clamp_int(
                 payload.get("notice_count"), 0, 0, 10**9
             ),
+            last_notice_output=str(payload.get("last_notice_output") or ""),
             artifact_hashes={
                 str(key): str(value)
                 for key, value in (payload.get("artifact_hashes") or {}).items()
@@ -396,6 +399,22 @@ def _notice_event(task: AsyncTask) -> str:
     )
 
 
+def _notice_output_fingerprint(task: AsyncTask) -> str:
+    """Check size plus a bounded tail, including same-size progress rewrites."""
+    try:
+        with task.output_path.open("rb") as output:
+            output.seek(0, 2)
+            size = output.tell()
+            if size == 0:
+                return ""
+            output.seek(max(0, size - 8192))
+            return hashlib.sha256(str(size).encode() + b"\0" + output.read(8192)).hexdigest()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        return f"output-read-error:{exc.errno}"
+
+
 def collect_task_events(ctx: ToolContext) -> list[str]:
     """Return running notices and completion events for notified tasks."""
     events: list[str] = []
@@ -411,8 +430,12 @@ def collect_task_events(ctx: ToolContext) -> list[str]:
                 task.next_notice_at = task.started_at + task.notice_time
             if now < task.next_notice_at:
                 continue
-            task.notice_count += 1
             task.next_notice_at = now + task.notice_time
+            fingerprint = _notice_output_fingerprint(task)
+            if fingerprint == task.last_notice_output:
+                continue
+            task.last_notice_output = fingerprint
+            task.notice_count += 1
             events.append(_notice_event(task))
             _write_registry(task)
             continue
@@ -566,7 +589,7 @@ def tool_task_start(
                 "remains, call task_pause(task_ids=["
                 f"'{task_id}'"
                 "]) to park. The runtime will inject [Async task notice] "
-                "while it is still running and [Async task complete] when "
+                "when new output appears while running, and [Async task complete] when "
                 "it exits, then wake you to inspect output with "
                 "task_check/task_read and continue."
             )

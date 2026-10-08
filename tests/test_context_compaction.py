@@ -120,7 +120,7 @@ def test_pending_compact_self_batch_kept_with_its_reasoning():
     assert all("ddtui_kind" not in m for m in _messages_for_wire(candidate))
 
 
-@pytest.mark.parametrize("summary", ["", "x" * 20000])
+@pytest.mark.parametrize("summary", ["", "   "])
 def test_invalid_summary_does_not_change_history(summary):
     messages = long_task()
     before = copy.deepcopy(messages)
@@ -128,6 +128,18 @@ def test_invalid_summary_does_not_change_history(summary):
         compact(messages, provider=Provider(summary))
     assert messages == before
     assert search_archive("test", "sentinel-0")["matches"]
+
+
+def test_summary_over_former_character_limit_is_accepted_in_full():
+    summary = "保留必要工作记录。" * 2500
+    provider = Provider(summary)
+    candidate, stats = compact(long_task(), provider=provider)
+    memory = next(m for m in candidate if m.get("ddtui_kind") == "history_summary")
+    assert memory["content"].endswith(summary)
+    assert stats["after_tokens"] < stats["before_tokens"]
+    assert provider.calls
+    assert all("输出最多" not in messages[0]["content"]
+               for messages, _, _ in provider.calls)
 
 
 def test_archive_failure_never_calls_model_or_changes_history(monkeypatch):
@@ -204,7 +216,7 @@ def test_stable_explore_anchor_survives_preceding_message_removal():
 def test_hierarchical_summarizer_bounds_requests():
     provider = Provider("small summary with source msg-ref")
     output = asyncio.run(cc.summarize(provider, "m", "e", "中文证据" * 8000, "current goal",
-                                      input_tokens=4000, output_chars=800))
+                                      input_tokens=4000))
     assert output
     assert len(provider.calls) > 2
     assert all(cc.estimate_tokens(messages) < 4000 for messages, _, _ in provider.calls)

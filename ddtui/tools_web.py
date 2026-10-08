@@ -26,6 +26,7 @@ from .config import (
     WEB_SEARCH_TIMEOUT,
 )
 from .state import ToolContext
+from .tool_output import limit_tool_output
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -106,8 +107,9 @@ def tool_web_fetch(
     returned verbatim. Binary types are refused. Size is capped both at
     the byte level (raw download) and the char level (returned string).
 
-    The truncation cap is `max_output_chars`, matching the bash/task
-    tools. `max_chars` is accepted as a backward-compatible alias.
+    The preview cap is `max_output_chars` (minimum 512), matching bash.
+    Full fetched text is archived before applying this cap.
+    `max_chars` is accepted as a backward-compatible alias.
     """
     # Canonical param is max_output_chars (consistent with bash/task_*);
     # max_chars kept as an alias so older callers keep working.
@@ -115,7 +117,7 @@ def tool_web_fetch(
     cap = WEB_FETCH_MAX_CHARS
     if cap_arg is not None:
         try:
-            cap = max(1, min(WEB_FETCH_HARD_CHAR_CAP, int(cap_arg)))
+            cap = max(512, min(WEB_FETCH_HARD_CHAR_CAP, int(cap_arg)))
         except (TypeError, ValueError):
             return f"Error: max_output_chars must be an integer, got {cap_arg!r}"
 
@@ -199,15 +201,13 @@ def tool_web_fetch(
         text = body
 
     notes: list[str] = []
-    if len(text) > cap:
-        text = text[:cap]
-        notes.append(f"truncated at {cap} chars")
     if truncated_bytes:
         notes.append(f"raw response exceeded {WEB_FETCH_MAX_BYTES // 1000} KB")
     suffix = f"\n\n…[{'; '.join(notes)}]" if notes else ""
 
     header = f"GET {final_url} → {status} ({ctype or 'unknown content-type'})"
-    return f"{header}\n\n{text}{suffix}"
+    return limit_tool_output(ctx, f"{header}\n\n{text}{suffix}", name="web_fetch",
+                             arguments={"url": url}, max_chars=cap)
 
 
 _BRAVE_API_KEY: str | None = None

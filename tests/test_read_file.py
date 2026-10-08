@@ -4,7 +4,9 @@ import re
 
 import pytest
 
-from ddtui.config import READ_FILES_MAX_FILES, READ_FILES_MAX_TOTAL_CHARS
+from ddtui.config import (READ_FILE_MAX_LINES, READ_FILE_MAX_LINE_CHARS,
+                          READ_FILE_MAX_TOTAL_CHARS, READ_FILES_MAX_FILES, READ_FILES_MAX_TOTAL_CHARS)
+from ddtui.history_archive import read_archive
 from ddtui.state import ToolContext
 from ddtui.tools_files import tool_read_file, tool_read_files, tool_write_file
 
@@ -32,13 +34,49 @@ def test_pagination_keeps_absolute_line_numbers(ctx, tmp_path):
     assert lines[1] == "     2\tbeta"
 
 
+def test_ordinary_source_files_fit_without_batch_clipping(ctx, tmp_path):
+    paths = ["a.py", "b.py", "c.py"]
+    content = "\n".join(f"value_{i} = '" + "x" * 40 + "'" for i in range(400))
+    for path in paths:
+        (tmp_path / path).write_text(content)
+    result = tool_read_files(ctx, [{"path": path} for path in paths])
+    assert len(result) > 32000
+    assert result.count("lines 1-400 of 400") == len(paths)
+    assert result.count("value_399 =") == len(paths)
+    assert "capped" not in result and "batch cap" not in result
+    assert "history_read(" not in result
+
+
+def test_default_page_and_resume(ctx, tmp_path):
+    page = READ_FILE_MAX_LINES
+    total = page * 2 + 1
+    (tmp_path / "pages.txt").write_text("x\n" * total)
+    first = tool_read_file(ctx, "pages.txt")
+    assert f"lines 1-{page} of {total}" in first
+    assert f"continue with offset={page + 1}" in first
+    second = tool_read_file(ctx, "pages.txt", offset=page + 1)
+    assert f"lines {page + 1}-{page * 2} of {total}" in second
+    assert f"continue with offset={total}" in second
+
+
 def test_long_line_clipped(ctx, tmp_path):
     (tmp_path / "minified.js").write_text("x" * 50_000 + "\nshort\n")
     out = tool_read_file(ctx, "minified.js")
     first = out.splitlines()[1]
-    assert len(first) < 3000
+    assert len(first) < READ_FILE_MAX_LINE_CHARS + 100
     assert "[line clipped; 50000 chars total]" in first
     assert "     2\tshort" in out
+    assert len(out) <= READ_FILE_MAX_TOTAL_CHARS
+    # The clipped part is recoverable without re-reading a now-changed file.
+    (tmp_path / "minified.js").write_text("changed")
+    start, chunks = 0, []
+    while True:
+        page = read_archive(ctx.session_id, out.ref, start=start)
+        chunks.append(page["text"])
+        start = page["next_start"]
+        if start is None:
+            break
+    assert "x" * 50_000 in "".join(chunks)
 
 
 def test_total_cap_with_resume_hint(ctx, tmp_path):
@@ -46,11 +84,21 @@ def test_total_cap_with_resume_hint(ctx, tmp_path):
         "\n".join(f"line {i} " + "y" * 100 for i in range(1, 1001))
     )
     out = tool_read_file(ctx, "big.txt")
-    assert len(out) < 70_000
+    assert len(out) <= READ_FILE_MAX_TOTAL_CHARS
     m = re.search(r"continue with offset=(\d+)", out)
     assert m, "resume hint missing"
     out2 = tool_read_file(ctx, "big.txt", offset=int(m.group(1)))
     assert out2.splitlines()[1].startswith(f"{int(m.group(1)):6d}\t")
+
+
+def test_small_configured_page_keeps_continuation_hint(ctx, tmp_path, monkeypatch):
+    monkeypatch.setattr("ddtui.tools_files.READ_FILE_MAX_TOTAL_CHARS", 2000)
+    (tmp_path / "long.txt").write_text("x" * 10000 + "\n" + "y" * 10000)
+    out = tool_read_file(ctx, "long.txt")
+    assert len(out) <= 2000
+    assert "line clipped" in out
+    assert "continue with offset=2" in out
+    assert "history_read(" in out
 
 
 def test_read_files_preserves_order_ranges_and_partial_errors(ctx, tmp_path):

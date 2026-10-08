@@ -124,21 +124,25 @@ CODEX_OAUTH_CLIENT_ID = _setting_str(
 # ───────── tool tunables ─────────
 
 BASH_TIMEOUT = 30
-BASH_OUTPUT_MAX_CHARS = 10_000   # truncate huge stdout/stderr
+BASH_OUTPUT_MAX_CHARS = max(512, _setting_int("DDTUI_BASH_OUTPUT_MAX_CHARS", default=32_000))
+# Generous per-result guards; accumulated history is normally managed by the
+# model's context-window pressure, not an unrelated small character budget.
+TOOL_OUTPUT_MAX_CHARS = max(512, _setting_int("DDTUI_TOOL_OUTPUT_MAX_CHARS", default=128_000))
+TOOL_HISTORY_MAX_CHARS = max(0, _setting_int("DDTUI_TOOL_HISTORY_MAX_CHARS", default=0))
+TOOL_HISTORY_SNIPPET_CHARS = max(512, _setting_int("DDTUI_TOOL_HISTORY_SNIPPET_CHARS", default=8_000))
 # A foreground bash command that ran at least this long gets a note in
 # its result steering the model toward task_start next time — teaching
 # at the moment of the mistake, since intent can't be checked upfront.
 BASH_SLOW_COMMAND_SECONDS = 30
-READ_FILE_MAX_LINES = 2000        # default limit for read_file
+READ_FILE_MAX_LINES = max(1, _setting_int("DDTUI_READ_FILE_MAX_LINES", default=500))
 # A minified single-line file must not blow the context: individual lines
 # are clipped at MAX_LINE_CHARS, and the whole result is capped at
 # MAX_TOTAL_CHARS (the model is told which line to resume from).
-READ_FILE_MAX_LINE_CHARS = 2000
-READ_FILE_MAX_TOTAL_CHARS = 64_000
-# One read_files call should stay roughly within the same context footprint
-# as one maximally-sized read_file call, even when it contains many files.
+READ_FILE_MAX_LINE_CHARS = max(1, _setting_int("DDTUI_READ_FILE_MAX_LINE_CHARS", default=8_000))
+READ_FILE_MAX_TOTAL_CHARS = max(512, _setting_int("DDTUI_READ_FILE_MAX_TOTAL_CHARS", default=48_000))
+# Batches get more room so reading several files does not force tiny slices.
 READ_FILES_MAX_FILES = 8
-READ_FILES_MAX_TOTAL_CHARS = 64_000
+READ_FILES_MAX_TOTAL_CHARS = max(512, _setting_int("DDTUI_READ_FILES_MAX_TOTAL_CHARS", default=96_000))
 AGENTS_MD_FILENAME = "AGENTS.md"
 AGENTS_MD_MAX_CHARS = 16_000      # cap project guidelines so prompt stays sane
 # Force the pure-Python search/glob fallback even when a ripgrep binary
@@ -150,7 +154,7 @@ NO_RIPGREP = _setting_flag("DDTUI_NO_RIPGREP", default=False)
 NO_GITIGNORE = _setting_flag("DDTUI_NO_GITIGNORE", default=True)
 WEB_FETCH_TIMEOUT = 20
 WEB_FETCH_MAX_BYTES = 2_000_000   # cap raw download (~2 MB)
-WEB_FETCH_MAX_CHARS = 10_000      # cap returned text (matches bash output cap)
+WEB_FETCH_MAX_CHARS = 10_000      # cap returned text
 WEB_FETCH_HARD_CHAR_CAP = 50_000  # absolute upper bound when caller overrides
 
 # Web search (Brave). Key file is one line, ASCII; missing → web_search
@@ -262,17 +266,19 @@ DEEPSEEK_CONTEXT_LIMIT = CTX_SAFE_LIMIT
 # Check at complete tool-batch/request boundaries and quiet turn ends.
 # Provider usage calibrates estimates of newly appended output and schemas.
 # Automatic maintenance evicts large old tool results before summarization.
-# Checks run inside the turn worker (busy still held). Set DDTUI_AUTO_COMPACT_THRESHOLD=0 to
-# disable, or any fraction in (0, 0.95].
-_raw_auto_compact = str(_raw_setting("DDTUI_AUTO_COMPACT_THRESHOLD") or "").strip()
+# Checks run inside the turn worker (busy still held). Default: 500,000 tokens.
+# Set DDTUI_AUTO_COMPACT_THRESHOLD=0 to disable, a fraction in (0, 0.95]
+# for a window-relative trigger, or a token count greater than 1.
+_raw_auto_compact = _setting_str("DDTUI_AUTO_COMPACT_THRESHOLD", "").strip()
 try:
+    _auto_compact_threshold = float(_raw_auto_compact) if _raw_auto_compact else 500_000
     AUTO_COMPACT_THRESHOLD = (
-        min(0.95, max(0.0, float(_raw_auto_compact)))
-        if _raw_auto_compact
-        else 0.80
+        int(_auto_compact_threshold)
+        if _auto_compact_threshold > 1
+        else min(0.95, max(0.0, _auto_compact_threshold))
     )
-except ValueError:
-    AUTO_COMPACT_THRESHOLD = 0.80
+except (ValueError, OverflowError):
+    AUTO_COMPACT_THRESHOLD = 500_000
 
 
 # ───────── /compact ─────────
@@ -291,10 +297,8 @@ COMPACT_TARGET_FRACTION = 0.55
 
 # ───────── subagent ─────────
 
-# Truncate the subagent's answer before it lands as a tool_result in
-# the parent — a chatty subagent shouldn't be able to blow out the
-# parent's context window in one shot.
-SUBAGENT_RESULT_MAX_CHARS = 20_000
+# Archive and preview auto-delivered subagent answers in the parent session.
+SUBAGENT_RESULT_MAX_CHARS = 6_000
 # Maximum number of live subagent sessions kept in memory at once.
 # spawn_agent at the cap returns an error asking the parent to
 # end_agent one first. A small bound is fine — long-tail use is the
@@ -314,6 +318,9 @@ SUBAGENT_REAP_INTERVAL_SEC = 60
 # an idle parent). The grace window lets an immediate agent_check
 # consume the result first, so the two delivery paths never double-send.
 SUBAGENT_READY_NOTIFY_DELAY = 2.0
+# Bound waiting even if a notification is lost; never kill the background job.
+SUBAGENT_PAUSE_TIMEOUT_SEC = 60.0
+SUBAGENT_PAUSE_MAX_TIMEOUT_SEC = 3600.0
 
 
 # ───────── conversation view ─────────
@@ -387,6 +394,9 @@ SYSTEM_PROMPT = """\
 - 需要长期保持的交互式会话（ssh、tmux、REPL、debugger）用 terminal_start 开常驻终端、terminal_send 输入、terminal_read 观察；不要反复用 bash 执行 ssh 'cmd' 做连续远端操作。
 - 文件编辑：单处精确替换用 edit_file（replace_all=true 替换全部出现），同一文件多处替换用 multi_edit，只有精确替换不适用（按行号大段插入/删除）才用 edit_lines；write_file 只用于新建文件或明确的整文件覆盖，覆盖已存在文件前必须先用 read_file/read_files 读过它。不要用 bash 拼接重定向改文件，除非编辑工具无法完成。
 - 已知需读取 2–8 个文件时优先用 read_files 一次读取；仍需分开调用 read_file 时要在同一轮一起发出，引擎会并行执行。read_file/read_files 输出每行带行号前缀；行号不是文件内容，写 old_string 时不要带上。
+- 一次发出当前已知、互不依赖的只读调用；有依赖的操作等前一步结果后再做。每次调用先明确它要解决的剩余问题；相同参数和结果没有新增证据时复用已有结论，不重复读同一段或搜索同一问题。需要原文时按返回引用调用 history_read。
+- 相同错误再次出现时先处理原因或改变假设；只有明确的瞬时故障、条件变化或用户要求才原样重试。工具重试提示不会替你判断任务完成。
+- 运行中通知只在输出变化时按 notice_time 的最小间隔推送，完成通知独立保留；安静不代表卡住或失败，不要用轮询补齐没有变化的通知。
 - 长 Markdown 先用 read_doc 看目录/目标章节，再用 follow_doc_link 沿当前推理明确选中的链接前进；不要自动遍历整棵文档树，源码仍可用 read_file/search_content 按需逃逸。
 - 子 agent 是异步的：spawn_agent/chat_agent 立即返回、不直接给答案。结果完成后会像任务通知一样自动送达（[Subagent result] 消息）；需要查看状态/领取已就绪输出时用非阻塞 agent_check(session_id)，不要阻塞等待。要并行就连发多个 spawn_agent；子 agent 跨轮保留记忆，同一任务复用会话、别反复 spawn；用完 end_agent 释放。
 
@@ -401,6 +411,7 @@ SYSTEM_PROMPT = """\
 - 回复简洁直接：先给结论或结果，再给必要依据；不要复述工具输出原文，不要冗长客套。
 - 引用代码位置用 文件路径:行号 格式（如 ddtui/app.py:120）。
 - 改完代码要验证：能编译、能跑测试或实际运行过再说完成；验证不过就如实报告失败和原因，不要声称完成。
+- 动手前明确验收条件与必要验证；条件满足、所需检查通过且没有未解决证据冲突时直接总结交付。只有新改动、新失败、未解决风险或用户要求才扩大/重复验证；单个命令成功不能替代整个任务的验收。
 - 不可逆或影响面大的操作（删除大量文件、覆盖未读过的内容、git push、对外发布）先向用户确认；需求含糊时先澄清关键歧义再动手；自己能查到的信息不要问用户。
 - 不要主动 git commit / git push，除非用户明确要求。
 
@@ -452,6 +463,7 @@ SUBAGENT_SYSTEM_PROMPT = f"""\
 - 长 Markdown 优先用 read_doc 读取目录/目标章节，并只跟随当前证据选中的显式链接；不要自动遍历所有链接。
 - 对项目特定命令、环境不确定时先 project_note_search；多步骤任务可用 todo_tool 管理进度。
 - 你没有 checkpoint，也不能再派生子 agent；需要等待后台任务时用 task_pause，不要用 task_wait。
+- task_pause 默认等待 {SUBAGENT_PAUSE_TIMEOUT_SEC:g} 秒，可用 timeout 指定秒数（大于 0、最多 {SUBAGENT_PAUSE_MAX_TIMEOUT_SEC:g}）。任务通知或等待超时都会唤醒你；超时不代表任务成功/失败，也不会停止任务。醒来后先检查状态，确认仍需等待时可再次 task_pause。
 """
 
 

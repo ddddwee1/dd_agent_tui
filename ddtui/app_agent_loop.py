@@ -20,11 +20,10 @@ import asyncio
 from functools import partial
 
 from rich.text import Text
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from .app_errors import _exception_block
-from .config import SUBAGENT_RESULT_MAX_CHARS
 from .engine import ToolOutcome, TurnEngine, TurnObserver
 from .runtime_messages import runtime_task_event_message
 from .tools import PARENT_TOOL_SCHEMAS
@@ -96,7 +95,10 @@ class ParentTurnObserver(TurnObserver):
         for w in (self._thinking, self._answer):
             if w is not None:
                 try:
-                    w.remove()
+                    if isinstance(w, ThinkingBlock):
+                        w.discard()
+                    else:
+                        w.remove()
                 except Exception:
                     pass
         self._thinking = None
@@ -442,11 +444,7 @@ class AppAgentLoopMixin:
                 )
             else:
                 result = self._end_subagent(args.get("session_id") or "")
-            if len(result) > SUBAGENT_RESULT_MAX_CHARS:
-                result = (
-                    result[:SUBAGENT_RESULT_MAX_CHARS]
-                    + f"\n…[+{len(result) - SUBAGENT_RESULT_MAX_CHARS} chars truncated]"
-                )
+            # The shared engine archives and budgets this result before commit.
             return result
 
         return None
@@ -457,7 +455,7 @@ class AppAgentLoopMixin:
         """Mirror a todo_tool call into the sidebar TodoBlock; fade it
         out once every item is completed."""
         items = args.get("items", []) if isinstance(args, dict) else []
-        sidebar = self.query_one("#sidebar", Vertical)
+        sidebar = self.query_one("#sidebar", VerticalScroll)
         self._cancel_dismiss()
         if self._todo_block is None or not self._todo_block.is_mounted:
             self._todo_block = TodoBlock()

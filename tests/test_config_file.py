@@ -44,7 +44,7 @@ def load_config(tmp_path):
 def test_defaults_when_no_file(load_config):
     c = load_config()
     assert c.DEEPSEEK_MODEL == "deepseek-v4-flash"
-    assert c.AUTO_COMPACT_THRESHOLD == 0.80
+    assert c.AUTO_COMPACT_THRESHOLD == 500_000
     assert c.CONFIG_FILE_KEY_COUNT == 0
     assert c.CONFIG_FILE_ERROR == ""
     assert c.CONFIG_FILE_UNUSED_KEYS == ()
@@ -64,6 +64,20 @@ def test_env_overrides_file(load_config):
     )
     assert c.AUTO_COMPACT_THRESHOLD == 0.5
     # Env-shadowed keys still count as consumed, not as typos.
+    assert c.CONFIG_FILE_UNUSED_KEYS == ()
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("500000", 500_000),
+    ('"250000"', 250_000),
+    ("0", 0),
+    ("0.99", 0.95),
+    ('"invalid"', 500_000),
+    ('""', 500_000),
+])
+def test_auto_compact_token_settings_and_fallback(load_config, value, expected):
+    c = load_config(f"DDTUI_AUTO_COMPACT_THRESHOLD = {value}\n")
+    assert c.AUTO_COMPACT_THRESHOLD == expected
     assert c.CONFIG_FILE_UNUSED_KEYS == ()
 
 
@@ -103,3 +117,39 @@ def test_unknown_keys_reported(load_config):
     )
     assert c.CONFIG_FILE_UNUSED_KEYS == ("DDTUI_AUTOCOMPACT_TRESHOLD",)
     assert c.AUTO_COMPACT_THRESHOLD == 0.3
+
+
+def test_output_budgets_are_configurable(load_config):
+    values = {
+        "BASH_OUTPUT_MAX_CHARS": 64000,
+        "READ_FILE_MAX_LINES": 1000,
+        "READ_FILE_MAX_LINE_CHARS": 16000,
+        "READ_FILE_MAX_TOTAL_CHARS": 96000,
+        "READ_FILES_MAX_TOTAL_CHARS": 192000,
+        "TOOL_OUTPUT_MAX_CHARS": 256000,
+        "TOOL_HISTORY_MAX_CHARS": 512000,
+        "TOOL_HISTORY_SNIPPET_CHARS": 16000,
+    }
+    c = load_config("\n".join(f"DDTUI_{key} = {value}" for key, value in values.items()),
+                    env={"DDTUI_BASH_OUTPUT_MAX_CHARS": "80000"})
+    for key, value in values.items():
+        assert getattr(c, key) == (80000 if key == "BASH_OUTPUT_MAX_CHARS" else value)
+    assert c.CONFIG_FILE_UNUSED_KEYS == ()
+
+
+def test_output_budget_defaults_and_invalid_settings(load_config):
+    c = load_config()
+    assert c.BASH_OUTPUT_MAX_CHARS == 32000
+    assert c.READ_FILE_MAX_LINES == 500
+    assert c.READ_FILE_MAX_TOTAL_CHARS == 48000
+    assert c.READ_FILES_MAX_TOTAL_CHARS == 96000
+    assert c.TOOL_OUTPUT_MAX_CHARS >= c.READ_FILES_MAX_TOTAL_CHARS
+    assert c.TOOL_HISTORY_MAX_CHARS == 0
+    c = load_config('DDTUI_BASH_OUTPUT_MAX_CHARS = "invalid"\n'
+                    'DDTUI_READ_FILE_MAX_LINES = -1\n'
+                    'DDTUI_TOOL_OUTPUT_MAX_CHARS = 0\n'
+                    'DDTUI_TOOL_HISTORY_MAX_CHARS = -1\n')
+    assert c.BASH_OUTPUT_MAX_CHARS == 32000
+    assert c.READ_FILE_MAX_LINES == 1
+    assert c.TOOL_OUTPUT_MAX_CHARS == 512
+    assert c.TOOL_HISTORY_MAX_CHARS == 0

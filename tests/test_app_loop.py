@@ -5,7 +5,7 @@ import asyncio
 
 import ddtui.app as app_mod
 from ddtui.providers import LLMProvider, LLMStreamEvent, ToolCallDelta
-from ddtui.widgets import AssistantMessage, ThinkingBlock, ToolCallBlock
+from ddtui.widgets import AssistantMessage, ThinkingBlock, ToolCallBlock, ToolCallGroup
 from tests.conftest import REPO_ROOT
 
 
@@ -85,8 +85,12 @@ def test_full_turn_through_engine(monkeypatch):
             assert all(block.collapsed for block in thinking_blocks)
             assert all(block.collapsed for block in tool_blocks)
             conversation = app.query_one("#conversation")
-            assert all(block.parent is conversation for block in thinking_blocks)
-            assert all(block.parent is conversation for block in tool_blocks)
+            groups = list(app.query(ToolCallGroup))
+            assert [len(group.tool_calls) for group in groups] == [3]
+            assert groups[0].thinking_blocks == tuple(thinking_blocks)
+            assert all(group.parent is conversation for group in groups)
+            assert all(group.collapsed for group in groups)
+            assert all(block._tool_group in groups for block in tool_blocks)
             assert len(app.query(AssistantMessage)) == 1
             assert app._busy is False
 

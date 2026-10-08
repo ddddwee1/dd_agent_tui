@@ -29,6 +29,9 @@ from pathlib import Path
 
 from .runtime_state import pid_alive, read_json
 
+# Shared result classification for execution and read-only history rendering.
+TOOL_ERROR_PREFIXES = ("Error:", "Blocked:", "⛔")
+
 
 @dataclass
 class TerminalSession:
@@ -80,6 +83,8 @@ class AsyncTask:
     notice_time: float | None = None
     next_notice_at: float | None = None
     notice_count: int = 0
+    # Last notified output fingerprint; unchanged logs must not wake the model.
+    last_notice_output: str = ""
     # Optional immutable evidence binding captured by task_start. Paths
     # are resolved before launch and SHA-256 values describe the exact
     # bytes the command was asked to validate.
@@ -363,6 +368,9 @@ class SubagentSession:
     waiting_refs: list[str] = field(default_factory=list)
     waiting_reason: str = ""
     waiting_next_action: str = ""
+    waiting_timeout: float = 0.0
+    # Starts when the engine actually parks, after its tool batch commits.
+    waiting_deadline: float | None = None
     park_requested: bool = False
     # Explore-span state for THIS session — subagents can collapse
     # their own probing spans exactly like the parent (explore_core

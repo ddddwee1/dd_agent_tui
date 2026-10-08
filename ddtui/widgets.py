@@ -10,6 +10,7 @@ arguments or method calls (e.g. `TasksBlock.render_tasks(tasks)`,
 from __future__ import annotations
 
 import json
+from collections import Counter
 import os
 import subprocess
 import time
@@ -30,6 +31,7 @@ from .state import (
     AsyncTask,
     SubagentSession,
     TokenCounter,
+    TOOL_ERROR_PREFIXES,
     async_task_status,
 )
 
@@ -688,6 +690,8 @@ class ThinkingBlock(Collapsible):
 
     def __init__(self) -> None:
         self._buffer = ""
+        self._streaming = True
+        self._tool_group: ToolCallGroup | None = None
         self._body = Static("", id="thinking-body", markup=False)
         super().__init__(self._body, title="thinking · 流式中…", collapsed=True)
 
@@ -697,8 +701,11 @@ class ThinkingBlock(Collapsible):
         # Keep the (collapsed) title informative: a live character count
         # shows how much reasoning has streamed in without unfolding.
         self.title = f"thinking · {len(self._buffer):,} 字符 · 流式中…"
+        if self._tool_group is not None:
+            self._tool_group.refresh_title()
 
     def finalize(self, reasoning_tokens: int) -> None:
+        self._streaming = False
         chars = len(self._buffer)
         if reasoning_tokens:
             self.title = (
@@ -707,6 +714,14 @@ class ThinkingBlock(Collapsible):
             )
         else:
             self.title = f"thinking · {chars:,} 字符 (点击展开/折叠)"
+        if self._tool_group is not None:
+            self._tool_group.refresh_title()
+
+    def discard(self) -> None:
+        """Remove uncommitted reasoning and update its enclosing group."""
+        if self._tool_group is not None:
+            self._tool_group.discard_thinking(self)
+        self.remove()
 
     @property
     def text(self) -> str:
@@ -745,15 +760,18 @@ class ToolCallBlock(Collapsible):
         self._args = args
         self._result: str | None = None
         self._blocked = False
+        self._tool_group: ToolCallGroup | None = None
         # markup=False so result text containing '[' or ']' won't be parsed.
         self._body = Static(self._build_body(), id="toolcall-body", markup=False)
         super().__init__(self._body, title=self._build_title(), collapsed=True)
 
     def set_result(self, result: str, blocked: bool = False) -> None:
         self._result = result
-        self._blocked = blocked
+        self._blocked = blocked or result.startswith(TOOL_ERROR_PREFIXES)
         self._body.update(self._build_body())
         self.title = self._build_title()
+        if self._tool_group is not None:
+            self._tool_group.refresh_title()
 
     @property
     def is_pending(self) -> bool:
@@ -800,6 +818,107 @@ class ToolCallBlock(Collapsible):
             )
             parts.append(Text(snippet))
         return Group(*parts)
+
+
+class ToolCallGroup(Collapsible):
+    """Consecutive thinking, tool calls and diffs, collapsed by default.
+
+    Both live and replay views push the original detail widgets into this
+    container. Results still update their own blocks; the group title stays
+    informative without forcing open a group the user chose to collapse.
+    """
+
+    DEFAULT_CSS = """
+    ToolCallGroup {
+        height: auto;
+        margin: 0 0 1 0;
+        background: #272822;
+        border-left: thick #fd971f;
+        padding: 0;
+    }
+    ToolCallGroup > CollapsibleTitle { color: #ffb454; }
+    ToolCallGroup > CollapsibleTitle:hover { background: #3e3d32; }
+    ToolCallGroup > CollapsibleTitle:focus { background: #49483e; }
+    ToolCallGroup > Contents { padding: 0 0 0 1; }
+    ToolCallGroup .tool-group-items { height: auto; }
+    ToolCallGroup ToolCallBlock { border-left: none; margin-bottom: 0; }
+    ToolCallGroup ThinkingBlock { border-left: none; margin-bottom: 0; }
+    """
+
+    def __init__(self) -> None:
+        self._calls: list[ToolCallBlock] = []
+        self._thoughts: list[ThinkingBlock] = []
+        self._pending_details: list = []
+        self._items = Vertical(classes="tool-group-items")
+        super().__init__(self._items, title="工具调用", collapsed=True)
+
+    @property
+    def tool_calls(self) -> tuple[ToolCallBlock, ...]:
+        return tuple(self._calls)
+
+    @property
+    def thinking_blocks(self) -> tuple[ThinkingBlock, ...]:
+        return tuple(self._thoughts)
+
+    def discard_thinking(self, block: ThinkingBlock) -> None:
+        self._thoughts.remove(block)
+        block._tool_group = None
+        if block in self._pending_details:
+            self._pending_details.remove(block)
+        if self._thoughts or self._calls:
+            self.refresh_title()
+        else:
+            self.display = False
+            self.remove()
+
+    def add_block(self, block):
+        """Queue pre-mount children; otherwise return an awaitable mount."""
+        if isinstance(block, ToolCallBlock):
+            self._calls.append(block)
+        elif isinstance(block, ThinkingBlock):
+            self._thoughts.append(block)
+        if isinstance(block, (ThinkingBlock, ToolCallBlock)):
+            block._tool_group = self
+            self.refresh_title()
+        if self._items.is_mounted:
+            return self._items.mount(block)
+        self._pending_details.append(block)
+        return None
+
+    async def on_mount(self) -> None:
+        if self._pending_details:
+            pending, self._pending_details = self._pending_details, []
+            await self._items.mount(*pending)
+
+    def refresh_title(self) -> None:
+        pending = sum(call.is_pending for call in self._calls)
+        failed = sum(not call.is_pending and call._blocked for call in self._calls)
+        done = len(self._calls) - pending - failed
+        names = Counter(call._tool_name for call in self._calls)
+        preview = ", ".join(f"{name} ×{count}" if count > 1 else name
+                            for name, count in list(names.items())[:3])
+        if len(names) > 3:
+            preview += " …"
+        if len(self._calls) == 1:
+            preview += "  " + self._calls[0]._short_args()
+        status = []
+        if pending:
+            status.append(f"执行中 {pending}")
+        if done:
+            status.append(f"✓ {done}")
+        if failed:
+            status.append(f"异常 {failed}")
+        parts = []
+        if self._thoughts:
+            parts.append("思考与工具" if self._calls else "思考")
+            chars = sum(len(block.text) for block in self._thoughts)
+            parts.append(f"thinking {len(self._thoughts)} 段 · {chars:,} 字符")
+            if any(block._streaming for block in self._thoughts):
+                parts.append("思考中…")
+        if self._calls:
+            parts.append(f"工具调用 · {len(self._calls)} 项 · {preview} · {' / '.join(status)}")
+        title = " · ".join(parts)
+        self.title = title.replace("[", "\\[")
 
 
 class DiffBlock(Collapsible):
@@ -1214,8 +1333,33 @@ class SubagentTabPane(VerticalScroll):
         # the user prompt, so the DOM order ends up user → thinking →
         # answer → tools.
         self._pending_mounts: list = []
+        self._tail_tool_group: ToolCallGroup | None = None
+        self._transcript_ready = False
+
+    def _append_transcript(self, widget) -> None:
+        """Keep live, replay and pre-mount buffering on the same group path."""
+        if isinstance(widget, (ThinkingBlock, ToolCallBlock)):
+            if self._tail_tool_group is None:
+                self._tail_tool_group = ToolCallGroup()
+                if self._transcript_ready:
+                    self.mount(self._tail_tool_group)
+                else:
+                    self._pending_mounts.append(self._tail_tool_group)
+            self._tail_tool_group.add_block(widget)
+            return
+        if isinstance(widget, DiffBlock) and self._tail_tool_group is not None:
+            self._tail_tool_group.add_block(widget)
+            return
+        self._tail_tool_group = widget if isinstance(widget, ToolCallGroup) else None
+        if self._transcript_ready:
+            self.mount(widget)
+        else:
+            self._pending_mounts.append(widget)
 
     def on_mount(self) -> None:
+        # Textual dispatches on_mount before is_mounted becomes true. Use
+        # an explicit readiness flag so replay/flush doesn't requeue forever.
+        self._transcript_ready = True
         # Render history (system msgs skipped, user prompt mounted) FIRST
         # so the spawn prompt lands above any live widgets the round
         # task already queued via _pending_mounts.
@@ -1224,12 +1368,12 @@ class SubagentTabPane(VerticalScroll):
         except Exception:
             pass
         if self._pending_mounts:
-            for w in self._pending_mounts:
+            pending, self._pending_mounts = self._pending_mounts, []
+            for w in pending:
                 try:
-                    self.mount(w)
+                    self._append_transcript(w)
                 except Exception:
                     pass
-            self._pending_mounts.clear()
             self.scroll_end(animate=False)
 
     # ───────── live streaming hooks (called from _run_subagent_round) ─────────
@@ -1240,10 +1384,7 @@ class SubagentTabPane(VerticalScroll):
         if self._live_thinking is not None:
             return
         self._live_thinking = ThinkingBlock()
-        if self.is_mounted:
-            self.mount(self._live_thinking)
-        else:
-            self._pending_mounts.append(self._live_thinking)
+        self._append_transcript(self._live_thinking)
 
     def append_thinking(self, text: str) -> None:
         if self._live_thinking is None:
@@ -1261,10 +1402,7 @@ class SubagentTabPane(VerticalScroll):
         if self._live_answer is not None:
             return
         self._live_answer = AssistantMessage()
-        if self.is_mounted:
-            self.mount(self._live_answer)
-        else:
-            self._pending_mounts.append(self._live_answer)
+        self._append_transcript(self._live_answer)
 
     def append_answer(self, text: str) -> None:
         if self._live_answer is None:
@@ -1290,11 +1428,9 @@ class SubagentTabPane(VerticalScroll):
         block = ToolCallBlock(name, args)
         if tool_call_id:
             self._tool_blocks[tool_call_id] = block
+        self._append_transcript(block)
         if self.is_mounted:
-            self.mount(block)
             self.scroll_end(animate=False)
-        else:
-            self._pending_mounts.append(block)
         return block
 
     def set_tool_result(
@@ -1304,6 +1440,9 @@ class SubagentTabPane(VerticalScroll):
         if block is not None:
             block.set_result(result, blocked=blocked)
 
+    def add_tool_diff(self, path: str, diff: str) -> None:
+        self._append_transcript(DiffBlock(path, diff))
+
     def remove_live_blocks(self) -> None:
         """Drop the in-flight ThinkingBlock / AssistantMessage on a
         stream error or cancellation. Caller should follow up with
@@ -1311,7 +1450,7 @@ class SubagentTabPane(VerticalScroll):
         instead of a silent gap."""
         if self._live_thinking is not None:
             try:
-                self._live_thinking.remove()
+                self._live_thinking.discard()
             except Exception:
                 pass
             self._live_thinking = None
@@ -1324,14 +1463,13 @@ class SubagentTabPane(VerticalScroll):
         # Also drop anything that was queued pre-mount but not yet
         # flushed — that's the same in-flight content.
         self._pending_mounts.clear()
+        self._tail_tool_group = None
 
     def mount_exception_notice(self, text: str) -> None:
         block = Static(Text(text, style="bold #f92672"), markup=False)
+        self._append_transcript(block)
         if self.is_mounted:
-            self.mount(block)
             self.scroll_end(animate=False)
-        else:
-            self._pending_mounts.append(block)
 
     def mark_round_committed(self) -> None:
         """Advance _rendered_idx to len(sess.messages) so the 1 Hz
@@ -1363,7 +1501,7 @@ class SubagentTabPane(VerticalScroll):
             # not interesting in a transcript view.
             return
         if role == "user":
-            self.mount(UserBubble(m.get("content") or ""))
+            self._append_transcript(UserBubble(m.get("content") or ""))
             return
         if role == "assistant":
             rc = m.get("reasoning_content")
@@ -1376,12 +1514,12 @@ class SubagentTabPane(VerticalScroll):
                 # the main conversation) — the count in the title signals
                 # there's reasoning to unfold.
                 tb.finalize(0)
-                self.mount(tb)
+                self._append_transcript(tb)
             content = m.get("content") or ""
             if content:
                 am = AssistantMessage()
                 am.append_text(content)
-                self.mount(am)
+                self._append_transcript(am)
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
                 name = fn.get("name", "?")
@@ -1390,11 +1528,7 @@ class SubagentTabPane(VerticalScroll):
                     args = json.loads(raw_args)
                 except json.JSONDecodeError:
                     args = {"_raw": raw_args}
-                blk = ToolCallBlock(name, args)
-                self.mount(blk)
-                tcid = tc.get("id") or ""
-                if tcid:
-                    self._tool_blocks[tcid] = blk
+                self.add_tool_block(tc.get("id") or "", name, args)
             return
         if role == "tool":
             tcid = m.get("tool_call_id") or ""
@@ -1406,7 +1540,7 @@ class SubagentTabPane(VerticalScroll):
                 # Shouldn't happen — every tool message follows an
                 # assistant tool_call with the same id. Render a
                 # standalone fallback rather than dropping the data.
-                self.mount(Static(Text(f"[orphan tool result] {content}")))
+                self._append_transcript(Static(Text(f"[orphan tool result] {content}")))
             return
 
 

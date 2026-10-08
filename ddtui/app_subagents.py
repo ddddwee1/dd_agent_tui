@@ -19,6 +19,8 @@ from .config import (
     MAX_LIVE_SUBAGENTS,
     POST_SYSTEM_PROMPT,
     SUBAGENT_READY_NOTIFY_DELAY,
+    SUBAGENT_PAUSE_TIMEOUT_SEC,
+    SUBAGENT_PAUSE_MAX_TIMEOUT_SEC,
     SUBAGENT_RESULT_MAX_CHARS,
     SUBAGENT_SYSTEM_PROMPT,
 )
@@ -33,6 +35,7 @@ from .state import (
     kill_all_terminals,
 )
 from .tools import SUBAGENT_BLOCKED_TOOLS, SUBAGENT_TOOL_SCHEMAS
+from .tool_output import limit_tool_output
 from .tools_tasks import collect_task_events
 from .widgets import SubagentTabPane
 
@@ -134,6 +137,8 @@ class SubagentTurnObserver(TurnObserver):
                 pane.set_tool_result(
                     tc_id, outcome.content, blocked=not outcome.ok
                 )
+                if outcome.diff:
+                    pane.add_tool_diff(args.get("path", "?"), outcome.diff)
             except Exception:
                 pass
 
@@ -166,6 +171,7 @@ class AppSubagentMixin:
             if sess.park_requested:
                 sess.park_requested = False
                 sess.phase = "waiting"
+                sess.waiting_deadline = time.monotonic() + sess.waiting_timeout
                 if sess.pane is not None:
                     try:
                         sess.pane.refresh_from_session()
@@ -360,6 +366,8 @@ class AppSubagentMixin:
             if sess.phase == "idle":
                 sess.phase = "ready"
         finally:
+            if sess.phase != "waiting":
+                sess.waiting_deadline = None
             sess.task = None
 
     def _subagent_task_pause(self, sess: SubagentSession, args: dict) -> str:
@@ -368,8 +376,16 @@ class AppSubagentMixin:
         The tool result is committed to history first. Then the next
         before_round hook raises SubagentParked so the engine stops
         before another model request. Task events later wake this same
-        session and are injected as user messages.
+        session and are injected as user messages. A monotonic deadline
+        provides a wakeup even when no new task event arrives.
         """
+        timeout = args.get("timeout", SUBAGENT_PAUSE_TIMEOUT_SEC)
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not 0 < timeout <= SUBAGENT_PAUSE_MAX_TIMEOUT_SEC):
+            return (
+                "Error: timeout must be a finite number of seconds greater "
+                f"than 0 and at most {SUBAGENT_PAUSE_MAX_TIMEOUT_SEC:g}."
+            )
         raw_ids = args.get("task_ids") if isinstance(args, dict) else None
         if isinstance(raw_ids, str):
             task_ids = [raw_ids]
@@ -397,6 +413,8 @@ class AppSubagentMixin:
         sess.waiting_refs = task_ids
         sess.waiting_reason = str(args.get("reason") or "").strip()
         sess.waiting_next_action = str(args.get("next_action") or "").strip()
+        sess.waiting_timeout = float(timeout)
+        sess.waiting_deadline = None
         sess.park_requested = True
         sess.phase = "waiting"
         refs = ", ".join(task_ids)
@@ -406,8 +424,10 @@ class AppSubagentMixin:
         )
         return (
             f"[Subagent waiting] parked on task event(s): {refs}.{detail} "
+            f"timeout={timeout:g}s (starts after the current tool batch). "
             "The runtime will wake this subagent with [Async task notice] "
-            "or [Async task complete]."
+            "or [Async task complete], or on waiting timeout. "
+            "A waiting timeout does not stop the task; check its current state."
         )
 
     def _spawn_subagent(
@@ -624,9 +644,13 @@ class AppSubagentMixin:
                 f", reason={sess.waiting_reason!r}"
                 if sess.waiting_reason else ""
             )
+            timeout = (
+                f", wake_in={max(0.0, sess.waiting_deadline - time.monotonic()):.1f}s"
+                if sess.waiting_deadline is not None else ""
+            )
             return (
                 f"[session_id={sid}, status=waiting, turn={sess.turn}, "
-                f"tasks={refs}{reason}] Waiting for task notice/complete; "
+                f"tasks={refs}{reason}{timeout}] Waiting for task notice/complete or timeout; "
                 "the runtime will wake the subagent automatically."
             )
         if sess.last_result is None:
@@ -662,20 +686,21 @@ class AppSubagentMixin:
         return ""
 
     def _poll_subagent_task_events(self) -> int:
-        """Collect task notices/completions for live subagents.
+        """Collect task events and expire parked waits (called by the UI tick).
 
         Running subagents receive the events at the next model-round
         boundary. Parked subagents are woken immediately by scheduling
         a fresh round with the events already queued in `pending_events`.
-        Returns the number of task events collected for UI notification.
+        Already queued events also wake a newly parked session: a notice
+        may have arrived while its final tool batch was still committing.
+        Returns the number of new task/timeout events for UI notification.
         """
         n_events = 0
+        now = time.monotonic()
         for sess in self._live_subagents.values():
             if sess.phase not in ("thinking", "answering", "tool", "waiting"):
                 continue
             events = collect_task_events(sess.ctx)
-            if not events:
-                continue
             n_events += len(events)
             sess.pending_events.extend(events)
             if (
@@ -683,6 +708,22 @@ class AppSubagentMixin:
                 and sess.task is None
                 and sess.last_result is None
             ):
+                if (not sess.pending_events and sess.waiting_deadline is not None
+                        and now >= sess.waiting_deadline):
+                    refs = ", ".join(sess.waiting_refs)
+                    sess.pending_events.append(
+                        f"[Async task notice] task_pause timed out after {sess.waiting_timeout:g}s. "
+                        f"task_ids: {refs}. This is a waiting timeout, not task completion "
+                        "or failure; background tasks were not stopped. Use task_check/task_read "
+                        "to inspect current state and continue useful work, or call task_pause "
+                        "again if still waiting."
+                        + (f" Next action recorded before waiting: {sess.waiting_next_action}"
+                           if sess.waiting_next_action else "")
+                    )
+                    n_events += 1
+                if not sess.pending_events:
+                    continue
+                sess.waiting_deadline = None
                 sess.phase = "thinking"
                 sess.task = asyncio.create_task(self._run_subagent_task(sess))
         return n_events
@@ -708,11 +749,10 @@ class AppSubagentMixin:
             sess.last_result = None
             sess.phase = "idle"
             sess.last_active_at = now
-            if len(result) > SUBAGENT_RESULT_MAX_CHARS:
-                result = (
-                    result[:SUBAGENT_RESULT_MAX_CHARS]
-                    + f"\n…[+{len(result) - SUBAGENT_RESULT_MAX_CHARS} chars truncated]"
-                )
+            result = limit_tool_output(
+                self.ctx, result, name="subagent_result",
+                arguments={"session_id": sess.id}, max_chars=SUBAGENT_RESULT_MAX_CHARS,
+            )
             gauge = self._subagent_ctx_gauge(sess)
             events.append(
                 f"[Subagent result] session_id={sess.id} (turn "
