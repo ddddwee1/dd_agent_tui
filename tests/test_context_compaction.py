@@ -10,7 +10,7 @@ import ddtui.context_compaction as cc
 from ddtui.app_history import AppHistoryMixin
 from ddtui.explore_core import explore_start, explore_end, resolve_start_index, restore_explore_payload
 from ddtui.history_archive import archive_messages, read_archive, search_archive
-from ddtui.providers import _messages_for_wire
+from ddtui.providers import LLMStreamEvent, ToolCallDelta, _messages_for_wire
 from ddtui.state import ExploreState, ToolContext
 
 
@@ -22,9 +22,9 @@ class Provider:
     def context_limit_for_model(self, model):
         return 100_000
 
-    async def complete_text(self, messages, model, effort):
+    async def stream_text(self, messages, model, effort):
         self.calls.append((copy.deepcopy(messages), model, effort))
-        return self.summary
+        yield LLMStreamEvent(content=self.summary)
 
 
 def call(name, ident):
@@ -157,12 +157,28 @@ def test_archive_failure_never_calls_model_or_changes_history(monkeypatch):
 
 def test_cancellation_keeps_original_messages():
     class Cancelled(Provider):
-        async def complete_text(self, *args):
+        async def stream_text(self, *args):
+            yield LLMStreamEvent(content="未完成的摘要")
             raise asyncio.CancelledError()
     messages = long_task()
     before = copy.deepcopy(messages)
     with pytest.raises(asyncio.CancelledError):
         compact(messages, provider=Cancelled())
+    assert messages == before
+
+
+@pytest.mark.parametrize("event", [
+    LLMStreamEvent(reasoning="只有思路，没有摘要"),
+    LLMStreamEvent(tool_call=ToolCallDelta(index=0, name="bash", arguments="{}")),
+])
+def test_reasoning_and_tool_calls_cannot_be_committed_as_summary(event):
+    class InvalidProvider(Provider):
+        async def stream_text(self, *args):
+            yield event
+    messages = long_task()
+    before = copy.deepcopy(messages)
+    with pytest.raises(RuntimeError):
+        compact(messages, provider=InvalidProvider())
     assert messages == before
 
 
@@ -215,11 +231,19 @@ def test_stable_explore_anchor_survives_preceding_message_removal():
 
 def test_hierarchical_summarizer_bounds_requests():
     provider = Provider("small summary with source msg-ref")
+    progress = []
+    async def on_progress(kind, text):
+        progress.append((kind, text))
     output = asyncio.run(cc.summarize(provider, "m", "e", "中文证据" * 8000, "current goal",
-                                      input_tokens=4000))
+                                      input_tokens=4000, on_progress=on_progress))
     assert output
     assert len(provider.calls) > 2
     assert all(cc.estimate_tokens(messages) < 4000 for messages, _, _ in provider.calls)
+    starts = [text for kind, text in progress if kind == "start"]
+    assert len(starts) == len(provider.calls)
+    assert starts[0].startswith("分段摘要 · 第 1 轮 · 1/")
+    assert starts[-1] == "合并分段摘要…"
+    assert [text for kind, text in progress if kind == "content"] == [provider.summary] * len(starts)
 
 
 def test_no_reduction_rejected():

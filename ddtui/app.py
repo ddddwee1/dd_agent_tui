@@ -175,6 +175,8 @@ class AgentApp(
             self._confirm_tool_call if CONFIRM_WRITES else always_allow
         )
         self._busy = False
+        self._compacting = False
+        self._compaction_progress: dict | None = None
         # Follow-bottom state: when True, every mount/chunk-update
         # auto-scrolls the conversation to the end. Toggled by
         # `_handle_scroll_change` which watches the user's scroll position.

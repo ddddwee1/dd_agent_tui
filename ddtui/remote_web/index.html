@@ -685,6 +685,8 @@
     let reconnectAttempt = 0;
     let manualDisconnect = false;
     let streamingNodes = null;
+    let compaction = null;
+    let compactionNode = null;
     let streamingRenderFrame = 0;
     // Set while a "clear" command is in flight: the session re-registers
     // under a NEW session_id, so we watch sessions.list broadcasts for an
@@ -854,6 +856,7 @@
         messages = snap.messages || [];
         streaming = null;
         streamingNodes = null;
+        compaction = snap.compaction || null;
         renderStatus();
         renderMessages();
       } else if (message.type === "status.changed") {
@@ -891,6 +894,27 @@
           streaming.content += payload.text || "";
         }
         appendStreamingDelta(kind, payload.text || "");
+      } else if (message.type === "compaction.progress") {
+        if (!compaction) compaction = { content: "", reasoning: "" };
+        compaction.automatic = !!payload.automatic;
+        if (payload.kind === "start") {
+          compaction.content = compaction.reasoning = "";
+        }
+        if (payload.kind === "start" || payload.kind === "phase") {
+          compaction.phase = payload.text || "";
+        } else if (payload.kind === "reasoning") {
+          compaction.reasoning += payload.text || "";
+          compaction.reasoning = Array.from(compaction.reasoning).slice(-4000).join("");
+        } else if (payload.kind === "content") {
+          compaction.content += payload.text || "";
+        }
+        compaction.content_chars = payload.content_chars || 0;
+        compaction.reasoning_chars = payload.reasoning_chars || 0;
+        renderCompaction();
+        scrollLogToEnd();
+      } else if (message.type === "compaction.finished") {
+        compaction = null;
+        renderCompaction();
       } else if (message.type === "terminal.tail") {
         appendMessage("tool", `[${payload.terminal_id}] ${payload.tail || ""}`);
       } else if (message.type === "session.offline") {
@@ -900,6 +924,7 @@
           messages = [];
           streaming = null;
           streamingNodes = null;
+          compaction = null;
           notice("session disconnected");
           setMobileTab("sessions");
           renderStatus();
@@ -935,6 +960,7 @@
       messages = [];
       streaming = null;
       streamingNodes = null;
+      compaction = null;
       lastSeq = 0;
       toolCallNames = {};
       lastBusy = null;
@@ -948,6 +974,10 @@
 
     function renderStatus() {
       maybeNotifyIdle(activeStatus);
+      if (!activeStatus || !activeStatus.compacting) {
+        compaction = null;
+        renderCompaction();
+      }
       if (!activeStatus) {
         els.status.innerHTML = `<span class="pill">no session</span>`;
         renderTerminals([]);
@@ -957,7 +987,7 @@
       const terminals = activeStatus.terminals || [];
       const pills = [
         `<span class="pill online">${escapeHtml(activeStatus.session_id || activeSession)}</span>`,
-        `<span class="pill ${activeStatus.busy ? "busy" : ""}">${activeStatus.busy ? "busy" : "idle"}</span>`,
+        `<span class="pill ${activeStatus.busy ? "busy" : ""}">${activeStatus.compacting ? "📦 上下文压缩中…" : activeStatus.busy ? "busy" : "idle"}</span>`,
         `<span class="pill">${escapeHtml(activeStatus.provider || "")} ${escapeHtml(activeStatus.model || "")}</span>`,
       ];
       const ctx = contextPill(activeStatus);
@@ -1064,6 +1094,7 @@
     function renderMessages() {
       els.log.innerHTML = "";
       streamingNodes = null;
+      compactionNode = null;
       typingEl = null; // wiped with innerHTML; updateTyping rebuilds it
       const all = streaming ? [...messages, streaming] : messages;
       if (!all.length) {
@@ -1074,6 +1105,7 @@
           : `<div class="mark">❯_</div>选择一个 session 开始`;
         els.log.appendChild(empty);
         updateTyping();
+        renderCompaction();
         return;
       }
       for (let i = 0; i < all.length; i += 1) {
@@ -1102,7 +1134,29 @@
         renderMessage(message);
       }
       updateTyping();
+      renderCompaction();
       scrollLogToEnd();
+    }
+
+    function renderCompaction() {
+      if (!compaction) {
+        if (compactionNode) compactionNode.root.remove();
+        compactionNode = null;
+        return;
+      }
+      if (!compactionNode || !compactionNode.root.isConnected) {
+        compactionNode = createFoldableBlock("compaction", "", "compaction", "📦 上下文压缩中…");
+        compactionNode.root.open = true;
+      }
+      compactionNode.root.querySelector(".role").textContent =
+        `📦 ${compaction.automatic ? "自动压缩" : "压缩"} · ${compaction.phase || "准备压缩…"}`;
+      compactionNode.count.textContent =
+        `摘要 ${formatCount(compaction.content_chars || 0)} 字符 · 思路 ${formatCount(compaction.reasoning_chars || 0)} 字符`;
+      const parts = [];
+      if (compaction.reasoning) parts.push(`思路\n${compaction.reasoning}`);
+      if (compaction.content) parts.push(`摘要\n${compaction.content}`);
+      compactionNode.text.textContent = parts.join("\n\n") || "等待模型输出…";
+      els.log.appendChild(compactionNode.root);
     }
 
     function formatToolCall(tc) {

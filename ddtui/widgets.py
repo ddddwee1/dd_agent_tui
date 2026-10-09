@@ -728,6 +728,68 @@ class ThinkingBlock(Collapsible):
         return self._buffer
 
 
+class CompactionBlock(Collapsible):
+    """Live compaction preview, kept separate from assistant messages."""
+
+    DEFAULT_CSS = """
+    CompactionBlock {
+        margin: 0 0 1 0;
+        border-left: thick #66d9ef;
+    }
+    CompactionBlock > CollapsibleTitle { color: #66d9ef; }
+    """
+
+    def __init__(self, *, automatic: bool) -> None:
+        self.automatic = automatic
+        self.phase = "准备压缩…"
+        self.text = ""
+        self.reasoning = ""
+        self.outcome: str | None = None
+        self._body = Static(Text("等待模型输出…", style="dim"))
+        super().__init__(self._body, title="📦 上下文压缩中…", collapsed=False)
+
+    def update_progress(self, kind: str, text: str) -> None:
+        if kind == "start":
+            self.phase = text
+            self.text = self.reasoning = ""
+        elif kind == "phase":
+            self.phase = text
+        elif kind == "content":
+            self.text += text
+        elif kind == "reasoning":
+            self.reasoning += text
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        label = "自动压缩" if self.automatic else "压缩"
+        self.title = f"📦 {label} · {self.phase} · 摘要 {len(self.text):,} 字符"
+        if self.reasoning:
+            self.title += f" · 思路 {len(self.reasoning):,} 字符"
+        parts = []
+        if self.reasoning:
+            parts.append(Text(self.reasoning[-4000:], style="dim"))
+        if self.text:
+            parts.append(Markdown(_sanitize_table_pipes(self.text)))
+        self._body.update(Group(*(parts or [Text("等待模型输出…", style="dim")])))
+
+    def finish(self, outcome: str) -> None:
+        self.outcome = outcome
+        self.phase = {
+            "applied": "已完成",
+            "failed": "未应用，原上下文保留",
+            "cancelled": "已取消，原上下文保留",
+        }[outcome]
+        self._refresh_preview()
+        self.collapsed = True
+
+    def snapshot(self) -> dict:
+        return {
+            "automatic": self.automatic, "phase": self.phase,
+            "content": self.text, "reasoning": self.reasoning[-4000:],
+            "content_chars": len(self.text), "reasoning_chars": len(self.reasoning),
+        }
+
+
 class ToolCallBlock(Collapsible):
     """One tool call with its result. Default collapsed; click the
     header to toggle. Title shows `● <name> <short args> <status>`;
@@ -1178,6 +1240,7 @@ class SubagentsBlock(Static):
         "thinking":  ("◐", "bold #ae81ff"),
         "answering": ("▶", "bold #66d9ef"),
         "tool":      ("⚙", "bold #fd971f"),
+        "compacting": ("📦", "bold #66d9ef"),
         "waiting":   ("◌", "bold #e6db74"),
         "ready":     ("▣", "bold #a6e22e"),
         "idle":      ("○", "bold #75715e"),
@@ -1190,7 +1253,7 @@ class SubagentsBlock(Static):
         t.append("Subagents  ", style="bold #f92672")
         n_busy = sum(
             1 for s in sessions
-            if s.phase in ("thinking", "answering", "tool")
+            if s.phase in ("thinking", "answering", "tool", "compacting")
         )
         n_waiting = sum(1 for s in sessions if s.phase == "waiting")
         n_ready = sum(1 for s in sessions if s.phase == "ready")
@@ -1216,7 +1279,9 @@ class SubagentsBlock(Static):
             else:
                 elapsed = now - s.started_at
                 t.append(f"  {elapsed:5.1f}s", style="dim")
-            if s.last_tool and s.phase != "idle":
+            if s.phase == "compacting":
+                t.append("  · 上下文压缩中…", style="#66d9ef")
+            elif s.last_tool and s.phase != "idle":
                 t.append(f"  · {s.last_tool}", style="#fd971f")
             if s.tokens_in or s.tokens_out:
                 t.append(
@@ -1385,6 +1450,11 @@ class SubagentTabPane(VerticalScroll):
             return
         self._live_thinking = ThinkingBlock()
         self._append_transcript(self._live_thinking)
+
+    def add_compaction_block(self, block: CompactionBlock) -> None:
+        self._append_transcript(block)
+        if self.is_mounted:
+            self.scroll_end(animate=False)
 
     def append_thinking(self, text: str) -> None:
         if self._live_thinking is None:
@@ -2025,6 +2095,7 @@ class StatusBar(Static):
         *,
         context_limit: int | None = None,
         busy: bool = False,
+        compacting: bool = False,
         queued: int = 0,
         steer: int = 0,
         explore: bool = False,
@@ -2057,6 +2128,8 @@ class StatusBar(Static):
                 context_text = f"Context {last_total:,}"
             body = f"{location} · {context_text} · {counter.turns} 轮"
 
+        if compacting:
+            body = f"📦 上下文压缩中… · {body}"
         if explore:
             body += " · 🔍 explore: on"
         if queued:

@@ -337,7 +337,7 @@ class SubagentSession:
     model: str = ""
     effort: str = ""
     turn: int = 0            # cumulative round count across all chat calls
-    # phase ∈ {"thinking","answering","tool","waiting","ready","idle","done","error"}
+    # phase ∈ {"thinking","answering","tool","compacting","waiting","ready","idle","done","error"}
     # ready  = round finished, result waiting in last_result
     # idle   = result already consumed, awaiting next chat_agent
     # waiting= task_pause parked the round; task events will wake it

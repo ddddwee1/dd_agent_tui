@@ -7,12 +7,13 @@ import pytest
 
 import ddtui.explore_core as ax
 from ddtui.app_explore import AppExploreMixin
+from ddtui.providers import LLMStreamEvent
 from ddtui.state import ExploreState
 
 
 class FakeProvider:
-    async def complete_text(self, messages, model, effort):
-        return "## 问题\n找 bug\n\n## 结论\n在 calc.py:12"
+    async def stream_text(self, messages, model, effort):
+        yield LLMStreamEvent(content="## 问题\n找 bug\n\n## 结论\n在 calc.py:12")
 
 
 class FakeApp(AppExploreMixin):

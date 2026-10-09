@@ -14,6 +14,7 @@ import time
 
 from . import explore_core
 from .app_support import build_env_block, load_agents_md
+from .app_history import CompactionObserver
 from .config import (
     AUTO_COMPACT_THRESHOLD,
     MAX_LIVE_SUBAGENTS,
@@ -185,6 +186,8 @@ class AppSubagentMixin:
                 for event in events:
                     sess.messages.append(runtime_task_event_message(event))
 
+            progress = CompactionObserver(self, automatic=True, session=sess)
+            outcome = "failed"
             try:
                 protected = explore_core.resolve_start_index(sess.explore.active, sess.messages) if sess.explore.active else 0
                 await auto_compact(
@@ -192,10 +195,17 @@ class AppSubagentMixin:
                     model=sess.model or self.model, effort=sess.effort or self.effort,
                     tools=sess.sub_tools, context_limit=sess.context_limit,
                     threshold=AUTO_COMPACT_THRESHOLD, protected_prefix=protected,
+                    on_progress=progress.on_progress,
                 )
+                outcome = "applied"
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
             except Exception as exc:
                 sess.messages.append({"role": "system", "ddtui_kind": "context_recovery",
                                       "content": f"上下文压缩未应用，原历史保留：{exc}"})
+            finally:
+                progress.finish(outcome)
 
             sess.turn += 1
             sess.phase = "thinking"
@@ -254,11 +264,24 @@ class AppSubagentMixin:
                 # messages with a summary. Reuses _compact_messages so
                 # /compact and compact_self share the same prompt / cut
                 # policy. Archives are local conversation state.
+                progress = CompactionObserver(self, automatic=False, session=sess)
+                outcome = "failed"
                 try:
                     new_messages, stats = await self._compact_messages(
                         sess.messages, ctx=sess.ctx, model=sess.model,
                         effort=sess.effort, explore=sess.explore.active,
+                        on_progress=progress.on_progress,
                     )
+                    # Keep the list shared with the engine; only commit a
+                    # complete candidate that passed compaction validation.
+                    sess.messages[:] = new_messages
+                    sess.ctx.context_last_prompt = 0
+                    sess.ctx.context_last_estimate = 0
+                    sess.ctx.compact_retry_after = 0
+                    outcome = "applied"
+                except asyncio.CancelledError:
+                    outcome = "cancelled"
+                    raise
                 except ValueError as e:
                     return f"Error: {e}"
                 except Exception as e:
@@ -266,12 +289,8 @@ class AppSubagentMixin:
                         f"Error: compact_self failed: "
                         f"{type(e).__name__}: {e}"
                     )
-                # Slice-assign, NOT rebind: the engine holds a reference
-                # to this exact list object.
-                sess.messages[:] = new_messages
-                sess.ctx.context_last_prompt = 0
-                sess.ctx.context_last_estimate = 0
-                sess.ctx.compact_retry_after = 0
+                finally:
+                    progress.finish(outcome)
                 return (
                     f"已压缩：{stats['before_n']} → "
                     f"{stats['after_n']} 条消息，约 "

@@ -209,6 +209,9 @@ def test_compact_self_keeps_list_identity(playground):
         async def fake_compact(messages, **kwargs):
             assert kwargs["ctx"] is app._live_subagents["sub-1"].ctx
             assert kwargs["model"] == "parent-model"
+            await kwargs["on_progress"]("start", "生成工作状态摘要…")
+            await kwargs["on_progress"]("content", "摘要片段")
+            assert app._live_subagents["sub-1"].phase == "compacting"
             kept = [m for m in messages if m["role"] == "system"]
             kept.append({"role": "system", "content": "# 历史摘要\n（压缩）"})
             return kept, {"before_n": len(messages), "after_n": len(kept), "saved": 12345}
@@ -253,8 +256,8 @@ def test_subagent_explore_full_span(playground, tmp_path, monkeypatch):
                 for ev in self.rounds.pop(0):
                     yield ev
 
-            async def complete_text(self, messages, model, effort):
-                return "## 结论\n配置在 config.py 加载"
+            async def stream_text(self, messages, model, effort):
+                yield LLMStreamEvent(content="## 结论\n配置在 config.py 加载")
 
         app = FakeApp(playground)
         app.provider = ExploreProvider()

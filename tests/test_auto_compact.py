@@ -13,10 +13,11 @@ from ddtui.state import ToolContext
 from tests.test_context_compaction import Provider, long_task
 
 
-def run(messages, ctx, provider=None, *, threshold=.75, limit=100_000, tools=()):
+def run(messages, ctx, provider=None, *, threshold=.75, limit=100_000, tools=(), on_compacting=None):
     return asyncio.run(cc.auto_compact(messages, provider=provider or Provider(), ctx=ctx,
                                       model="m", effort="low", tools=tools,
-                                      context_limit=limit, threshold=threshold))
+                                      context_limit=limit, threshold=threshold,
+                                      on_compacting=on_compacting))
 
 
 def test_single_user_long_turn_evicts_outputs_without_llm_call():
@@ -24,7 +25,9 @@ def test_single_user_long_turn_evicts_outputs_without_llm_call():
     ctx = ToolContext(work_dir=".", session_id="long")
     provider = Provider()
     shared = messages
-    stats = run(messages, ctx, provider)
+    states = []
+    stats = run(messages, ctx, provider, on_compacting=states.append)
+    assert states == [True, False]
     assert stats["mode"] == "tool_eviction"
     assert not provider.calls
     assert stats["after_tokens"] <= stats["target_tokens"]
@@ -37,9 +40,11 @@ def test_single_user_long_turn_evicts_outputs_without_llm_call():
 def test_below_threshold_and_disabled_do_not_archive_or_summarize():
     ctx = ToolContext(work_dir=".", session_id="disabled")
     provider = Provider()
-    assert run(long_task(1, 10), ctx, provider) is None
-    assert run(long_task(), ctx, provider, threshold=0) is None
-    assert run(long_task(), ctx, provider, limit=None) is None
+    states = []
+    assert run(long_task(1, 10), ctx, provider, on_compacting=states.append) is None
+    assert run(long_task(), ctx, provider, threshold=0, on_compacting=states.append) is None
+    assert run(long_task(), ctx, provider, limit=None, on_compacting=states.append) is None
+    assert not states
     assert not provider.calls
     assert ctx.compact_retry_after == 0
 
@@ -93,21 +98,24 @@ def test_huge_latest_result_can_be_evicted():
     assert "FAILED sentinel-0" in messages[-1]["content"]
 
 
-def test_failure_leaves_history_and_backs_off(monkeypatch):
+@pytest.mark.parametrize("error", [RuntimeError("summarizer down"), asyncio.CancelledError()])
+def test_failure_leaves_history_and_backs_off(monkeypatch, error):
     calls = []
+    states = []
     async def fail(*a, **k):
+        assert states == [True]
         calls.append(1)
-        raise RuntimeError("summarizer down")
+        raise error
     monkeypatch.setattr(cc, "compact_history", fail)
     ctx = ToolContext(work_dir=".", session_id="failed")
     messages = long_task()
     before = copy.deepcopy(messages)
-    try:
-        run(messages, ctx)
-    except RuntimeError:
-        pass
+    with pytest.raises(type(error)):
+        run(messages, ctx, on_compacting=states.append)
     assert messages == before
-    assert run(messages, ctx) is None
+    assert states == [True, False]
+    assert run(messages, ctx, on_compacting=states.append) is None
+    assert states == [True, False]
     assert len(calls) == 1
 
 
@@ -148,11 +156,14 @@ def test_parent_wrapper_saves_and_marks_journal_after_success():
             self.model, self.effort = "m", "low"
             self._active_explore = None
             self.saved, self.journal, self.mounted = 0, {}, []
+            self.compaction_states = []
         def _context_limit(self): return 100_000
+        def _set_compacting(self, value): self.compaction_states.append(value)
         async def _autosave_conversation(self): self.saved += 1
         def _write_turn_journal(self, **kwargs): self.journal.update(kwargs)
         async def _mount_widget(self, widget): self.mounted.append(widget)
     app = App()
     asyncio.run(app._auto_compact_if_needed())
     assert app.saved == 1 and app.journal["context_compacted"]
+    assert app.compaction_states == [True, False]
     assert app.mounted

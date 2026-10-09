@@ -216,6 +216,7 @@ class AppRemoteMixin:
             "model": self.model,
             "effort": self.effort,
             "busy": self._busy,
+            "compacting": getattr(self, "_compacting", False),
             "queued": len(self._queued),
             "steer": len(self._steer),
             # Context pressure + runtime counts for the web status bar —
@@ -252,6 +253,7 @@ class AppRemoteMixin:
                 if isinstance(m, dict) and m.get("role") == "system"
             ),
             "messages": safe_json(visible_messages),
+            "compaction": safe_json(getattr(self, "_compaction_progress", None)),
             "updated_at": now_iso(),
         }
 

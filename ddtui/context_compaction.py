@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Awaitable, Callable
+from contextlib import aclosing
 
 from .config import (COMPACT_KEEP_RECENT_TURNS, COMPACT_RECENT_TOKENS,
                      COMPACT_TARGET_FRACTION, COMPACT_TOOL_SNIPPET_CHARS)
@@ -17,6 +19,7 @@ from .runtime_messages import RUNTIME_TASK_EVENT_KIND
 
 
 MEMORY_KINDS = {"history_summary", "context_recovery", "explore_summary"}
+CompactionProgress = Callable[[str, str], Awaitable[None]]
 _SIGNAL = re.compile(r"error|fail|exception|traceback|assert|exit.?code|return.?code|"
                      r"passed|success|sha.?256|正确|失败|错误|耗时", re.I)
 
@@ -178,9 +181,15 @@ _SUMMARY_INSTRUCTIONS = """你是工作状态整理助手，直接输出中文�
 """
 
 
+async def _report_progress(callback: CompactionProgress | None, kind: str, text: str) -> None:
+    if callback is not None:
+        await callback(kind, text)
+
+
 async def summarize(provider, model, effort, rendered: str, guidance: str,
                     *, input_tokens: int,
-                    instructions: str = _SUMMARY_INSTRUCTIONS) -> str:
+                    instructions: str = _SUMMARY_INSTRUCTIONS,
+                    on_progress: CompactionProgress | None = None) -> str:
     # Bound each request, including very long single messages. Hierarchical
     # reduction is only used when necessary; raw sources remain recoverable.
     instruction = {"role": "system", "content": instructions}
@@ -190,25 +199,42 @@ async def summarize(provider, model, effort, rendered: str, guidance: str,
     if overhead >= input_tokens:
         raise ValueError("Context budget too small for compaction guidance")
 
-    async def one(text, *, partial=False):
+    async def one(text, label, *, partial=False):
         prompt = guidance + ("\n这是历史分段，保留引用供随后合并。\n" if partial else "\n") + text
-        result = await provider.complete_text([instruction, {"role": "user", "content": prompt}], model, effort)
-        if not result or not result.strip():
+        await _report_progress(on_progress, "start", label)
+        parts = []
+        async with aclosing(provider.stream_text([instruction, {"role": "user", "content": prompt}], model, effort)) as stream:
+            async for event in stream:
+                if event.tool_call is not None:
+                    raise RuntimeError("摘要生成不允许调用工具")
+                if event.reasoning:
+                    await _report_progress(on_progress, "reasoning", event.reasoning)
+                if event.content:
+                    parts.append(event.content)
+                    await _report_progress(on_progress, "content", event.content)
+        result = "".join(parts).strip()
+        if not result:
             raise RuntimeError("摘要返回为空")
-        return result.strip()
+        return result
 
+    round_n = 0
     while len(rendered) > chunk_chars:
+        round_n += 1
         pieces = [rendered[i:i + chunk_chars] for i in range(0, len(rendered), chunk_chars)]
-        reduced = "\n\n".join([await one(piece, partial=True) for piece in pieces])
+        reduced = "\n\n".join([
+            await one(piece, f"分段摘要 · 第 {round_n} 轮 · {i}/{len(pieces)}", partial=True)
+            for i, piece in enumerate(pieces, 1)
+        ])
         if len(reduced) >= len(rendered):
             raise ValueError("分段摘要未缩小，保留原上下文")
         rendered = reduced
-    return await one(rendered)
+    return await one(rendered, "合并分段摘要…" if round_n else "生成工作状态摘要…")
 
 
 async def compact_history(messages, *, provider, ctx, model, effort,
                           context_limit: int | None = None, tools=(),
-                          force: bool = True, protected_prefix: int = 0):
+                          force: bool = True, protected_prefix: int = 0,
+                          on_progress: CompactionProgress | None = None):
     original = list(messages)
     safe_boundaries(original)  # Reject malformed history before doing any work.
     before = history_tokens(original, tools)
@@ -225,10 +251,12 @@ async def compact_history(messages, *, provider, ctx, model, effort,
         raise ValueError("没有可压缩的完整历史段。")
 
     # Archive FIRST. Summary failure/cancellation leaves live history intact.
+    await _report_progress(on_progress, "phase", "归档原始历史…")
     batch, refs = archive_messages(ctx.session_id, original, reason="compact", state=state_snapshot(ctx))
     by_identity = {id(m): ref for m, ref in zip(original, refs)}
     recovery = recovery_message(ctx, batch, summary=False)
     # Low-cost eviction leaves protocol structure and exact recent exchanges.
+    await _report_progress(on_progress, "phase", "移出旧工具输出…")
     cut = choose_cut(body, recent_budget)
     lighter = []
     evicted = 0
@@ -261,13 +289,14 @@ async def compact_history(messages, *, provider, ctx, model, effort,
                     f"\n原始消息已归档，批次 {batch}，可用 history_search/history_read 恢复。\n待整理历史：\n")
         input_budget = max(1024, int((context_limit or 100_000) * 0.6))
         summary = await summarize(provider, model, effort, rendered, guidance,
-                                  input_tokens=input_budget)
+                                  input_tokens=input_budget, on_progress=on_progress)
         memory = {"role": "system", "ddtui_kind": "explore_summary" if protected_prefix else "history_summary",
                   "content": "# 历史摘要（当前工作状态；原始证据可检索）\n\n" + summary,
                   "history_batch": batch}
         recovery = recovery_message(ctx, batch, summary=True)
         candidate = prefix + fixed + [memory, recovery] + pinned + tail
         mode = "summary"
+    await _report_progress(on_progress, "phase", "校验压缩结果…")
     safe_boundaries(candidate)
     after = history_tokens(candidate, tools)
     if after >= before:
@@ -293,7 +322,9 @@ def request_pressure(ctx, messages, tools, context_limit: int) -> tuple[int, int
 
 
 async def auto_compact(messages, *, provider, ctx, model, effort, tools,
-                       context_limit, threshold, protected_prefix=0):
+                       context_limit, threshold, protected_prefix=0,
+                       on_compacting: Callable[[bool], None] | None = None,
+                       on_progress: CompactionProgress | None = None):
     if not context_limit or threshold <= 0:
         return None
     if ctx.context_model and ctx.context_model != model:
@@ -309,13 +340,20 @@ async def auto_compact(messages, *, provider, ctx, model, effort, tools,
     # growth gives another chance; manual /compact is never blocked by this.
     ctx.compact_retry_after = estimate + max(512, estimate // 10)
     calibration = max(1.0, estimate / max(1, history_tokens(messages, tools)))
-    candidate, stats = await compact_history(
-        messages, provider=provider, ctx=ctx, model=model, effort=effort,
-        context_limit=int(context_limit / calibration), tools=tools, force=False,
-        protected_prefix=protected_prefix,
-    )
-    messages[:] = candidate
-    ctx.context_last_prompt = 0
-    ctx.context_last_estimate = 0
-    ctx.compact_retry_after = 0 if stats["target_met"] else stats["after_tokens"] + max(512, stats["after_tokens"] // 10)
-    return stats
+    try:
+        if on_compacting is not None:
+            on_compacting(True)
+        candidate, stats = await compact_history(
+            messages, provider=provider, ctx=ctx, model=model, effort=effort,
+            context_limit=int(context_limit / calibration), tools=tools, force=False,
+            protected_prefix=protected_prefix,
+            on_progress=on_progress,
+        )
+        messages[:] = candidate
+        ctx.context_last_prompt = 0
+        ctx.context_last_estimate = 0
+        ctx.compact_retry_after = 0 if stats["target_met"] else stats["after_tokens"] + max(512, stats["after_tokens"] // 10)
+        return stats
+    finally:
+        if on_compacting is not None:
+            on_compacting(False)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime
@@ -13,7 +14,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Static
 
 from . import explore_core
-from .context_compaction import auto_compact, compact_history
+from .context_compaction import CompactionProgress, auto_compact, compact_history
 from .config import (
     AUTO_COMPACT_THRESHOLD,
     HISTORY_DIR,
@@ -36,6 +37,7 @@ from .tools_tasks import recover_tasks_for_session
 from .tools_checkpoint import tool_checkpoint_clear, tool_checkpoint_tool
 from .widgets import (
     AssistantMessage,
+    CompactionBlock,
     DiffBlock,
     ExploreSummaryBlock,
     MultilineInput,
@@ -65,6 +67,64 @@ def _next_ledger_id(entries: dict, saved_value, prefix: str) -> int:
         except ValueError:
             continue
     return max(saved, seen + 1)
+
+
+class CompactionObserver:
+    """Render progress without putting unfinished summaries in history."""
+
+    def __init__(self, app, *, automatic: bool, session=None) -> None:
+        self.app = app
+        self.automatic = automatic
+        self.session = session
+        self.block: CompactionBlock | None = None
+        self._previous_phase = session.phase if session is not None else None
+
+    async def on_progress(self, kind: str, text: str) -> None:
+        if self.block is None:
+            self.block = CompactionBlock(automatic=self.automatic)
+            if self.session is None:
+                await self.app._mount_widget(self.block)
+            else:
+                self.session.phase = "compacting"
+                if self.session.pane is not None:
+                    try:
+                        self.session.pane.add_compaction_block(self.block)
+                    except Exception:
+                        pass
+        self.block.update_progress(kind, text)
+        if self.session is not None:
+            if self.session.pane is not None:
+                try:
+                    self.session.pane.scroll_end(animate=False)
+                except Exception:
+                    pass
+            return
+        self.app._compaction_progress = self.block.snapshot()
+        try:
+            self.app._remote_emit("compaction.progress", {
+                "kind": kind, "text": text, "automatic": self.automatic,
+                "content_chars": len(self.block.text),
+                "reasoning_chars": len(self.block.reasoning),
+            })
+        except Exception:
+            pass
+        if getattr(self.app, "_follow_bottom", False):
+            view = self.app.query_one("#conversation", VerticalScroll)
+            view.call_after_refresh(view.scroll_end, animate=False)
+
+    def finish(self, outcome: str) -> None:
+        if self.block is None:
+            return
+        self.block.finish(outcome)
+        if self.session is not None:
+            if self.session.phase == "compacting":
+                self.session.phase = self._previous_phase
+            return
+        self.app._compaction_progress = None
+        try:
+            self.app._remote_emit("compaction.finished", {"outcome": outcome})
+        except Exception:
+            pass
 
 
 class AppHistoryMixin:
@@ -276,7 +336,8 @@ class AppHistoryMixin:
         return entries
 
     async def _compact_messages(
-        self, messages, *, ctx=None, model=None, effort=None, explore=None
+        self, messages, *, ctx=None, model=None, effort=None, explore=None,
+        on_progress: CompactionProgress | None = None,
     ) -> tuple[list[dict], dict]:
         """Build an archived, bounded candidate without changing live history."""
         ctx = ctx or self.ctx
@@ -288,15 +349,19 @@ class AppHistoryMixin:
             messages, provider=self.provider, ctx=ctx, model=model, effort=effort,
             context_limit=limit, tools=SUBAGENT_TOOL_SCHEMAS if ctx.is_subagent else PARENT_TOOL_SCHEMAS,
             protected_prefix=protected,
+            on_progress=on_progress,
         )
 
     async def _compact_worker(self) -> None:
+        progress = CompactionObserver(self, automatic=False)
+        outcome = "failed"
         self._set_busy(True)
         try:
-            await self._mount_widget(Static(Text("📦 正在归档并压缩历史…", style="bold #66d9ef")))
+            self._set_compacting(True)
             try:
                 candidate, stats = await self._compact_messages(
-                    self.messages, explore=self._active_explore
+                    self.messages, explore=self._active_explore,
+                    on_progress=progress.on_progress,
                 )
             except Exception as exc:
                 await self._mount_widget(Static(Text(
@@ -304,12 +369,19 @@ class AppHistoryMixin:
                 )))
                 return
             self.messages[:] = candidate
+            outcome = "applied"
             self.ctx.context_last_prompt = 0
             self.ctx.context_last_estimate = 0
             self.ctx.compact_retry_after = 0
             await self._autosave_conversation()
             await self._show_compaction_stats(stats, automatic=False)
+        except asyncio.CancelledError:
+            if outcome != "applied":
+                outcome = "cancelled"
+            raise
         finally:
+            progress.finish(outcome)
+            self._set_compacting(False)
             self._set_busy(False)
             self._refresh_status()
 
@@ -326,6 +398,7 @@ class AppHistoryMixin:
 
     async def _auto_compact_if_needed(self, *, model=None, effort=None) -> None:
         """Check before model requests and at quiet boundaries, never mid-batch."""
+        progress = CompactionObserver(self, automatic=True)
         try:
             protected = explore_core.resolve_start_index(self._active_explore, self.messages) if self._active_explore else 0
             stats = await auto_compact(
@@ -334,12 +407,19 @@ class AppHistoryMixin:
                 context_limit=self.provider.context_limit_for_model(model) if model else self._context_limit(),
                 threshold=AUTO_COMPACT_THRESHOLD,
                 protected_prefix=protected,
+                on_compacting=self._set_compacting,
+                on_progress=progress.on_progress,
             )
+        except asyncio.CancelledError:
+            progress.finish("cancelled")
+            raise
         except Exception as exc:
+            progress.finish("failed")
             await self._mount_widget(Static(Text(
                 f"自动压缩未应用，原上下文保留：{exc}", style="dim"
             )))
             return
+        progress.finish("applied")
         if stats:
             # A pre-compaction journal index cannot be used to truncate this
             # new view after a crash. Recovery must preserve the committed view.

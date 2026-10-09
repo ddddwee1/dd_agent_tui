@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
@@ -122,6 +123,14 @@ class LLMProvider:
     ) -> str:
         raise NotImplementedError
 
+    async def stream_text(
+        self, messages: list[dict], model: str, effort: str
+    ) -> AsyncIterator[LLMStreamEvent]:
+        """Stream a text-only request without exposing any tools."""
+        async with aclosing(self.stream(messages, [], model, effort)) as stream:
+            async for event in stream:
+                yield event
+
     async def stream(
         self,
         messages: list[dict],
@@ -200,45 +209,70 @@ class DeepSeekProvider(LLMProvider):
         model: str,
         effort: str,
     ) -> AsyncIterator[LLMStreamEvent]:
+        tool_options = {"tools": tools, "tool_choice": "auto"} if tools else {}
+        async for event in self._stream_response(
+            messages, model, **tool_options,
+            reasoning_effort=effort,
+            extra_body={"thinking": {"type": "enabled"}},
+        ):
+            yield event
+
+    async def stream_text(
+        self, messages: list[dict], model: str, effort: str
+    ) -> AsyncIterator[LLMStreamEvent]:
+        # Preserve complete_text's summarization settings; streaming alone
+        # must not switch DeepSeek summaries into thinking/tool mode.
+        async with aclosing(self._stream_response(messages, model, require_complete=True)) as stream:
+            async for event in stream:
+                yield event
+
+    async def _stream_response(
+        self, messages: list[dict], model: str, *, require_complete: bool = False, **options
+    ) -> AsyncIterator[LLMStreamEvent]:
         stream = await self.client.chat.completions.create(
             model=model,
             messages=_messages_for_wire(messages),
-            tools=tools,
-            tool_choice="auto",
             stream=True,
             stream_options={"include_usage": True},
-            reasoning_effort=effort,
-            extra_body={"thinking": {"type": "enabled"}},
+            **options,
         )
-        async for chunk in stream:
-            if getattr(chunk, "usage", None):
-                yield LLMStreamEvent(usage=chunk.usage)
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                yield LLMStreamEvent(reasoning=reasoning)
-            content = getattr(delta, "content", None)
-            if content:
-                yield LLMStreamEvent(content=content)
-            for tool_call in getattr(delta, "tool_calls", None) or []:
-                function = getattr(tool_call, "function", None)
-                yield LLMStreamEvent(
-                    tool_call=ToolCallDelta(
-                        index=tool_call.index
-                        if tool_call.index is not None
-                        else 0,
-                        id=tool_call.id,
-                        type=tool_call.type,
-                        name=getattr(function, "name", None)
-                        if function
-                        else None,
-                        arguments=getattr(function, "arguments", None)
-                        if function
-                        else None,
+        completed = False
+        async with stream:
+            async for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    yield LLMStreamEvent(usage=chunk.usage)
+                if not chunk.choices:
+                    continue
+                finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                if finish_reason in ("length", "content_filter"):
+                    raise RuntimeError(f"DeepSeek 流式输出未完成：{finish_reason}")
+                completed = completed or finish_reason == "stop"
+                delta = chunk.choices[0].delta
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    yield LLMStreamEvent(reasoning=reasoning)
+                content = getattr(delta, "content", None)
+                if content:
+                    yield LLMStreamEvent(content=content)
+                for tool_call in getattr(delta, "tool_calls", None) or []:
+                    function = getattr(tool_call, "function", None)
+                    yield LLMStreamEvent(
+                        tool_call=ToolCallDelta(
+                            index=tool_call.index
+                            if tool_call.index is not None
+                            else 0,
+                            id=tool_call.id,
+                            type=tool_call.type,
+                            name=getattr(function, "name", None)
+                            if function
+                            else None,
+                            arguments=getattr(function, "arguments", None)
+                            if function
+                            else None,
+                        )
                     )
-                )
+        if require_complete and not completed:
+            raise RuntimeError("DeepSeek 流式输出未完成：未收到结束标记")
 
 
 class CodexResponsesProvider(LLMProvider):
@@ -282,6 +316,19 @@ class CodexResponsesProvider(LLMProvider):
                 parts.append(event.content)
         return "".join(parts).strip()
 
+    async def stream_text(
+        self, messages: list[dict], model: str, effort: str
+    ) -> AsyncIterator[LLMStreamEvent]:
+        completed = False
+        async with aclosing(super().stream_text(messages, model, effort)) as stream:
+            async for event in stream:
+                # response.completed always emits a usage event, even when
+                # the backend omits token counts. EOF alone is not success.
+                completed = completed or event.usage is not None
+                yield event
+        if not completed:
+            raise RuntimeError("Codex 流式输出未完成：未收到完成事件")
+
     async def stream(
         self,
         messages: list[dict],
@@ -290,8 +337,9 @@ class CodexResponsesProvider(LLMProvider):
         effort: str,
     ) -> AsyncIterator[LLMStreamEvent]:
         payload = self._build_payload(messages, tools, model, effort)
-        async for event in self._stream_payload(payload, allow_refresh=True):
-            yield event
+        async with aclosing(self._stream_payload(payload, allow_refresh=True)) as stream:
+            async for event in stream:
+                yield event
 
     def _build_payload(
         self,
@@ -396,6 +444,10 @@ class CodexResponsesProvider(LLMProvider):
         yielded_calls: set[str],
     ) -> AsyncIterator[LLMStreamEvent]:
         event_type = event.get("type")
+        if event_type in ("error", "response.failed", "response.incomplete"):
+            response = event.get("response") or {}
+            detail = event.get("error") or event.get("message") or response.get("error") or response.get("incomplete_details") or {}
+            raise RuntimeError(f"Codex 流式输出未完成：{event_type} {json.dumps(detail, ensure_ascii=False)[:1000]}")
         if event_type == "response.output_text.delta":
             delta = event.get("delta")
             if isinstance(delta, str) and delta:

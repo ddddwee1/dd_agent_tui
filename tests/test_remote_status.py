@@ -52,6 +52,7 @@ def test_status_payload_context_and_counts():
     assert payload["tasks_running"] == 1  # only the live proc counts
     assert payload["subagents"] == 1
     assert payload["busy"] is True and payload["queued"] == 1
+    assert payload["compacting"] is False
     assert payload["average_tokens_per_second"] is None
 
 
@@ -59,3 +60,9 @@ def test_status_payload_reports_session_rate():
     app = FakeApp()
     app.counter.add(ProviderUsage(completion_tokens=84), elapsed=2)
     assert app._remote_status_payload()["average_tokens_per_second"] == 42
+
+
+def test_status_payload_reports_compaction():
+    app = FakeApp()
+    app._compacting = True
+    assert app._remote_status_payload()["compacting"] is True

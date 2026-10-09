@@ -2,12 +2,15 @@
 turn with a real tool call through the shared TurnEngine."""
 
 import asyncio
+import copy
 from types import SimpleNamespace
+
+import pytest
 
 import ddtui.app as app_mod
 import ddtui.engine as engine_mod
 from ddtui.providers import LLMProvider, LLMStreamEvent, ProviderUsage, ToolCallDelta
-from ddtui.widgets import AssistantMessage, StatusBar, ThinkingBlock, ToolCallBlock, ToolCallGroup
+from ddtui.widgets import AssistantMessage, CompactionBlock, StatusBar, ThinkingBlock, ToolCallBlock, ToolCallGroup
 from tests.conftest import REPO_ROOT
 
 
@@ -95,6 +98,96 @@ def test_full_turn_through_engine(monkeypatch):
             assert all(block._tool_group in groups for block in tool_blocks)
             assert len(app.query(AssistantMessage)) == 1
             assert app._busy is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("automatic", [False, True], ids=["manual", "automatic"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+def test_compaction_status_survives_animation_and_clears(monkeypatch, tmp_path, automatic, outcome):
+    import ddtui.app_history as history
+    import ddtui.runtime_state as runtime
+    from tests.test_context_compaction import long_task
+
+    async def run():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        class SummaryProvider(FakeProvider):
+            async def complete_text(self, *args):
+                raise AssertionError("Compaction must use the streaming API")
+
+            async def stream_text(self, messages, model, effort):
+                yield LLMStreamEvent(reasoning="正在整理历史证据…")
+                yield LLMStreamEvent(content="## 工作状态\n已完成初步排查；")
+                started.set()
+                await release.wait()
+                if outcome == "failure":
+                    raise RuntimeError("summarizer down")
+                yield LLMStreamEvent(content="下一步修复方案 B，保留公共接口。")
+
+        monkeypatch.setattr(app_mod, "build_provider", lambda name: SummaryProvider())
+        monkeypatch.setattr(history, "HISTORY_DIR", tmp_path / "history")
+        monkeypatch.setattr(runtime, "RUNTIME_DIR", tmp_path / "runtime")
+        monkeypatch.setattr(history, "AUTO_COMPACT_THRESHOLD", .1)
+        app = app_mod.AgentApp(provider_name="fake")
+        emissions = []
+        monkeypatch.setattr(app, "_remote_emit", lambda event, payload=None: emissions.append((event, payload)))
+        async with app.run_test(size=(80, 24)) as pilot:
+            # Small tool results force a summary rather than instant eviction.
+            app.messages.extend(long_task(30, 300)[1:])
+            original = copy.deepcopy(list(app.messages))
+            bar = app.query_one("#status", StatusBar)
+            assert not app._compacting
+            if automatic:
+                app._set_busy(True)
+                task = asyncio.create_task(app._auto_compact_if_needed())
+            else:
+                task = asyncio.create_task(app._compact_worker())
+            try:
+                await asyncio.wait_for(started.wait(), timeout=5)
+                assert app._compacting and app._busy
+                app._tick_progress_bar()
+                await pilot.pause()
+                assert "上下文压缩中" in bar.render_line(0).text
+                assert app._remote_status_payload()["compacting"] is True
+                preview = app.query_one(CompactionBlock)
+                assert preview.text == "## 工作状态\n已完成初步排查；"
+                assert preview.reasoning == "正在整理历史证据…"
+                assert not preview.collapsed
+                assert list(app.messages) == original  # preview has not been committed
+                snapshot = app._remote_snapshot_payload()["compaction"]
+                assert snapshot["content"] == preview.text
+                assert any(event == "compaction.progress" and payload["kind"] == "content"
+                           for event, payload in emissions)
+
+                if outcome == "cancelled":
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    release.set()
+                    await task
+                await pilot.pause()
+                assert not app._compacting
+                assert "上下文压缩中" not in str(bar.render())
+                assert app._remote_status_payload()["compacting"] is False
+                assert app._busy is automatic
+                assert preview.collapsed
+                assert preview.outcome == {"success": "applied", "failure": "failed", "cancelled": "cancelled"}[outcome]
+                assert app._remote_snapshot_payload()["compaction"] is None
+                assert any(event == "compaction.finished" for event, _ in emissions)
+                if outcome == "success":
+                    memory = next(m for m in app.messages if m.get("ddtui_kind") == "history_summary")
+                    assert memory["content"].endswith(preview.text)
+                    assert "下一步修复方案 B" in preview.text
+                    assert "正在整理历史证据" not in memory["content"]
+                else:
+                    assert list(app.messages) == original
+            finally:
+                if not task.done():
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
 
     asyncio.run(run())
 

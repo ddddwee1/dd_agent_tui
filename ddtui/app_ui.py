@@ -173,6 +173,7 @@ class AppUiMixin:
             self.counter,
             context_limit=self._context_limit(),
             busy=True,
+            compacting=self._compacting,
             queued=len(self._queued),
             steer=len(self._steer),
             explore=self._active_explore is not None,
@@ -1041,6 +1042,7 @@ class AppUiMixin:
             self.counter,
             context_limit=self._context_limit(),
             busy=self._busy,
+            compacting=self._compacting,
             queued=len(self._queued),
             steer=len(self._steer),
             explore=self._active_explore is not None,
@@ -1055,6 +1057,14 @@ class AppUiMixin:
         self._refresh_status()
         try:
             self._remote_emit_status("busy", force=True)
+        except Exception:
+            pass
+
+    def _set_compacting(self, compacting: bool) -> None:
+        self._compacting = compacting
+        self._refresh_status()
+        try:
+            self._remote_emit_status("compaction", force=True)
         except Exception:
             pass
 
