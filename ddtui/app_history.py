@@ -387,7 +387,7 @@ class AppHistoryMixin:
 
     async def _show_compaction_stats(self, stats: dict, *, automatic: bool) -> None:
         label = "自动压缩" if automatic else "压缩"
-        mode = "移出旧工具输出" if stats["mode"] == "tool_eviction" else "更新工作状态摘要"
+        mode = "更新工作状态摘要"
         residual = "；仍超过目标预算，保留了必要原文" if not stats["target_met"] else ""
         await self._mount_widget(Static(Text(
             f"📦 已{label}：{stats['before_n']} → {stats['after_n']} 条消息，"

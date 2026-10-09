@@ -26,6 +26,11 @@ class Provider:
         self.calls.append((copy.deepcopy(messages), model, effort))
         yield LLMStreamEvent(content=self.summary)
 
+    async def stream(self, messages, tools, model, effort):
+        # In-context summary path: same wire method as a normal turn.
+        self.calls.append((copy.deepcopy(messages), list(tools), model, effort))
+        yield LLMStreamEvent(content=self.summary)
+
 
 def call(name, ident):
     return {"role": "assistant", "reasoning_content": "reasoning must travel with retained calls",

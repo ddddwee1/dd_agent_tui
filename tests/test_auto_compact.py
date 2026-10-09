@@ -20,7 +20,10 @@ def run(messages, ctx, provider=None, *, threshold=.75, limit=100_000, tools=(),
                                       on_compacting=on_compacting))
 
 
-def test_single_user_long_turn_evicts_outputs_without_llm_call():
+def test_single_user_long_turn_summarizes_instead_of_in_place_eviction():
+    # In-place eviction of retained messages would invalidate the provider's
+    # prefix/context cache from the first edited message onward, so even a
+    # single long turn must go through the summary pass.
     messages = long_task(12, 5000)
     ctx = ToolContext(work_dir=".", session_id="long")
     provider = Provider()
@@ -28,12 +31,11 @@ def test_single_user_long_turn_evicts_outputs_without_llm_call():
     states = []
     stats = run(messages, ctx, provider, on_compacting=states.append)
     assert states == [True, False]
-    assert stats["mode"] == "tool_eviction"
-    assert not provider.calls
+    assert stats["mode"] == "summary"
+    assert provider.calls
     assert stats["after_tokens"] <= stats["target_tokens"]
     assert messages is shared
     assert len([m for m in messages if m["role"] == "user"]) == 1
-    assert any(m.get("ddtui_history_ref") for m in messages)
     assert cc.safe_boundaries(messages)[-1] == len(messages)
 
 
@@ -66,7 +68,9 @@ def test_token_threshold_and_response_reserve(monkeypatch, limit, trigger):
     pressure = trigger
     stats = run(messages, ctx, provider, threshold=500_000, limit=limit)
     assert stats["after_tokens"] < stats["before_tokens"]
-    assert any(m.get("ddtui_history_ref") for m in messages)
+    # Archived originals stay reachable through the recovery entry; retained
+    # messages are no longer edited in place just to carry refs.
+    assert any(m.get("ddtui_kind") == "context_recovery" for m in messages)
 
 
 def test_new_tool_output_triggers_before_next_request_without_usage():

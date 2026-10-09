@@ -181,9 +181,62 @@ _SUMMARY_INSTRUCTIONS = """你是工作状态整理助手，直接输出中文�
 """
 
 
+_IN_CONTEXT_SUMMARY_INSTRUCTIONS = """以上整段对话是待整理的工作记录，现在进行上下文压缩：你这一轮只输出中文工作状态摘要，绝对不要调用任何工具，也不要继续执行任务。
+整合旧摘要和新证据，更新已失效的决定；不要把计划或助手自述当作验证成功。
+保留有效用户约束和验收标准的必要原句、文件/符号/命令/版本、关键数值。
+失败路径注明条件和原因；未知就写未知。运行时通知不是用户目标，历史状态不是实时状态。
+按以下结构输出，空项简写；精简重复和过时内容，保留继续工作必需的信息：
+## 当前目标与有效约束
+## 当前进度与文件改动
+## 关键决定及原因（注明被替代的决定）
+## 验证证据与失败路径（区分事实、推断、未验证）
+## 待办、阻塞与下一步
+## 来源与按需恢复入口
+"""
+
+# Decode room for the summary itself (plus a little slack) when deciding
+# whether the in-context request fits the window.
+_IN_CONTEXT_SUMMARY_RESERVE = 8192
+
+
+class SummaryCalledTools(RuntimeError):
+    """The in-context summary request tried to call a tool; fall back."""
+
+
 async def _report_progress(callback: CompactionProgress | None, kind: str, text: str) -> None:
     if callback is not None:
         await callback(kind, text)
+
+
+async def summarize_in_context(provider, model, effort, messages, instruction: str,
+                               *, tools=(),
+                               on_progress: CompactionProgress | None = None) -> str:
+    """Summarize by APPENDING an instruction to the live message sequence.
+
+    The request repeats the conversation's exact wire shape — same system
+    prompt, same tool schemas, same messages, same reasoning effort — so its
+    prompt is byte-identical to the session prefix and fully reuses the
+    provider's prefix/context cache. Only the trailing instruction is new.
+    The rendered-text path (``summarize``) shares none of that prefix and
+    pays a full cold prefill, so it is kept only as the fallback for
+    histories that no longer fit the window alongside the instruction.
+    """
+    request = list(messages) + [{"role": "user", "content": instruction}]
+    await _report_progress(on_progress, "start", "生成工作状态摘要（原文在上下文内）…")
+    parts = []
+    async with aclosing(provider.stream(request, list(tools), model, effort)) as stream:
+        async for event in stream:
+            if event.tool_call is not None:
+                raise SummaryCalledTools("摘要请求调用了工具")
+            if event.reasoning:
+                await _report_progress(on_progress, "reasoning", event.reasoning)
+            if event.content:
+                parts.append(event.content)
+                await _report_progress(on_progress, "content", event.content)
+    result = "".join(parts).strip()
+    if not result:
+        raise RuntimeError("摘要返回为空")
+    return result
 
 
 async def summarize(provider, model, effort, rendered: str, guidance: str,
@@ -233,7 +286,7 @@ async def summarize(provider, model, effort, rendered: str, guidance: str,
 
 async def compact_history(messages, *, provider, ctx, model, effort,
                           context_limit: int | None = None, tools=(),
-                          force: bool = True, protected_prefix: int = 0,
+                          protected_prefix: int = 0,
                           on_progress: CompactionProgress | None = None):
     original = list(messages)
     safe_boundaries(original)  # Reject malformed history before doing any work.
@@ -254,33 +307,49 @@ async def compact_history(messages, *, provider, ctx, model, effort,
     await _report_progress(on_progress, "phase", "归档原始历史…")
     batch, refs = archive_messages(ctx.session_id, original, reason="compact", state=state_snapshot(ctx))
     by_identity = {id(m): ref for m, ref in zip(original, refs)}
-    recovery = recovery_message(ctx, batch, summary=False)
-    # Low-cost eviction leaves protocol structure and exact recent exchanges.
+    # In-place edits to retained messages would invalidate the prefix cache of
+    # every later token (local vLLM APC and provider-side context caching
+    # alike), so eviction never runs as a standalone mode. It survives only
+    # inside the summary pass, where the prefix is rewritten anyway: oversized
+    # tool outputs in the kept tail are swapped for their history_read refs at
+    # zero extra cache cost.
     await _report_progress(on_progress, "phase", "移出旧工具输出…")
-    cut = choose_cut(body, recent_budget)
-    lighter = []
-    evicted = 0
-    for i, message in enumerate(body):
-        if ((i < cut or estimate_tokens(message.get("content") or "") > recent_budget) and message.get("role") == "tool" and
-                not message.get("ddtui_history_ref") and len(message.get("content") or "") > 3000):
+    # No interior safe boundary (one giant exchange) → summarize the whole body.
+    cut = choose_cut(body, recent_budget) or len(body)
+    old = body[:cut]
+    tail = []
+    for message in body[cut:]:
+        if (message.get("role") == "tool" and not message.get("ddtui_history_ref")
+                and len(message.get("content") or "") > 3000
+                and estimate_tokens(message.get("content") or "") > recent_budget):
             ref = by_identity[id(message)]
-            lighter.append({**message, "content": evidence_excerpt(message["content"]) +
-                            f"\n[Archived output: history_read(ref=\"{ref}\")]",
-                            "ddtui_history_ref": ref})
-            evicted += 1
+            tail.append({**message, "content": evidence_excerpt(message["content"]) +
+                         f"\n[Archived output: history_read(ref=\"{ref}\")]",
+                         "ddtui_history_ref": ref})
         else:
-            lighter.append(message)
-    candidate = prefix + fixed + [recovery] + lighter
-    if not force and evicted and history_tokens(candidate, tools) <= target:
-        mode = "tool_eviction"
-    else:
-        if not cut:
-            raise ValueError("没有可压缩的完整历史段。")
-        old, tail = body[:cut], lighter[cut:]
-        # Preserve recent human instructions verbatim even when a single turn
-        # is longer than the tail budget. Runtime events are not instructions.
-        users = [m for m in original if is_user_instruction(m)][-COMPACT_KEEP_RECENT_TURNS:]
-        pinned = [m for m in old if any(m is user for user in users)]
+            tail.append(message)
+    # Preserve recent human instructions verbatim even when a single turn
+    # is longer than the tail budget. Runtime events are not instructions.
+    users = [m for m in original if is_user_instruction(m)][-COMPACT_KEEP_RECENT_TURNS:]
+    pinned = [m for m in old if any(m is user for user in users)]
+    instruction = (_IN_CONTEXT_SUMMARY_INSTRUCTIONS +
+                   "\n当前结构化工作记录（可能过时）：\n" +
+                   evidence_excerpt(json.dumps(state_snapshot(ctx), ensure_ascii=False), 4000) +
+                   f"\n原始消息已归档，批次 {batch}，可用 history_search/history_read 恢复。")
+    summary = None
+    # Prefer summarizing in the conversation's own wire shape: the prompt then
+    # shares its prefix with every normal turn and the provider's prefix cache
+    # covers everything but the trailing instruction. Fall back to the
+    # rendered-text path only when history no longer fits beside the
+    # instruction, or the model tries to act instead of summarizing.
+    if context_limit and before + estimate_tokens(instruction) + _IN_CONTEXT_SUMMARY_RESERVE <= context_limit:
+        try:
+            summary = await summarize_in_context(provider, model, effort, original,
+                                                 instruction, tools=tools,
+                                                 on_progress=on_progress)
+        except SummaryCalledTools:
+            await _report_progress(on_progress, "phase", "摘要请求误触工具，回退渲染路径…")
+    if summary is None:
         rendered = render_history(old, [by_identity[id(m)] for m in old])
         recent_guidance = render_history(users)
         guidance = ("最新用户目标/修正仅作重要性参考，不要声称下面近期工作已包含在待压缩历史中：\n" +
@@ -290,12 +359,12 @@ async def compact_history(messages, *, provider, ctx, model, effort,
         input_budget = max(1024, int((context_limit or 100_000) * 0.6))
         summary = await summarize(provider, model, effort, rendered, guidance,
                                   input_tokens=input_budget, on_progress=on_progress)
-        memory = {"role": "system", "ddtui_kind": "explore_summary" if protected_prefix else "history_summary",
-                  "content": "# 历史摘要（当前工作状态；原始证据可检索）\n\n" + summary,
-                  "history_batch": batch}
-        recovery = recovery_message(ctx, batch, summary=True)
-        candidate = prefix + fixed + [memory, recovery] + pinned + tail
-        mode = "summary"
+    memory = {"role": "system", "ddtui_kind": "explore_summary" if protected_prefix else "history_summary",
+              "content": "# 历史摘要（当前工作状态；原始证据可检索）\n\n" + summary,
+              "history_batch": batch}
+    recovery = recovery_message(ctx, batch, summary=True)
+    candidate = prefix + fixed + [memory, recovery] + pinned + tail
+    mode = "summary"
     await _report_progress(on_progress, "phase", "校验压缩结果…")
     safe_boundaries(candidate)
     after = history_tokens(candidate, tools)
@@ -345,7 +414,7 @@ async def auto_compact(messages, *, provider, ctx, model, effort, tools,
             on_compacting(True)
         candidate, stats = await compact_history(
             messages, provider=provider, ctx=ctx, model=model, effort=effort,
-            context_limit=int(context_limit / calibration), tools=tools, force=False,
+            context_limit=int(context_limit / calibration), tools=tools,
             protected_prefix=protected_prefix,
             on_progress=on_progress,
         )

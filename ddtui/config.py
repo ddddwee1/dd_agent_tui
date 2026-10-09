@@ -265,7 +265,10 @@ DEEPSEEK_CONTEXT_LIMIT = CTX_SAFE_LIMIT
 
 # Check at complete tool-batch/request boundaries and quiet turn ends.
 # Provider usage calibrates estimates of newly appended output and schemas.
-# Automatic maintenance evicts large old tool results before summarization.
+# Compaction always summarizes; it never edits retained history in place,
+# because that would invalidate the provider's prefix/context cache for every
+# later token. Oversized tool outputs are only swapped for history_read refs
+# inside the summary pass, where the prefix is rewritten anyway.
 # Checks run inside the turn worker (busy still held). Default: 500,000 tokens.
 # Set DDTUI_AUTO_COMPACT_THRESHOLD=0 to disable, a fraction in (0, 0.95]
 # for a window-relative trigger, or a token count greater than 1.
