@@ -42,7 +42,7 @@ def test_prompt_key_rules_present():
     assert "replace_all=true 替换全部出现" in SYSTEM_PROMPT
     assert "覆盖已存在文件前必须先用 read_file/read_files" in SYSTEM_PROMPT
     assert "行号不是文件内容" in SYSTEM_PROMPT
-    assert "回复和思考过程（reasoning）都默认使用中文" in SYSTEM_PROMPT
+    assert "回复默认使用中文" in SYSTEM_PROMPT
     assert "文件路径:行号" in SYSTEM_PROMPT
     assert "不要主动 git commit" in SYSTEM_PROMPT
     assert "不要臆造时间或上下文压力" in SYSTEM_PROMPT
@@ -68,7 +68,7 @@ def test_subagent_prompt_identity_and_contract():
     sp = SUBAGENT_SYSTEM_PROMPT
     assert "你是 ddtui 的子 agent" in sp
     assert f"超过 {SUBAGENT_RESULT_MAX_CHARS} 字符会被截断" in sp
-    assert "回复和思考过程（reasoning）都默认使用中文" in sp
+    assert "回复默认使用中文" in sp
     assert "compact_self" in sp
 
 
