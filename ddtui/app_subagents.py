@@ -88,11 +88,11 @@ class SubagentTurnObserver(TurnObserver):
         self._thinking_started = False
         self._answer_started = False
 
-    async def on_usage(self, usage) -> None:
+    async def on_usage(self, usage, *, elapsed: float | None = None) -> None:
         # Roll subagent usage into the parent counter so the status bar
         # reflects the latest context pressure; also accumulate
         # per-session counts for the sidebar widget.
-        self.app.counter.add(usage)
+        self.app.counter.add(usage, elapsed=elapsed)
         if usage is not None:
             self.sess.tokens_in += getattr(usage, "prompt_tokens", 0) or 0
             self.sess.tokens_out += (

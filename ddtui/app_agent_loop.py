@@ -104,8 +104,8 @@ class ParentTurnObserver(TurnObserver):
         self._thinking = None
         self._answer = None
 
-    async def on_usage(self, usage) -> None:
-        self.app.counter.add(usage)
+    async def on_usage(self, usage, *, elapsed: float | None = None) -> None:
+        self.app.counter.add(usage, elapsed=elapsed)
 
     async def on_assistant_message(self, msg: dict) -> None:
         if (

@@ -962,6 +962,8 @@
       ];
       const ctx = contextPill(activeStatus);
       if (ctx) pills.push(ctx);
+      const speed = activeStatus.average_tokens_per_second;
+      pills.push(`<span class="pill">平均 ${typeof speed === "number" && Number.isFinite(speed) ? speed.toFixed(1) : "--"} tok/s</span>`);
       if (activeStatus.turns) pills.push(`<span class="pill">${activeStatus.turns} 轮</span>`);
       if (activeStatus.queued) pills.push(`<span class="pill">queue ${activeStatus.queued}</span>`);
       if (activeStatus.steer) pills.push(`<span class="pill">steer ${activeStatus.steer}</span>`);

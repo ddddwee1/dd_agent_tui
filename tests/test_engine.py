@@ -3,6 +3,9 @@ execution, meta/confirm hooks, cancellation, abort."""
 
 import asyncio
 import time
+from types import SimpleNamespace
+
+import ddtui.engine as engine_mod
 
 from ddtui.engine import (
     BLOCKED_BY_CONFIRM,
@@ -10,8 +13,8 @@ from ddtui.engine import (
     TurnObserver,
     outcome_from_result,
 )
-from ddtui.providers import LLMProvider, LLMStreamEvent, ToolCallDelta
-from ddtui.state import ToolContext
+from ddtui.providers import LLMProvider, LLMStreamEvent, ProviderUsage, ToolCallDelta
+from ddtui.state import TokenCounter, ToolContext
 
 SLEEP = 0.15
 
@@ -51,6 +54,9 @@ class Recorder(TurnObserver):
     def on_stream_aborted(self):
         self.events.append(("aborted",))
 
+    async def on_usage(self, usage, *, elapsed=None):
+        self.events.append(("usage", usage, elapsed))
+
     async def on_tool_result(self, tc_id, name, args, outcome):
         self.events.append(("result", name, outcome.ok, outcome.diff))
 
@@ -89,6 +95,45 @@ def test_text_round_assembly():
         deltas = [e for e in rec.events if e[0] in ("rdelta", "cdelta")]
         assert deltas == [("rdelta", "思考"), ("rdelta", "中"),
                           ("cdelta", "你好"), ("cdelta", "世界")]
+    asyncio.run(run())
+
+
+def test_request_timing_excludes_tools_and_pre_round_work(monkeypatch):
+    async def run():
+        clock = SimpleNamespace(now=100.0)
+        monkeypatch.setattr(engine_mod, "time", SimpleNamespace(monotonic=lambda: clock.now))
+
+        class TimedProvider(ScriptedProvider):
+            async def stream(self, messages, tools, model, effort):
+                clock.now += 2 if not self.calls else 8
+                async for event in super().stream(messages, tools, model, effort):
+                    yield event
+
+        async def before_round():
+            clock.now += 15
+
+        def slow_tool(ctx, name, args):
+            clock.now += 60
+            return "ok"
+
+        provider = TimedProvider([
+            [LLMStreamEvent(tool_call=tc(0, "bash", "{}")),
+             LLMStreamEvent(usage=ProviderUsage(completion_tokens=50)),
+             LLMStreamEvent(usage=ProviderUsage(completion_tokens=100))],
+            [LLMStreamEvent(content="done"),
+             LLMStreamEvent(usage=ProviderUsage(completion_tokens=100))],
+        ])
+        recorder = Recorder()
+        await make_engine(provider, [], observer=recorder,
+                          executor=slow_tool, before_round=before_round).run_turn()
+        samples = [(event[1], event[2]) for event in recorder.events if event[0] == "usage"]
+        assert [elapsed for _, elapsed in samples] == [2, 8]
+        counter = TokenCounter()
+        for usage, elapsed in samples:
+            counter.add(usage, elapsed=elapsed)
+        assert counter.turns == 2
+        assert counter.average_tokens_per_second == 20
+
     asyncio.run(run())
 
 
@@ -248,6 +293,7 @@ def test_stream_abort_notifies_and_appends_nothing():
         class Exploding(ScriptedProvider):
             async def stream(self, messages, tools, model, effort):
                 yield LLMStreamEvent(content="partial")
+                yield LLMStreamEvent(usage=ProviderUsage(completion_tokens=10))
                 raise RuntimeError("stream died")
 
         msgs = [{"role": "user", "content": "x"}]
@@ -259,6 +305,7 @@ def test_stream_abort_notifies_and_appends_nothing():
             raised = True
         assert raised
         assert ("aborted",) in rec.events
+        assert not any(event[0] == "usage" for event in rec.events)
         assert all(m["role"] != "assistant" for m in msgs)
     asyncio.run(run())
 

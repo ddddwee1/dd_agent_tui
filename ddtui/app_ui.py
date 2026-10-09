@@ -21,6 +21,7 @@ from .config import (
 from .runtime_state import new_session_id
 from .state import (
     SubagentSession,
+    TokenCounter,
     kill_all_tasks,
     kill_all_terminals,
 )
@@ -457,6 +458,7 @@ class AppUiMixin:
         # state buffers and their parked bubbles in #pending.
         self._drop_queue()
         self._drop_steer()
+        self.counter = TokenCounter()
         self._refresh_status()
         view = self.query_one("#conversation", VerticalScroll)
         for child in list(view.children):

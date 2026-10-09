@@ -386,17 +386,28 @@ class SubagentSession:
 
 
 class TokenCounter:
-    """Last-call token usage. AgentApp holds one and feeds every API
-    response's `usage` into `add()`. StatusBar reads the latest call to
-    render the context-usage gradient."""
+    """Last-call usage and session-average output throughput.
+
+    Throughput uses completion tokens (including reasoning) divided by
+    the sum of timed model requests, excluding tools and idle time.
+    Only completed requests with usage and positive elapsed time count.
+    """
 
     def __init__(self) -> None:
         self.last_prompt = 0
         self.last_completion = 0
         self.last_reasoning = 0
         self.turns = 0
+        self._timed_completion = 0
+        self._stream_seconds = 0.0
 
-    def add(self, usage) -> None:
+    @property
+    def average_tokens_per_second(self) -> float | None:
+        if self._stream_seconds <= 0:
+            return None
+        return self._timed_completion / self._stream_seconds
+
+    def add(self, usage, *, elapsed: float | None = None) -> None:
         if not usage:
             return
         self.last_prompt = getattr(usage, "prompt_tokens", 0) or 0
@@ -406,3 +417,6 @@ class TokenCounter:
             (getattr(details, "reasoning_tokens", 0) or 0) if details else 0
         )
         self.turns += 1
+        if elapsed is not None and elapsed > 0:
+            self._timed_completion += self.last_completion
+            self._stream_seconds += elapsed

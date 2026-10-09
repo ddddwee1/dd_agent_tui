@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -98,7 +99,7 @@ class TurnObserver:
         half-rendered UI. Synchronous on purpose (see module docstring).
         """
 
-    async def on_usage(self, usage) -> None:
+    async def on_usage(self, usage, *, elapsed: float | None = None) -> None:
         pass
 
     async def on_assistant_message(self, msg: dict) -> None:
@@ -200,6 +201,7 @@ class TurnEngine:
         reasoning = ""
         tool_calls: dict[int, dict] = {}
         usage = None
+        started_at = time.monotonic()
         try:
             async for ev in self.provider.stream(
                 self.messages, self.tools, self.model, self.effort
@@ -219,11 +221,12 @@ class TurnEngine:
             # the observer just drops its half-rendered widgets.
             self.observer.on_stream_aborted()
             raise
+        elapsed = time.monotonic() - started_at
         if usage is not None:
             self.ctx.context_last_prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
             self.ctx.context_last_estimate = request_estimate
             self.ctx.context_model = self.model
-            await self.observer.on_usage(usage)
+            await self.observer.on_usage(usage, elapsed=elapsed)
         content, _guarded = guard_assistant_runtime_claims(content)
         msg: dict = {"role": "assistant", "content": content}
         if reasoning:

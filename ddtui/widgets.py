@@ -2029,7 +2029,9 @@ class StatusBar(Static):
         steer: int = 0,
         explore: bool = False,
     ) -> None:
-        location = self._location()
+        speed = counter.average_tokens_per_second
+        speed_text = "--" if speed is None else f"{speed:.1f}"
+        location = f"{self._location()} · 平均 {speed_text} tok/s"
         # Drive the background gradient off last-call tokens (what
         # matters is whether the *next* call still fits). Pre-first-turn
         # we sit at the green baseline.

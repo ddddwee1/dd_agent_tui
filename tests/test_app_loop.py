@@ -2,10 +2,12 @@
 turn with a real tool call through the shared TurnEngine."""
 
 import asyncio
+from types import SimpleNamespace
 
 import ddtui.app as app_mod
-from ddtui.providers import LLMProvider, LLMStreamEvent, ToolCallDelta
-from ddtui.widgets import AssistantMessage, ThinkingBlock, ToolCallBlock, ToolCallGroup
+import ddtui.engine as engine_mod
+from ddtui.providers import LLMProvider, LLMStreamEvent, ProviderUsage, ToolCallDelta
+from ddtui.widgets import AssistantMessage, StatusBar, ThinkingBlock, ToolCallBlock, ToolCallGroup
 from tests.conftest import REPO_ROOT
 
 
@@ -93,6 +95,39 @@ def test_full_turn_through_engine(monkeypatch):
             assert all(block._tool_group in groups for block in tool_blocks)
             assert len(app.query(AssistantMessage)) == 1
             assert app._busy is False
+
+    asyncio.run(run())
+
+
+def test_footer_rate_updates_and_clear_starts_fresh(monkeypatch, tmp_path):
+    import ddtui.app_history as history
+    import ddtui.runtime_state as runtime
+
+    async def run():
+        fake = FakeProvider()
+        fake.rounds = [[LLMStreamEvent(content="完成"),
+                        LLMStreamEvent(usage=ProviderUsage(1000, 84))]]
+        monkeypatch.setattr(app_mod, "build_provider", lambda name: fake)
+        monkeypatch.setattr(history, "HISTORY_DIR", tmp_path / "history")
+        monkeypatch.setattr(runtime, "RUNTIME_DIR", tmp_path / "runtime")
+        ticks = iter([10.0, 12.0])
+        monkeypatch.setattr(engine_mod, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+
+        app = app_mod.AgentApp(provider_name="fake")
+        async with app.run_test() as pilot:
+            bar = app.query_one("#status", StatusBar)
+            assert "平均 -- tok/s" in str(bar.render())
+            app.run_worker(app._agent_turn("计算速度"), exclusive=True)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.counter.average_tokens_per_second == 42
+            assert "平均 42.0 tok/s" in bar.render_line(0).text
+
+            app.action_clear_chat()
+            await pilot.pause()
+            assert app.counter.average_tokens_per_second is None
+            assert app.counter.turns == 0
+            assert "平均 -- tok/s" in str(bar.render())
 
     asyncio.run(run())
 

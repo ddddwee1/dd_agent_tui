@@ -2,11 +2,13 @@
 rounds through the shared engine, compact_self, result auto-delivery."""
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
+import ddtui.engine as engine_mod
 from ddtui.app_subagents import AppSubagentMixin
-from ddtui.providers import LLMProvider, LLMStreamEvent, ToolCallDelta
+from ddtui.providers import LLMProvider, LLMStreamEvent, ProviderUsage, ToolCallDelta
 from ddtui.state import TokenCounter, ToolContext
 from ddtui.tools_tasks import tool_task_kill, tool_task_start
 
@@ -103,6 +105,27 @@ def test_spawn_defaults_inherit_parent(playground):
         assert sess.model == "parent-model" and sess.effort == "high"
         await _wait_round(sess)
         assert app.provider.stream_calls == [("parent-model", "high")]
+    asyncio.run(run())
+
+
+def test_subagent_usage_contributes_to_session_rate(playground, monkeypatch):
+    async def run():
+        ticks = iter([10.0, 14.0])
+        monkeypatch.setattr(engine_mod, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+
+        class UsageProvider(FakeProvider):
+            async def stream(self, messages, tools, model, effort):
+                yield LLMStreamEvent(content="done")
+                yield LLMStreamEvent(usage=ProviderUsage(1000, 100))
+
+        app = FakeApp(playground)
+        app.provider = UsageProvider()
+        app._spawn_subagent("任务", "")
+        sess = app._live_subagents["sub-1"]
+        await _wait_round(sess)
+        assert sess.tokens_in == 1000 and sess.tokens_out == 100
+        assert app.counter.average_tokens_per_second == 25
+
     asyncio.run(run())
 
 

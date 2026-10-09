@@ -222,6 +222,7 @@ class AppRemoteMixin:
             # the remote UI mirrors the TUI's "how close to the window"
             # gauge and the sidebar's running-work overview.
             "turns": self.counter.turns,
+            "average_tokens_per_second": self.counter.average_tokens_per_second,
             "context_used": (
                 self.counter.last_prompt + self.counter.last_completion
             ),

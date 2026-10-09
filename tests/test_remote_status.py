@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 from ddtui.app_remote import AppRemoteMixin
+from ddtui.providers import ProviderUsage
 from ddtui.state import TokenCounter
 
 
@@ -51,3 +52,10 @@ def test_status_payload_context_and_counts():
     assert payload["tasks_running"] == 1  # only the live proc counts
     assert payload["subagents"] == 1
     assert payload["busy"] is True and payload["queued"] == 1
+    assert payload["average_tokens_per_second"] is None
+
+
+def test_status_payload_reports_session_rate():
+    app = FakeApp()
+    app.counter.add(ProviderUsage(completion_tokens=84), elapsed=2)
+    assert app._remote_status_payload()["average_tokens_per_second"] == 42
