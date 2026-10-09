@@ -248,7 +248,12 @@ class DeepSeekProvider(LLMProvider):
                     raise RuntimeError(f"DeepSeek 流式输出未完成：{finish_reason}")
                 completed = completed or finish_reason == "stop"
                 delta = chunk.choices[0].delta
-                reasoning = getattr(delta, "reasoning_content", None)
+                # DeepSeek 官方 API 用 reasoning_content；较新的 vLLM
+                # OpenAI 端点把该字段更名为 reasoning（旧名只在输入侧兼容），
+                # 两边都认才能同时接官方与自托管后端。
+                reasoning = getattr(delta, "reasoning_content", None) or getattr(
+                    delta, "reasoning", None
+                )
                 if reasoning:
                     yield LLMStreamEvent(reasoning=reasoning)
                 content = getattr(delta, "content", None)
