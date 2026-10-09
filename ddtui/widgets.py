@@ -2100,9 +2100,18 @@ class StatusBar(Static):
         steer: int = 0,
         explore: bool = False,
     ) -> None:
-        speed = counter.average_tokens_per_second
+        # Decode-only rate so a slow prefill cannot drag the number;
+        # 首响 shows where the latest request's wall time actually went.
+        speed = counter.decode_tokens_per_second
         speed_text = "--" if speed is None else f"{speed:.1f}"
-        location = f"{self._location()} · 平均 {speed_text} tok/s"
+        ttft = counter.last_ttft
+        if ttft is None:
+            ttft_text = ""
+        elif ttft >= 10:
+            ttft_text = f" · 首响 {ttft:.0f}s"
+        else:
+            ttft_text = f" · 首响 {ttft:.1f}s"
+        location = f"{self._location()} · 生成 {speed_text} tok/s{ttft_text}"
         # Drive the background gradient off last-call tokens (what
         # matters is whether the *next* call still fits). Pre-first-turn
         # we sit at the green baseline.

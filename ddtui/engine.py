@@ -99,7 +99,13 @@ class TurnObserver:
         half-rendered UI. Synchronous on purpose (see module docstring).
         """
 
-    async def on_usage(self, usage, *, elapsed: float | None = None) -> None:
+    async def on_usage(
+        self,
+        usage,
+        *,
+        elapsed: float | None = None,
+        ttft: float | None = None,
+    ) -> None:
         pass
 
     async def on_assistant_message(self, msg: dict) -> None:
@@ -202,12 +208,17 @@ class TurnEngine:
         tool_calls: dict[int, dict] = {}
         usage = None
         started_at = time.monotonic()
+        first_token_at: float | None = None
         try:
             async for ev in self.provider.stream(
                 self.messages, self.tools, self.model, self.effort
             ):
                 if ev.usage is not None:
                     usage = ev.usage
+                if first_token_at is None and (
+                    ev.reasoning or ev.content or ev.tool_call is not None
+                ):
+                    first_token_at = time.monotonic()
                 if ev.reasoning:
                     reasoning += ev.reasoning
                     await self.observer.on_reasoning_delta(ev.reasoning)
@@ -222,11 +233,12 @@ class TurnEngine:
             self.observer.on_stream_aborted()
             raise
         elapsed = time.monotonic() - started_at
+        ttft = None if first_token_at is None else first_token_at - started_at
         if usage is not None:
             self.ctx.context_last_prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
             self.ctx.context_last_estimate = request_estimate
             self.ctx.context_model = self.model
-            await self.observer.on_usage(usage, elapsed=elapsed)
+            await self.observer.on_usage(usage, elapsed=elapsed, ttft=ttft)
         content, _guarded = guard_assistant_runtime_claims(content)
         msg: dict = {"role": "assistant", "content": content}
         if reasoning:

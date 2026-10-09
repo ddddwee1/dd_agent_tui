@@ -391,15 +391,23 @@ class TokenCounter:
     Throughput uses completion tokens (including reasoning) divided by
     the sum of timed model requests, excluding tools and idle time.
     Only completed requests with usage and positive elapsed time count.
+
+    decode_tokens_per_second divides the same tokens by post-first-token
+    time only, so a slow prefill (TTFT) cannot dilute it; last_ttft keeps
+    the newest request's first-token wait. average_tokens_per_second
+    stays on the whole-request wall clock (remote status reports it).
     """
 
     def __init__(self) -> None:
         self.last_prompt = 0
         self.last_completion = 0
         self.last_reasoning = 0
+        self.last_ttft: float | None = None
         self.turns = 0
         self._timed_completion = 0
         self._stream_seconds = 0.0
+        self._decode_completion = 0
+        self._decode_seconds = 0.0
 
     @property
     def average_tokens_per_second(self) -> float | None:
@@ -407,7 +415,19 @@ class TokenCounter:
             return None
         return self._timed_completion / self._stream_seconds
 
-    def add(self, usage, *, elapsed: float | None = None) -> None:
+    @property
+    def decode_tokens_per_second(self) -> float | None:
+        if self._decode_seconds <= 0:
+            return None
+        return self._decode_completion / self._decode_seconds
+
+    def add(
+        self,
+        usage,
+        *,
+        elapsed: float | None = None,
+        ttft: float | None = None,
+    ) -> None:
         if not usage:
             return
         self.last_prompt = getattr(usage, "prompt_tokens", 0) or 0
@@ -420,3 +440,11 @@ class TokenCounter:
         if elapsed is not None and elapsed > 0:
             self._timed_completion += self.last_completion
             self._stream_seconds += elapsed
+            if ttft is not None and 0 < ttft < elapsed:
+                self.last_ttft = ttft
+                self._decode_completion += self.last_completion
+                self._decode_seconds += elapsed - ttft
+            else:
+                # No usable first-token timestamp: leave the decode
+                # aggregate alone rather than dilute it with prefill.
+                self.last_ttft = None

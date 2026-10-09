@@ -110,7 +110,8 @@ def test_spawn_defaults_inherit_parent(playground):
 
 def test_subagent_usage_contributes_to_session_rate(playground, monkeypatch):
     async def run():
-        ticks = iter([10.0, 14.0])
+        # started_at, first-token timestamp, end-of-stream.
+        ticks = iter([10.0, 11.0, 14.0])
         monkeypatch.setattr(engine_mod, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
 
         class UsageProvider(FakeProvider):
@@ -125,6 +126,10 @@ def test_subagent_usage_contributes_to_session_rate(playground, monkeypatch):
         await _wait_round(sess)
         assert sess.tokens_in == 1000 and sess.tokens_out == 100
         assert app.counter.average_tokens_per_second == 25
+        # Subagent rounds feed the decode clock too: 100 tokens over
+        # the 3s after the first token.
+        assert app.counter.decode_tokens_per_second == pytest.approx(100 / 3)
+        assert app.counter.last_ttft == 1.0
 
     asyncio.run(run())
 

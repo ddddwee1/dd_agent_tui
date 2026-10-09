@@ -203,24 +203,29 @@ def test_footer_rate_updates_and_clear_starts_fresh(monkeypatch, tmp_path):
         monkeypatch.setattr(app_mod, "build_provider", lambda name: fake)
         monkeypatch.setattr(history, "HISTORY_DIR", tmp_path / "history")
         monkeypatch.setattr(runtime, "RUNTIME_DIR", tmp_path / "runtime")
-        ticks = iter([10.0, 12.0])
+        # started_at, first-token timestamp, end-of-stream.
+        ticks = iter([10.0, 11.0, 12.0])
         monkeypatch.setattr(engine_mod, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
 
         app = app_mod.AgentApp(provider_name="fake")
         async with app.run_test() as pilot:
             bar = app.query_one("#status", StatusBar)
-            assert "平均 -- tok/s" in str(bar.render())
+            assert "生成 -- tok/s" in str(bar.render())
             app.run_worker(app._agent_turn("计算速度"), exclusive=True)
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert app.counter.average_tokens_per_second == 42
-            assert "平均 42.0 tok/s" in bar.render_line(0).text
+            # The footer shows the decode-only rate (84 tokens in the
+            # 1s after the first token) plus the prefill wait.
+            assert "生成 84.0 tok/s" in bar.render_line(0).text
+            assert "首响 1.0s" in bar.render_line(0).text
 
             app.action_clear_chat()
             await pilot.pause()
             assert app.counter.average_tokens_per_second is None
+            assert app.counter.decode_tokens_per_second is None
             assert app.counter.turns == 0
-            assert "平均 -- tok/s" in str(bar.render())
+            assert "生成 -- tok/s" in str(bar.render())
 
     asyncio.run(run())
 

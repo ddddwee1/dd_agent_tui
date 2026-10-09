@@ -54,7 +54,7 @@ class Recorder(TurnObserver):
     def on_stream_aborted(self):
         self.events.append(("aborted",))
 
-    async def on_usage(self, usage, *, elapsed=None):
+    async def on_usage(self, usage, *, elapsed=None, ttft=None):
         self.events.append(("usage", usage, elapsed))
 
     async def on_tool_result(self, tc_id, name, args, outcome):
