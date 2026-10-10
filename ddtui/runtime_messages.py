@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from .history_store import stamp_message
+
 
 RUNTIME_TASK_EVENT_KIND = "runtime_task_event"
 _RESERVED_RE = re.compile(
@@ -14,11 +16,11 @@ _REPLACEMENT = "[assistant runtime-status claim: unverified]"
 
 def runtime_task_event_message(text: str) -> dict:
     """Build a metadata-authenticated runtime task event message."""
-    return {
+    return stamp_message({
         "role": "user",
         "content": text,
         "ddtui_kind": RUNTIME_TASK_EVENT_KIND,
-    }
+    })
 
 
 def guard_assistant_runtime_claims(text: str) -> tuple[str, bool]:

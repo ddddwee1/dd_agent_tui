@@ -8,6 +8,7 @@ import uuid
 from .config import TOOL_HISTORY_MAX_CHARS, TOOL_HISTORY_SNIPPET_CHARS, TOOL_OUTPUT_MAX_CHARS
 from .context_compaction import evidence_excerpt
 from .history_archive import archive_messages
+from .history_store import stamp_message
 
 
 log = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ def _footer(ref: str, original_chars: int) -> str:
 
 def limit_tool_output(ctx, text: str, *, name: str = "", call_id: str | None = None,
                       arguments: dict | None = None,
+                      source_message: dict | None = None,
                       preview: str | None = None,
                       max_chars: int = TOOL_OUTPUT_MAX_CHARS) -> str:
     """Archive BEFORE shortening. On storage failure retain the original evidence.
@@ -49,7 +51,9 @@ def limit_tool_output(ctx, text: str, *, name: str = "", call_id: str | None = N
         # Standalone tool callers may not have allocated a session yet.
         if not ctx.session_id:
             ctx.session_id = "outputs-" + uuid.uuid4().hex
-        source = {"role": "tool", "name": name, "content": str(text)}
+        source = (dict(source_message) if source_message is not None
+                  else stamp_message({"role": "tool"}))
+        source.update(name=name, content=str(text))
         if call_id is not None:
             source["tool_call_id"] = call_id
         if arguments is not None:
@@ -91,6 +95,7 @@ def trim_tool_history(messages, ctx, *, max_chars: int = TOOL_HISTORY_MAX_CHARS)
                                      message.get("ddtui_output_chars", len(content)))
         shortened = limit_tool_output(ctx, content, call_id=message.get("tool_call_id"),
                                       name=message.get("name", ""),
+                                      source_message=message,
                                       max_chars=TOOL_HISTORY_SNIPPET_CHARS)
         if len(shortened) >= len(content):
             continue

@@ -18,6 +18,7 @@ from .config import (
     SUBAGENT_IDLE_TIMEOUT_SEC,
     SUBAGENT_REAP_INTERVAL_SEC,
 )
+from .history_store import stamp_message
 from .runtime_state import new_session_id
 from .state import (
     SubagentSession,
@@ -762,11 +763,11 @@ class AppUiMixin:
             return 0
 
         for tc in missing:
-            self.messages.append({
+            self.messages.append(stamp_message({
                 "role": "tool",
                 "tool_call_id": tc.get("id") or "",
                 "content": cancel_note,
-            })
+            }))
 
         # Flip still-pending tool widgets to a blocked state. Walk back
         # from the bottom; stop once we hit the boundary (UserBubble /

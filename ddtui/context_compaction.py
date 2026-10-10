@@ -15,6 +15,7 @@ from contextlib import aclosing
 from .config import (COMPACT_KEEP_RECENT_TURNS, COMPACT_RECENT_TOKENS,
                      COMPACT_TARGET_FRACTION, COMPACT_TOOL_SNIPPET_CHARS)
 from .history_archive import archive_messages
+from .history_store import stamp_message
 from .runtime_messages import RUNTIME_TASK_EVENT_KIND
 
 
@@ -162,8 +163,8 @@ def recovery_message(ctx, batch: str, *, summary: bool) -> dict:
     if ctx.experiments:
         parts.append(f"实验账本 {len(ctx.experiments)} 项：涉及验证/性能结论时用 experiment_status 核对版本和证据。")
     parts.append("需要后台状态时用 task_list/task_check；只恢复下一步需要的材料，不必遍历所有工具。")
-    return {"role": "system", "ddtui_kind": "context_recovery", "content": "\n".join(parts),
-            "history_batch": batch}
+    return stamp_message({"role": "system", "ddtui_kind": "context_recovery", "content": "\n".join(parts),
+                          "history_batch": batch})
 
 
 _SUMMARY_INSTRUCTIONS = """你是工作状态整理助手，直接输出中文工作记录，不调用工具，不继续执行任务。
@@ -359,9 +360,9 @@ async def compact_history(messages, *, provider, ctx, model, effort,
         input_budget = max(1024, int((context_limit or 100_000) * 0.6))
         summary = await summarize(provider, model, effort, rendered, guidance,
                                   input_tokens=input_budget, on_progress=on_progress)
-    memory = {"role": "system", "ddtui_kind": "explore_summary" if protected_prefix else "history_summary",
-              "content": "# 历史摘要（当前工作状态；原始证据可检索）\n\n" + summary,
-              "history_batch": batch}
+    memory = stamp_message({"role": "system", "ddtui_kind": "explore_summary" if protected_prefix else "history_summary",
+                            "content": "# 历史摘要（当前工作状态；原始证据可检索）\n\n" + summary,
+                            "history_batch": batch})
     recovery = recovery_message(ctx, batch, summary=True)
     candidate = prefix + fixed + [memory, recovery] + pinned + tail
     mode = "summary"

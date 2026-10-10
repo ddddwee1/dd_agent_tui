@@ -25,7 +25,7 @@ from .app_remote import AppRemoteMixin
 from .app_subagents import AppSubagentMixin
 from .app_support import build_env_block, load_agents_md
 from .app_ui import AppUiMixin
-from .history_store import HistoryStore
+from .history_store import HistoryStore, stamp_message
 from .config import (
     CONFIRM_WRITES,
     DEFAULT_PROVIDER,
@@ -274,7 +274,7 @@ class AgentApp(
         self._agents_md_loaded = agents_md is not None
         if POST_SYSTEM_PROMPT:
             prefix.append({"role": "system", "content": POST_SYSTEM_PROMPT})
-        return prefix
+        return [stamp_message(message) for message in prefix]
 
     @property
     def messages(self) -> HistoryStore:

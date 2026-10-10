@@ -24,7 +24,20 @@ process).
 from __future__ import annotations
 
 from collections.abc import Iterable, MutableSequence
+from datetime import datetime
 from typing import Any
+
+
+def stamp_message(message: dict) -> dict:
+    """Stamp a newly recorded message; never use this to backfill loaded history.
+
+    Assistant timestamps mark completed streams, tool timestamps mark result
+    recording, and queued inputs are stamped when admitted to the conversation.
+    Keep existing stamps when the same message is retained or archived again.
+    """
+    if "ddtui_timestamp" not in message:
+        message["ddtui_timestamp"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    return message
 
 
 class HistoryStore(MutableSequence):

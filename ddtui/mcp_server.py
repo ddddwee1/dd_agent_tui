@@ -101,11 +101,13 @@ def _condense_messages(
 
     condensed: list[dict[str, Any]] = []
     for m in tail:
+        metadata = {"ddtui_timestamp": m["ddtui_timestamp"]} if "ddtui_timestamp" in m else {}
         role = m.get("role")
         content = str(m.get("content") or "")
         if role == "tool":
             name = call_names.get(str(m.get("tool_call_id") or ""), "?")
             condensed.append({
+                **metadata,
                 "role": "tool",
                 "content": f"[tool {name} → {len(content):,} chars]",
             })
@@ -116,9 +118,10 @@ def _condense_messages(
             if calls:
                 suffix = f"[calls: {', '.join(calls)}]"
                 text = f"{text}\n{suffix}" if text else suffix
-            condensed.append({"role": "assistant", "content": text})
+            condensed.append({**metadata, "role": "assistant", "content": text})
             continue
         condensed.append({
+            **metadata,
             "role": str(role or "?"),
             "content": _clip_text(content, max_chars),
         })

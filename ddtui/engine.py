@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from .app_support import _merge_tool_call_delta
+from .history_store import stamp_message
 from .runtime_messages import guard_assistant_runtime_claims
 from .context_compaction import history_tokens
 from .tool_output import limit_tool_output, trim_tool_history
@@ -240,7 +241,7 @@ class TurnEngine:
             self.ctx.context_model = self.model
             await self.observer.on_usage(usage, elapsed=elapsed, ttft=ttft)
         content, _guarded = guard_assistant_runtime_claims(content)
-        msg: dict = {"role": "assistant", "content": content}
+        msg = stamp_message({"role": "assistant", "content": content})
         if reasoning:
             self.provider.attach_reasoning(msg, reasoning)
         if tool_calls:
@@ -362,26 +363,26 @@ class TurnEngine:
     async def _commit(
         self, tc: dict, name: str, args: dict, outcome: ToolOutcome
     ) -> None:
+        msg = stamp_message({"role": "tool", "tool_call_id": tc.get("id")})
         digest = result_digest(outcome.content)
         # Retrieval tools already paginate exact JSON. Re-excerpting their
         # results would hide next_start and create recursive archive reads.
         if name not in {"history_read", "history_search"}:
             outcome.content = limit_tool_output(
                 self.ctx, outcome.content, name=name, call_id=tc.get("id"), arguments=args,
+                source_message=msg,
             )
         outcome.content = self._loop_guard.observe(
             self.ctx, name=name, args=args, call_id=tc.get("id"),
             content=outcome.content, digest=digest, ok=outcome.ok,
+            source_message=msg,
         )
         if name not in {"history_read", "history_search"}:
             outcome.content = limit_tool_output(
                 self.ctx, outcome.content, name=name, call_id=tc.get("id"), arguments=args,
+                source_message=msg,
             )
-        msg = {
-            "role": "tool",
-            "tool_call_id": tc.get("id"),
-            "content": str(outcome.content),
-        }
+        msg["content"] = str(outcome.content)
         if getattr(outcome.content, "ref", None):
             msg["ddtui_history_ref"] = outcome.content.ref
             msg["ddtui_output_chars"] = outcome.content.original_chars

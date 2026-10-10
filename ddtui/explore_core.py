@@ -24,6 +24,7 @@ from .app_support import _render_history_for_summary
 from .config import EXPLORE_ARCHIVE_DIR
 from .context_compaction import render_history, summarize
 from .history_archive import archive_messages
+from .history_store import stamp_message
 from .runtime_state import atomic_write_json
 from .state import ExploreState
 
@@ -361,14 +362,14 @@ async def explore_end(
         f"raw_archive: {archive_path}\n"
         f"history_batch: {batch}; history_search/history_read 可按引用恢复原文。"
     )
-    summary_message = {
+    summary_message = stamp_message({
         "role": "system",
         "content": summary_content,
         "ddtui_kind": "explore_summary",
         "explore_id": explore_id,
         "explore_kind": kind,
         "explore_archive": str(archive_path),
-    }
+    })
 
     before_chars = _message_chars(raw_messages)
     after_chars = len(summary_content)

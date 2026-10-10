@@ -26,6 +26,7 @@ from .config import (
     SUBAGENT_SYSTEM_PROMPT,
 )
 from .engine import ToolOutcome, TurnEngine, TurnObserver
+from .history_store import stamp_message
 from .context_compaction import auto_compact
 from .runtime_messages import runtime_task_event_message
 from .state import (
@@ -208,8 +209,8 @@ class AppSubagentMixin:
                 outcome = "cancelled"
                 raise
             except Exception as exc:
-                sess.messages.append({"role": "system", "ddtui_kind": "context_recovery",
-                                      "content": f"上下文压缩未应用，原历史保留：{exc}"})
+                sess.messages.append(stamp_message({"role": "system", "ddtui_kind": "context_recovery",
+                                                    "content": f"上下文压缩未应用，原历史保留：{exc}"}))
             finally:
                 progress.finish(outcome)
 
@@ -530,6 +531,7 @@ class AppSubagentMixin:
                 "content": f"# Subagent role / constraints\n\n{system.strip()}",
             })
         sub_messages.append({"role": "user", "content": prompt})
+        sub_messages = [stamp_message(message) for message in sub_messages]
 
         # Subagent-visible schemas come straight from the registry:
         # no spawn_* (no recursive forking), no checkpoint_* (no consumer
@@ -616,7 +618,7 @@ class AppSubagentMixin:
                 f"Error: session {sid} has an unread result. Call "
                 "agent_check first to consume it."
             )
-        sess.messages.append({"role": "user", "content": prompt})
+        sess.messages.append(stamp_message({"role": "user", "content": prompt}))
         sess.last_active_at = time.monotonic()
         sess.task = asyncio.create_task(self._run_subagent_task(sess))
         return (

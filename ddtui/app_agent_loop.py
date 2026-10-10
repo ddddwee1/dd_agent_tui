@@ -25,6 +25,7 @@ from textual.widgets import Static
 
 from .app_errors import _exception_block
 from .engine import ToolOutcome, TurnEngine, TurnObserver
+from .history_store import stamp_message
 from .runtime_messages import runtime_task_event_message
 from .tools import PARENT_TOOL_SCHEMAS
 from .widgets import (
@@ -230,7 +231,7 @@ class AppAgentLoopMixin:
                 user_message = (
                     runtime_task_event_message(pending)
                     if pending_is_runtime
-                    else {"role": "user", "content": pending}
+                    else stamp_message({"role": "user", "content": pending})
                 )
                 self.messages.append(user_message)
                 try:
@@ -319,17 +320,13 @@ class AppAgentLoopMixin:
             pending_steer = self._steer
             self._steer = []
             for s, parked in pending_steer:
-                self.messages.append(
-                    {"role": "user", "content": f"[实时插话] {s}"}
-                )
+                message = stamp_message({"role": "user", "content": f"[实时插话] {s}"})
+                self.messages.append(message)
                 try:
                     self._remote_emit(
                         "message.append",
                         {
-                            "message": {
-                                "role": "user",
-                                "content": f"[实时插话] {s}",
-                            },
+                            "message": message,
                             "source": "steer",
                         },
                     )

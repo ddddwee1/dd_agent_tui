@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 
 from .history_archive import archive_messages
+from .history_store import stamp_message
 from .tool_output import ArchivedOutput
 
 
@@ -51,7 +52,7 @@ class ToolLoopGuard:
             self._latest_user = latest
 
     def observe(self, ctx, *, name: str, args: dict, call_id: str | None,
-                content: str, digest: str, ok: bool) -> str:
+                content: str, digest: str, ok: bool, source_message: dict | None = None) -> str:
         # Bash's exit status is the last real status line in its result; stdout
         # may contain other "Exit code" strings. Errors retain their full preview.
         exit_codes = re.findall(r"^Exit code: (-?\d+)\s*$", content, re.M) if name == "bash" else []
@@ -65,10 +66,12 @@ class ToolLoopGuard:
             if not failed:
                 return content
         if previous is None or previous.digest != digest:
+            source = (dict(source_message) if source_message is not None
+                      else stamp_message({"role": "tool"}))
+            source.update(tool_call_id=call_id, name=name, content=str(content))
             self._observations[key] = _Observation(
                 digest=digest,
-                source={"role": "tool", "tool_call_id": call_id, "name": name,
-                        "content": str(content)},
+                source=source,
                 ref=getattr(content, "ref", None),
                 original_chars=getattr(content, "original_chars", len(content)),
             )
