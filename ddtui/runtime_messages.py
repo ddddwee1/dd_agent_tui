@@ -8,8 +8,9 @@ from .history_store import stamp_message
 
 
 RUNTIME_TASK_EVENT_KIND = "runtime_task_event"
+EXPERIMENT_RUNTIME_KIND = "experiment_runtime"
 _RESERVED_RE = re.compile(
-    r"\[(Async task (?:notice|complete)|Subagent result)(?:[^\]\n]*)\]"
+    r"\[(Async task (?:notice|complete)|Subagent result|Experiment runtime|Experiment completion check)(?:[^\]\n]*)\]"
 )
 _REPLACEMENT = "[assistant runtime-status claim: unverified]"
 
@@ -56,6 +57,6 @@ def guard_assistant_runtime_claims(text: str) -> tuple[str, bool]:
     if changed:
         guarded = (
             "> Runtime status in assistant prose is unverified; use the "
-            "runtime event card or task_check.\n\n" + guarded
+            "runtime event card, task_check or experiment_status.\n\n" + guarded
         )
     return guarded, changed

@@ -14,6 +14,8 @@ from typing import Any
 
 from .state import ToolContext, async_task_status
 from .tool_utils import _safe_path
+from .source_identity import change_kind, refresh, source_snapshot
+from .optimization import active_plan, budget_status, completion_state, correctness_passed
 
 
 _ATTEMPT_TYPES = {"candidate", "fix"}
@@ -82,6 +84,15 @@ def validate_experiment_snapshot(
             f"Expected {expected_path} sha256={expected_sha}. Start a new "
             "experiment after changing candidate bytes."
         )
+    snapshot = experiment.get('source_snapshot')
+    if snapshot:
+        try:
+            current = refresh(snapshot)
+        except (OSError, ValueError, SyntaxError) as exc:
+            return f'Error: cannot inspect experiment source dependencies: {exc}'
+        if current['files'] != snapshot['files']:
+            return 'Error: executable source dependencies changed; start a new experiment.'
+        hashes.update(current['files'])
     return None
 
 
@@ -94,6 +105,8 @@ def tool_experiment_start(
     parent_id: str | None = None,
     max_candidates: int = 3,
     max_same_boundary_fixes: int = 2,
+    source_root: str | None = None,
+    dependencies: list[str] | None = None,
 ) -> str:
     """Start one immutable candidate/fix attempt and snapshot its SHA-256."""
     attempt_type = _clean(attempt_type, 40).lower()
@@ -108,28 +121,45 @@ def tool_experiment_start(
             return "Error: a fix requires a valid parent_id."
         if not boundary:
             boundary = ctx.experiments[parent_id].get("boundary") or "unspecified"
+        if active_plan(ctx) and ctx.experiments[parent_id].get('plan_start_number') != ctx.optimization_plan['first_experiment_number']:
+            return 'Error: fix parent must belong to the active experiment plan.'
     p = _safe_path(ctx.work_dir, artifact_path)
     if not p.is_file():
         return f"Error: artifact is not a readable file: {p}"
     try:
         sha = sha256_file(p)
-    except OSError as exc:
+        if active_plan(ctx):
+            base = ctx.optimization_plan['baseline']
+            if str(p.resolve()) != base['entry']:
+                return 'Error: this plan binds a different entry file; edit the planned entry.'
+            deps = ctx.optimization_plan.get('current_dependencies', base['dependencies'])
+            if dependencies is not None:
+                deps = sorted({str(_safe_path(ctx.work_dir, d)) for d in dependencies})
+            snapshot = source_snapshot(p, Path(base['root']), deps)
+            ctx.optimization_plan['current_dependencies'] = deps
+        else:
+            root = _safe_path(ctx.work_dir, source_root) if source_root else p.parent
+            snapshot = source_snapshot(p, root, [_safe_path(ctx.work_dir, d) for d in (dependencies or [])])
+    except (OSError, ValueError, SyntaxError) as exc:
         return f"Error hashing artifact {p}: {exc}"
 
     max_candidates = _bounded_int(max_candidates, 3, 1, 100)
     max_same_boundary_fixes = _bounded_int(max_same_boundary_fixes, 2, 0, 100)
-    if ctx.experiments:
-        first = next(iter(ctx.experiments.values()))
+    attempts = list(ctx.experiments.values())
+    if active_plan(ctx):
+        attempts = [entry for entry in attempts if entry.get('plan_start_number') == ctx.optimization_plan['first_experiment_number']]
+    if attempts:
+        first = attempts[0]
         max_candidates = _bounded_int(first.get("max_candidates"), 3, 1, 100)
         max_same_boundary_fixes = _bounded_int(
             first.get("max_same_boundary_fixes"), 2, 0, 100
         )
     candidate_number = sum(
-        entry["attempt_type"] == "candidate" for entry in ctx.experiments.values()
+        entry["attempt_type"] == "candidate" for entry in attempts
     )
     fix_number = sum(
         entry["attempt_type"] == "fix" and entry.get("boundary") == boundary
-        for entry in ctx.experiments.values()
+        for entry in attempts
     )
     if attempt_type == "candidate":
         candidate_number += 1
@@ -152,6 +182,9 @@ def tool_experiment_start(
         "id": experiment_id,
         "artifact_path": str(p),
         "artifact_sha256": sha,
+        "source_snapshot": snapshot,
+        "plan_start_number": ctx.optimization_plan['first_experiment_number'] if active_plan(ctx) else None,
+        "change_kind": change_kind(ctx.optimization_plan['baseline'], snapshot) if active_plan(ctx) else 'uncompared',
         "hypothesis": hypothesis,
         "boundary": boundary or "unspecified",
         "attempt_type": attempt_type,
@@ -172,6 +205,9 @@ def tool_experiment_start(
         f"Experiment {experiment_id} started\n"
         f"artifact: {p}\n"
         f"artifact_sha256: {sha}\n"
+        f"change_kind: {entry['change_kind']}\n"
+        f"source_files: {len(snapshot['files'])}; coverage: {snapshot['coverage']}\n"
+        f"source_unknown: {snapshot['unknown']}\n"
         f"attempt: {attempt_type}\n"
         f"boundary: {entry['boundary']}\n"
         f"candidate_budget: {candidate_number}/{max_candidates}\n"
@@ -182,10 +218,7 @@ def tool_experiment_start(
 
 
 def _has_valid_correctness(entry: dict) -> bool:
-    for record in reversed(entry["records"]):
-        if record["kind"] == "correctness" and record["valid"]:
-            return record["result"] == "pass"
-    return False
+    return correctness_passed(entry)
 
 
 def tool_experiment_record(
@@ -225,6 +258,13 @@ def tool_experiment_record(
         current_sha = None
     if current_sha != entry["artifact_sha256"]:
         invalid_reasons.append("artifact bytes changed after experiment_start")
+    snapshot = entry.get('source_snapshot')
+    if snapshot:
+        try:
+            if refresh(snapshot)['files'] != snapshot['files']:
+                invalid_reasons.append('executable source dependencies changed after experiment_start')
+        except (OSError, ValueError, SyntaxError):
+            invalid_reasons.append('executable source dependencies cannot be inspected')
 
     task_status = None
     task_return_code = None
@@ -248,6 +288,8 @@ def tool_experiment_record(
             invalid_reasons.append("task was not bound to this experiment_id")
         if task_artifacts.get(entry["artifact_path"]) != entry["artifact_sha256"]:
             invalid_reasons.append("task artifact SHA does not match experiment SHA")
+        if snapshot and any(task_artifacts.get(p) != h for p, h in snapshot['files'].items()):
+            invalid_reasons.append('task did not bind all executable source dependencies')
         if task_status == "killed" and result != "inconclusive":
             invalid_reasons.append(
                 f"task status is {task_status} (return_code {task_return_code})"
@@ -300,7 +342,7 @@ def tool_experiment_record(
         entry["status"] = "invalidated"
     entry["records"].append(record)
     entry["updated_at"] = _now()
-    if decision == "keep":
+    if decision == "keep" and valid and result == 'pass' and _has_valid_correctness(entry):
         entry["status"] = "kept"
     elif decision == "rollback":
         entry["status"] = "rolled_back"
@@ -329,9 +371,13 @@ def tool_experiment_status(
             return f"Error: unknown experiment_id {experiment_id!r}."
     else:
         entries = list(ctx.experiments.values())
-    if not entries:
+    if not entries and not ctx.optimization_plan:
         return "No experiments recorded."
     lines = [f"Experiment ledger: {len(entries)} attempt(s)"]
+    if ctx.optimization_plan:
+        import json
+        lines.append('runtime_budget: ' + json.dumps(budget_status(ctx)))
+        lines.append('completion: ' + json.dumps(completion_state(ctx), ensure_ascii=False))
     for entry in entries:
         valid_correctness = _has_valid_correctness(entry)
         valid_performance = any(

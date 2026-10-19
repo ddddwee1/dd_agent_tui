@@ -197,6 +197,10 @@ TOOLS = [
                             "the exact recorded SHA-256."
                         ),
                     },
+                    "budget_phase": {
+                        "type": "string", "enum": ["screen", "fix", "confirm", "local"],
+                        "description": "With an active experiment_plan, screen (default) spends search slots; fix requires a child fix attempt; confirm requires a correctness-passed candidate; local is CPU-only and consumes no device slot. All native execution must use this managed path.",
+                    },
                 },
                 "required": ["command"],
             },
@@ -1734,7 +1738,7 @@ TOOLS = [
                     "active_refs": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Active task ids, subagent ids, PR ids, etc.",
+                        "description": "Active task ids, subagent ids, document receipt ids (doc-N) needed for the current stage, PR ids, etc.",
                     },
                     "files": {
                         "type": "array",
@@ -1797,6 +1801,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "experiment_plan",
+            "description": "Before editing a correct baseline for optimization, bind its entry and local imports, declare real time/device budgets and reserve repair/confirmation slots. Runtime feedback is automatic each model round; completion checks are bounded to two corrections. Does not select an algorithm or model. An active plan cannot be reset. Dynamic imports and non-Python inputs need explicit dependencies.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artifact_path": {"type": "string"},
+                    "source_root": {"type": "string", "description": "Local import root; default entry's parent."},
+                    "dependencies": {"type": "array", "items": {"type": "string"}},
+                    "wall_seconds": {"type": "integer", "description": "Default 1200; use the task's agreed budget."},
+                    "max_device_requests": {"type": "integer", "description": "Default 10 managed device tasks."},
+                    "reserve_device_requests": {"type": "integer", "description": "Default 3 slots protected from new candidate screening."},
+                    "reserve_seconds": {"type": "integer", "description": "Default 300 seconds for repair/confirmation."},
+                    "required_change": {"type": "string", "enum": ["any", "implementation"], "description": "Implementation rejects literal-only tuning; AST changes still require reached-path and performance review."},
+                },
+                "required": ["artifact_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "experiment_start",
             "description": (
                 "Start a bounded implementation experiment and snapshot one "
@@ -1837,6 +1862,8 @@ TOOLS = [
                         "type": "integer",
                         "description": "Declared fix budget per boundary. Default 2.",
                     },
+                    "source_root": {"type": "string", "description": "Local import root; inherited from an active plan."},
+                    "dependencies": {"type": "array", "items": {"type": "string"}, "description": "Explicit dynamic/non-Python dependencies; inherited from an active plan."},
                 },
                 "required": ["artifact_path", "hypothesis"],
             },

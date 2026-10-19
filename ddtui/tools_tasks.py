@@ -44,6 +44,7 @@ from .state import (
 )
 from .tools_checkpoint import prune_checkpoint_refs
 from .tools_experiments import snapshot_artifacts, validate_experiment_snapshot
+from .optimization import active_plan, admit_device_request
 from .tool_utils import (
     _check_dangerous,
     _safe_path,
@@ -462,6 +463,7 @@ def tool_task_start(
     notice_time: float | int | None = None,
     artifacts: list[str] | None = None,
     experiment_id: str | None = None,
+    budget_phase: str = 'screen',
 ) -> str:
     """Start a managed asynchronous shell task."""
     err = _check_dangerous(command)
@@ -503,6 +505,9 @@ def tool_task_start(
     )
     if experiment_error:
         return experiment_error
+    budget_error = admit_device_request(ctx, experiment_id, budget_phase)
+    if budget_error:
+        return budget_error
 
     task_id = ctx.alloc_task_id()
     task_name = (name or description or _short_command(command)).strip()
@@ -554,6 +559,9 @@ def tool_task_start(
     except Exception as e:
         clear_path(spec_path)
         return f"Error starting task: {e}"
+
+    if active_plan(ctx) and budget_phase != 'local':
+        ctx.optimization_plan['device_requests'] += 1
 
     task = AsyncTask(
         id=task_id,

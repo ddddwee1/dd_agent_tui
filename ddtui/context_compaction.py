@@ -16,7 +16,7 @@ from .config import (COMPACT_KEEP_RECENT_TURNS, COMPACT_RECENT_TOKENS,
                      COMPACT_TARGET_FRACTION, COMPACT_TOOL_SNIPPET_CHARS)
 from .history_archive import archive_messages
 from .history_store import stamp_message
-from .runtime_messages import RUNTIME_TASK_EVENT_KIND
+from .runtime_messages import EXPERIMENT_RUNTIME_KIND, RUNTIME_TASK_EVENT_KIND
 
 
 MEMORY_KINDS = {"history_summary", "context_recovery", "explore_summary"}
@@ -50,7 +50,7 @@ def is_memory(message: dict) -> bool:
 
 
 def is_user_instruction(message: dict) -> bool:
-    return message.get("role") == "user" and message.get("ddtui_kind") != RUNTIME_TASK_EVENT_KIND
+    return message.get("role") == "user" and message.get("ddtui_kind") not in {RUNTIME_TASK_EVENT_KIND, EXPERIMENT_RUNTIME_KIND, "document_recovery"}
 
 
 def evidence_excerpt(text: str, limit: int = COMPACT_TOOL_SNIPPET_CHARS) -> str:
@@ -160,6 +160,7 @@ def recovery_message(ctx, batch: str, *, summary: bool) -> dict:
                      evidence_excerpt(json.dumps(checkpoint, ensure_ascii=False), 2200))
     if ctx.doc_receipts:
         parts.append(f"文档阅读记录 {len(ctx.doc_receipts)} 条：需要恢复文档路径时用 doc_route_status。")
+        parts.append("历史已读不等于正文仍在当前上下文。自动恢复只覆盖预算内的已读正文；未恢复、过时或只读过目录的内容用 read_doc/follow_doc_link 重新读取。")
     if ctx.experiments:
         parts.append(f"实验账本 {len(ctx.experiments)} 项：涉及验证/性能结论时用 experiment_status 核对版本和证据。")
     parts.append("需要后台状态时用 task_list/task_check；只恢复下一步需要的材料，不必遍历所有工具。")
@@ -300,7 +301,7 @@ async def compact_history(messages, *, provider, ctx, model, effort,
     body = original[protected_prefix:]
     fixed = [m for m in body if m.get("role") == "system" and not is_memory(m)]
     fixed_ids = {id(m) for m in fixed}
-    body = [m for m in body if id(m) not in fixed_ids and m.get("ddtui_kind") != "context_recovery"]
+    body = [m for m in body if id(m) not in fixed_ids and m.get("ddtui_kind") not in {"context_recovery", "document_recovery"}]
     if len(body) < 2:
         raise ValueError("没有可压缩的完整历史段。")
 
@@ -366,18 +367,28 @@ async def compact_history(messages, *, provider, ctx, model, effort,
     recovery = recovery_message(ctx, batch, summary=True)
     candidate = prefix + fixed + [memory, recovery] + pinned + tail
     mode = "summary"
+    from .tools_docs import DOC_RECOVERY_MAX_CHARS, restore_document_sections
+    available = max(0, min(target, before - 1) - history_tokens(candidate, tools))
+    documents, receipt_updates, deferred = restore_document_sections(
+        ctx, candidate, max_chars=min(DOC_RECOVERY_MAX_CHARS, available))
+    insertion = len(prefix) + len(fixed) + 2
+    candidate[insertion:insertion] = documents
     await _report_progress(on_progress, "phase", "校验压缩结果…")
     safe_boundaries(candidate)
     after = history_tokens(candidate, tools)
     if after >= before:
         raise ValueError("压缩未减少上下文，保留原历史")
+    for key, update in receipt_updates.items():
+        ctx.doc_receipts[key].update(update)
     before_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in original)
     after_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in candidate)
     return candidate, {"before_n": len(original), "after_n": len(candidate),
                        "before_chars": before_chars, "after_chars": after_chars,
                        "saved": max(0, before_chars - after_chars),
                        "before_tokens": before, "after_tokens": after, "target_tokens": target,
-                       "target_met": after <= target, "mode": mode, "batch": batch}
+                       "target_met": after <= target, "mode": mode, "batch": batch,
+                       "restored_documents": [m["document_receipt_id"] for m in documents],
+                       "deferred_documents": deferred}
 
 
 def request_pressure(ctx, messages, tools, context_limit: int) -> tuple[int, int]:

@@ -375,7 +375,7 @@ claude mcp add ddtui -- ddtui-mcp --token-file ~/.ddtui/remote_token
 - 文件：`read_file`、`read_files`、`read_doc`、`follow_doc_link`、`doc_route_status`、`write_file`、`edit_file`、`edit_lines`、`multi_edit`
 - 搜索：`list_files`、`glob_files`、`search_content`
 - Web：`web_fetch`、`web_search`
-- 任务进度与证据：`todo_tool`、`experiment_start`、`experiment_record`、`experiment_status`
+- 任务进度与证据：`todo_tool`、`experiment_plan`、`experiment_start`、`experiment_record`、`experiment_status`
 - 子 agent：`spawn_agent`、`chat_agent`、`agent_check`、`end_agent`
 
 `read_files(files=[{"path": "a.py"}, {"path": "b.py", "offset": 40,
@@ -443,7 +443,17 @@ ssh -tt host 'tmux new -A -s ddtui-agent'
 
 长 Markdown 使用渐进式读取：`read_doc(path)` 先返回标题目录和显式链接；指定 `heading`/`anchor` 时只返回对应章节。`follow_doc_link` 只沿模型当前推理明确选择的一条链接前进，`doc_route_status` 保存已读章节、已跟随边和失效路径。它不会自动抓完整个链接图；`read_file` / `search_content` 仍是阅读任意源码的逃逸口。route receipt 跟随 autosave，并在 `/compact` 后继续保留。
 
+阅读回执记录文档 SHA-256 与正文输出身份，`doc_route_status` 区分历史已读和当前上下文可见。压缩后优先恢复 checkpoint 的 `active_refs` 中指定的文档回执，再按最近阅读顺序补充不同正文章节；在剩余上下文预算内最多恢复六节、总计最多 32,000 字符。只恢复版本一致的已读章节，不展开链接，也不把标题目录算作正文。文档已变、版本未知或超出恢复预算时保持未恢复状态，`read_doc` 或 `follow_doc_link` 可以再次读取。自动恢复内容作为参考材料进入上下文，不作为用户指令；原有章节输出裁剪标记继续保留。通过 shell 或普通文件工具读取的文档没有章节回执，需要显式 `read_doc` 才能使用这项恢复机制。
+
 多候选实现使用 `experiment_start` 对候选文件做不可变 SHA-256 快照，并记录 candidate/fix 类型、失败边界和预算。`experiment_record` 把 correctness、performance、source gate 等证据绑定到对应 task/命令；同一 SHA 尚无有效 correctness 时，performance 会被保存但明确标为 invalid。`experiment_status` 给出可压缩、可恢复的总账。
+
+优化前调用 `experiment_plan(artifact_path=..., source_root=..., required_change="implementation")` 冻结基线并声明任务的时间、设备请求和保留额度。运行时每轮自动提供 elapsed/remaining、设备剩余额度和搜索/纠错阶段；活跃计划不能重置预算。进程内使用单调时钟，恢复会话按保存的截止时间扣除离线时间。声明预算只控制新任务的准入，不会终止已启动的任务。
+
+活跃计划下，上板命令通过 `task_start(..., experiment_id=..., artifacts=[entry], budget_phase=...)` 执行：`screen` 使用搜索额度；进入保留阶段后只允许绑定同计划修复尝试的 `fix`，或已有该源码正确性证据的 `confirm`。启动失败不扣配额，已启动但失败的命令仍计数。`local` 用于 CPU 检查，不消耗设备请求。单位是受管理的命令请求，不是测试用例或 kernel launch；通过 bash/terminal 等旁路执行的命令无法自动识别为上板请求，不能用它们绕过预算。
+
+源码快照追踪入口及 `source_root` 内的静态 Python 导入，自动把依赖哈希绑定到 task。动态导入、数据文件和外部代码须通过 `dependencies` 显式声明，安装库另记工具链身份。未导入的备份不进入比较；注释或 docstring 变化不算实现进展，但验证仍绑定原始字节哈希。`parameters` 表示仅字面量变化；`implementation_candidate` 只是 AST 结构变化，需要检查运行路径，不能单凭它宣称结构性优化或提速。
+
+结束检查核对当前源与依赖、是否回退，以及是否有有效的正确性和性能证据；最多自动续接两轮纠错，任务仍在后台运行时等待完成通知。未解决的问题标为 incomplete。此检查不证明完整用例覆盖、真实结构路径或性能收益，也不会选择替代模型。状态进入已有会话存储，不在项目目录创建实验台账。
 
 真实 task/subagent 通知由运行时作为带内部类型的 user event card 注入。普通 assistant 文本如果仿写 `[Async task complete]` 等保留前缀，会被改写为未验证状态声明；权威状态以 event card 或 `task_check` 为准。
 

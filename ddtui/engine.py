@@ -36,10 +36,12 @@ from typing import Awaitable, Callable
 
 from .app_support import _merge_tool_call_delta
 from .history_store import stamp_message
-from .runtime_messages import guard_assistant_runtime_claims
+from .runtime_messages import EXPERIMENT_RUNTIME_KIND, guard_assistant_runtime_claims
 from .context_compaction import history_tokens
 from .tool_output import limit_tool_output, trim_tool_history
 from .tool_loop_guard import ToolLoopGuard, result_digest
+from .tools_docs import sync_document_visibility
+from .optimization import completion_feedback, round_feedback
 from .state import ToolContext, TOOL_ERROR_PREFIXES
 from .tools import (
     APP_DISPATCHED_TOOLS,
@@ -190,15 +192,29 @@ class TurnEngine:
             trim_tool_history(self.messages, self.ctx)
             if self.before_round is not None:
                 await self.before_round()
+            sync_document_visibility(self.ctx, self.messages)
+            feedback = round_feedback(self.ctx)
+            if feedback:
+                await self._experiment_feedback(feedback)
+                self.ctx.optimization_plan['model_rounds'] += 1
             self._loop_guard.sync_context(self.messages)
             msg = await self._stream_once()
+            tool_calls = msg.get("tool_calls") or []
+            feedback = completion_feedback(self.ctx) if not tool_calls else None
             self.messages.append(msg)
             await self.observer.on_assistant_message(msg)
             await self.observer.on_history_appended(msg, "assistant")
-            tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
+                if feedback:
+                    await self._experiment_feedback(feedback)
+                    continue
                 return
             await self._run_tool_batch(tool_calls)
+
+    async def _experiment_feedback(self, text):
+        msg = stamp_message({'role': 'user', 'content': text, 'ddtui_kind': EXPERIMENT_RUNTIME_KIND})
+        self.messages.append(msg)
+        await self.observer.on_history_appended(msg, 'runtime')
 
     # ── streaming ──
 

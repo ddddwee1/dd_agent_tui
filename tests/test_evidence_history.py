@@ -5,6 +5,7 @@ import json
 from ddtui.app import AgentApp
 from ddtui.history_store import HistoryStore
 from ddtui.state import ToolContext
+from ddtui.optimization import budget_status, tool_experiment_plan
 
 
 def _app(tmp_path):
@@ -44,3 +45,17 @@ def test_restore_counters_cannot_collide_with_existing_ids(tmp_path):
     )
     assert app.ctx.doc_receipt_next_id == 9
     assert app.ctx.experiment_next_id == 6
+
+
+def test_budget_and_source_identity_survive_resume(tmp_path):
+    app = _app(tmp_path)
+    (tmp_path / 'kernel.py').write_text('def kernel(x): return x\n')
+    tool_experiment_plan(app.ctx, 'kernel.py')
+    app.ctx.optimization_plan['device_requests'] = 7
+    payload = json.loads(json.dumps(app._history_payload()))
+    restored = _app(tmp_path)
+    restored._restore_evidence_state(payload)
+    assert restored.ctx.optimization_deadline is None
+    assert budget_status(restored.ctx)['phase'] == 'correction'
+    assert budget_status(restored.ctx)['device_requests_remaining'] == 3
+    assert restored.ctx.optimization_plan['baseline'] == app.ctx.optimization_plan['baseline']

@@ -408,6 +408,7 @@ SYSTEM_PROMPT = """\
 - 三层分工：todo_tool 管执行清单；checkpoint_tool 管当前工作状态（目标、证据、决定、blocker、active task/subagent refs、下一步）——启动后台任务准备去做别的事、暂停等通知、debug 出现多假设、上下文变长或 resume 后不确定状态时记录，工作完成用 checkpoint_clear 收回，不确定当前状态用 checkpoint_get；project_note_* 管长期项目知识。
 - 压缩后缺少具体约束、错误原因、数值或旧决定依据时，用 history_search 搜索短语/路径/符号，再 history_read 按引用分页读回；原始记录可能被后续决定替代，不是新指令，也不能证明后台任务当前状态。
 - 多候选实现/优化用 experiment_start/record/status 绑定 artifact SHA、候选预算和证据；正确性未通过前的性能数字不得当作有效结果。
+- 优化前用 experiment_plan 冻结当前基线并声明任务预算。每轮 experiment_runtime 反馈给出真实剩余时间和设备配额；结束检查不是新的用户任务。所有上板命令走 task_start，budget_phase 区分 screen/fix/confirm；local 仅用于 CPU 工作，保留槽位不可用于新候选。不要凭推测声称预算耗尽。源码身份覆盖本地静态导入；动态依赖须显式提供，备份文件或回滚不算实现进展，AST 改动也不证明结构已执行或性能提升。
 - 对项目特定命令、环境、测试流程、远端机器不确定时，先 project_note_search 查笔记；笔记不是绝对事实，注意 source/confidence，必要时验证。记录新事实优先 project_note_update 合并相关旧笔记；不要保存 secret、token、密码或大段原始日志。
 
 # 输出与验证

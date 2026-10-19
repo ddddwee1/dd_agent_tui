@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from .history_archive import archive_messages
 from .history_store import stamp_message
 from .tool_output import ArchivedOutput
+from .runtime_messages import EXPERIMENT_RUNTIME_KIND
 
 
 log = logging.getLogger(__name__)
@@ -46,7 +47,8 @@ class ToolLoopGuard:
         self._latest_user = None
 
     def sync_context(self, messages) -> None:
-        latest = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+        latest = next((m for m in reversed(messages) if m.get("role") == "user"
+                       and m.get('ddtui_kind') != EXPERIMENT_RUNTIME_KIND), None)
         if latest is not self._latest_user:
             self._observations.clear()
             self._latest_user = latest

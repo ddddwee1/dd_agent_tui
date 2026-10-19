@@ -42,6 +42,7 @@ from .tools_experiments import (
     tool_experiment_start,
     tool_experiment_status,
 )
+from .optimization import tool_experiment_plan
 from .tools_files import (
     tool_apply_patch,
     tool_edit_file,
@@ -161,6 +162,7 @@ def _specs() -> list[ToolSpec]:
         S("history_search", tool_history_search, parallel=True),
         S("history_read", tool_history_read, parallel=True),
         S("experiment_start", tool_experiment_start),
+        S("experiment_plan", tool_experiment_plan),
         S("experiment_record", tool_experiment_record),
         S("experiment_status", tool_experiment_status),
         S("checkpoint_tool", tool_checkpoint_tool, subagent=False),

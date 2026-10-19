@@ -198,6 +198,37 @@ def test_checkpoint_is_directly_available_in_recovery_card():
     assert "doc_route_status" in card and "experiment_status" in card
 
 
+def test_compaction_restores_document_body_across_repeated_compaction(tmp_path):
+    from ddtui.tools_docs import tool_read_doc, sync_document_visibility
+    (tmp_path / "guide.md").write_text("# Guide\n\n## Contract\nExact contraction boundary.\n")
+    ctx = ToolContext(work_dir=str(tmp_path), session_id="document-recovery")
+    output = tool_read_doc(ctx, "guide.md", heading="Contract")
+    messages = long_task()
+    messages[2:2] = [call("read_doc", "document"), result("document", output)]
+    candidate, stats = compact(messages, ctx)
+    recovered = [m for m in candidate if m.get("ddtui_kind") == "document_recovery"]
+    assert len(recovered) == 1 and "Exact contraction boundary." in recovered[0]["content"]
+    assert not cc.is_user_instruction(recovered[0])
+    assert stats["restored_documents"] == ["doc-1"]
+    sync_document_visibility(ctx, candidate)
+    assert ctx.doc_receipts["doc-1"]["context_status"] == "visible"
+    candidate.extend(long_task()[2:])
+    again, _ = compact(candidate, ctx)
+    assert len([m for m in again if m.get("ddtui_kind") == "document_recovery"]) == 1
+    cc.safe_boundaries(again)
+
+
+def test_failed_compaction_does_not_change_document_receipts(tmp_path):
+    from ddtui.tools_docs import tool_read_doc
+    (tmp_path / "guide.md").write_text("# Guide\n\n## Contract\nKeep exact.\n")
+    ctx = ToolContext(work_dir=str(tmp_path), session_id="document-failure")
+    tool_read_doc(ctx, "guide.md", heading="Contract")
+    before = copy.deepcopy(ctx.doc_receipts)
+    with pytest.raises(RuntimeError):
+        compact(long_task(), ctx, Provider(""))
+    assert ctx.doc_receipts == before
+
+
 def test_open_exploration_compacts_in_stages_and_can_still_end(tmp_path, monkeypatch):
     import ddtui.explore_core as ex
     monkeypatch.setattr(ex, "EXPLORE_ARCHIVE_DIR", tmp_path / "explorations")

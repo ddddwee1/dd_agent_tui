@@ -258,6 +258,9 @@ class ToolContext:
     # Candidate/evidence ledger for bounded implementation experiments.
     experiments: dict[str, dict] = field(default_factory=dict)
     experiment_next_id: int = 1
+    optimization_plan: dict | None = None
+    # Live deadlines use a monotonic clock; resume reconstructs from the saved wall deadline.
+    optimization_deadline: float | None = None
     # Ephemeral request-size calibration. Never restore provider usage from a
     # previous process/model, or retry compaction every round on the same input.
     context_last_prompt: int = 0

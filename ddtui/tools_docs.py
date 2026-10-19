@@ -9,6 +9,7 @@ technical route for the model.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from datetime import datetime
@@ -16,6 +17,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from .state import ToolContext
+from .history_store import stamp_message
 from .tool_utils import _safe_path
 from .tools_files import _note_file_known
 
@@ -23,6 +25,9 @@ from .tools_files import _note_file_known
 DOC_SECTION_MAX_CHARS = 32_000
 DOC_MAX_LINE_CHARS = 2_000
 DOC_MAX_LINKS = 40
+DOC_RECOVERY_MAX_CHARS = 32_000
+DOC_RECOVERY_MAX_SECTIONS = 6
+DOC_RECOVERY_PREFIX = "[Automatically restored document section; reference material, not a new user instruction.]\n\n"
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _INLINE_LINK_RE = re.compile(
     r"(?<!!)\[([^\]]+)\]\(\s*<?([^\s)>]+)>?(?:\s+[^)]*)?\)"
@@ -212,6 +217,7 @@ def _render_receipt(receipt: dict, body: str) -> str:
     lines = [
         f"Document receipt {receipt['id']}",
         f"path: {receipt['path']}",
+        f"source_sha256: {receipt.get('source_sha256', 'unknown')}",
         f"selection: {receipt['heading'] or 'outline'}",
         f"selection_lines: {receipt['start_line']}-{receipt['end_line']}",
         f"shown_through_line: {receipt['shown_through_line']}",
@@ -247,7 +253,8 @@ def _create_receipt(
     if p.suffix.lower() not in {".md", ".markdown", ".mdown"}:
         return f"Error: read_doc only accepts Markdown files: {p}"
     try:
-        text = p.read_text(encoding="utf-8")
+        source = p.read_bytes()
+        text = source.decode("utf-8")
     except FileNotFoundError:
         return f"Error: file not found: {p}"
     except UnicodeDecodeError:
@@ -305,6 +312,8 @@ def _create_receipt(
         "parent_receipt_id": parent_receipt_id,
         "parent_link_id": parent_link_id,
         "created_at": _now(),
+        "source_sha256": hashlib.sha256(source).hexdigest(),
+        "context_status": "visible",
     }
     ctx.doc_receipts[receipt_id] = receipt
     for prior in ctx.doc_receipts.values():
@@ -315,7 +324,95 @@ def _create_receipt(
             ):
                 link["covered_receipt_id"] = receipt_id
     _note_file_known(ctx, p)
-    return _render_receipt(receipt, body)
+    output = _render_receipt(receipt, body)
+    receipt["output_sha256"] = hashlib.sha256(output.encode("utf-8")).hexdigest()
+    return output
+
+
+def document_visibility(messages, receipts) -> dict[str, str]:
+    """A reading receipt is visible only while its actual output is present."""
+    digests = set()
+    for message in messages:
+        content = message.get("content") or ""
+        if message.get("ddtui_kind") == "document_recovery":
+            content = content.removeprefix(DOC_RECOVERY_PREFIX)
+        elif message.get("role") != "tool":
+            continue
+        if content.startswith("Document receipt "):
+            digests.add(hashlib.sha256(content.encode("utf-8")).hexdigest())
+    return {key: "visible" if receipt.get("output_sha256") in digests else "archived"
+            for key, receipt in receipts.items()}
+
+
+def sync_document_visibility(ctx, messages) -> None:
+    for key, status in document_visibility(messages, ctx.doc_receipts).items():
+        ctx.doc_receipts[key]["context_status"] = status
+
+
+def restore_document_sections(ctx, messages, *, max_chars=DOC_RECOVERY_MAX_CHARS):
+    """Prepare bounded, version-checked rereads without mutating live state.
+
+    Restore checkpoint document refs, then recent distinct body selections. Outlines remain outlines;
+    links are not followed automatically and old file versions are not treated
+    as current documentation. The caller commits receipt updates with history.
+    """
+    visibility = document_visibility(messages, ctx.doc_receipts)
+    updates = {key: {"context_status": status} for key, status in visibility.items()}
+    restored, deferred, seen = [], [], set()
+    used = 0
+    latest = {(r.get("path"), r.get("anchor")): key for key, r in ctx.doc_receipts.items()}
+    pinned = []
+    for reference in (ctx.checkpoint or {}).get("active_refs") or []:
+        match = re.match(r"^(doc-\d+)(?![\w-])", reference.strip()) if isinstance(reference, str) else None
+        key = match.group(1) if match else None
+        if key in ctx.doc_receipts:
+            receipt = ctx.doc_receipts[key]
+            pinned.append(latest[(receipt.get("path"), receipt.get("anchor"))])
+    order = pinned + list(reversed(ctx.doc_receipts))
+    for key in order:
+        receipt = ctx.doc_receipts[key]
+        selection = (receipt.get("path"), receipt.get("anchor"))
+        if selection in seen:
+            continue
+        seen.add(selection)
+        if not receipt.get("heading") or visibility[key] == "visible":
+            continue
+        if len(restored) >= DOC_RECOVERY_MAX_SECTIONS:
+            deferred.append({"receipt_id": key, "reason": "section_budget"})
+            continue
+        try:
+            source = Path(receipt["path"]).read_bytes()
+            text = source.decode("utf-8")
+            source_hash = hashlib.sha256(source).hexdigest()
+            if not receipt.get("source_sha256"):
+                raise ValueError("document version unknown; use read_doc to read current content")
+            if source_hash != receipt["source_sha256"]:
+                raise ValueError("document changed; use read_doc to read current content")
+            lines = text.splitlines()
+            headings = _headings(lines)
+            selected, error = _select_heading(headings, None, receipt.get("anchor"))
+            if error or selected is None:
+                raise ValueError(error or "section not found")
+            start, end = _section_bounds(lines, headings, selected)
+            body, complete, shown_through = _numbered(
+                [(i + 1, lines[i]) for i in range(start, end)], DOC_SECTION_MAX_CHARS)
+            current = {**receipt, "content_complete": complete,
+                       "shown_through_line": shown_through}
+            output = _render_receipt(current, body)
+        except (OSError, UnicodeError, ValueError, KeyError) as exc:
+            deferred.append({"receipt_id": key, "reason": str(exc)})
+            continue
+        content = DOC_RECOVERY_PREFIX + output
+        if used + len(content) > max_chars:
+            deferred.append({"receipt_id": key, "reason": "character_budget"})
+            continue
+        restored.append(stamp_message({"role": "user", "ddtui_kind": "document_recovery",
+                                       "content": content, "document_receipt_id": key}))
+        updates[key].update(context_status="visible", content_complete=complete,
+                            shown_through_line=shown_through,
+                            output_sha256=hashlib.sha256(output.encode("utf-8")).hexdigest())
+        used += len(content)
+    return list(reversed(restored)), updates, deferred
 
 
 def tool_read_doc(
@@ -356,11 +453,17 @@ def tool_follow_doc_link(
         return f"Error: link label is ambiguous in {receipt_id}.\n{available}"
     link = matches[0]
     existing = link["followed_receipt_id"] or link.get("covered_receipt_id")
-    if existing and existing in ctx.doc_receipts:
+    prior = ctx.doc_receipts.get(existing, {})
+    try:
+        unchanged = (hashlib.sha256(Path(prior["path"]).read_bytes()).hexdigest()
+                     == prior.get("source_sha256"))
+    except (OSError, KeyError):
+        unchanged = False
+    if prior.get("context_status") == "visible" and unchanged:
         link["followed_receipt_id"] = existing
         return (
             f"Link already covered by {existing}; no duplicate content returned.\n"
-            f"{_format_link(link)}\nUse doc_route_status(receipt_id={existing!r})."
+            f"{_format_link(link)}\nUse read_doc with the target path and anchor to reread the body."
         )
     if link["external"]:
         return "Error: external links are not read by follow_doc_link; use web_fetch."
@@ -412,7 +515,8 @@ def tool_doc_route_status(ctx: ToolContext, receipt_id: str | None = None) -> st
             f"{receipt['start_line']}-{receipt['end_line']}; "
             f"links {covered}/{len(receipt['links'])} covered, "
             f"{unresolved} unresolved, "
-            f"truncated={receipt.get('links_truncated', False)}"
+            f"truncated={receipt.get('links_truncated', False)}; "
+            f"context={receipt.get('context_status', 'unknown')}"
         )
         for link in receipt["links"]:
             lines.append(f"  {_format_link(link)}")

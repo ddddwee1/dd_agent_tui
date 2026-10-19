@@ -30,7 +30,7 @@ from .runtime_state import (
     read_json,
     turn_journal_path,
 )
-from .runtime_messages import RUNTIME_TASK_EVENT_KIND
+from .runtime_messages import EXPERIMENT_RUNTIME_KIND, RUNTIME_TASK_EVENT_KIND
 from .state import TokenCounter
 from .tools import DIFF_STRIP_TOOLS, PARENT_TOOL_SCHEMAS, SUBAGENT_TOOL_SCHEMAS
 from .tools_tasks import recover_tasks_for_session
@@ -140,6 +140,7 @@ class AppHistoryMixin:
             "doc_receipt_next_id": self.ctx.doc_receipt_next_id,
             "experiments": self.ctx.experiments,
             "experiment_next_id": self.ctx.experiment_next_id,
+            "optimization_plan": self.ctx.optimization_plan,
             "active_explore": self._explore_payload(),
             # list(): HistoryStore is deliberately not JSON-serializable.
             "messages": list(self.messages),
@@ -165,6 +166,9 @@ class AppHistoryMixin:
             payload.get("experiment_next_id"),
             "exp-",
         )
+        plan = payload.get('optimization_plan')
+        self.ctx.optimization_plan = plan if isinstance(plan, dict) and 'baseline' in plan and 'deadline_wall' in plan else None
+        self.ctx.optimization_deadline = None
 
     def _turn_journal_path(self) -> Path:
         return turn_journal_path(self._session_id)
@@ -651,6 +655,8 @@ class AppHistoryMixin:
                 continue
             content = m.get("content") or ""
             if role == "user":
+                if m.get('ddtui_kind') == EXPERIMENT_RUNTIME_KIND:
+                    continue  # Per-round controller facts are available through experiment_status.
                 if m.get("ddtui_kind") == RUNTIME_TASK_EVENT_KIND:
                     await self._mount_task_event_notice(content)
                 elif content.startswith("[实时插话] "):

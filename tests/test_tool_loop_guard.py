@@ -57,6 +57,22 @@ def test_repeated_read_runs_again_and_changed_file_returns_new_evidence(tmp_path
     assert "Unchanged result:" not in results[2]["content"]
 
 
+def test_runtime_budget_feedback_does_not_reset_read_repetition(tmp_path):
+    ctx = ToolContext(work_dir=str(tmp_path), session_id='budget-read-repeat')
+    (tmp_path / 'file.txt').write_text('unchanged evidence')
+    messages = [{'role': 'user', 'content': 'inspect the file'}]
+
+    async def before():
+        messages.append({'role': 'user', 'ddtui_kind': 'experiment_runtime', 'content': 'current budget'})
+
+    engine = TurnEngine(provider=Provider([('1', 'read_file', {'path': 'file.txt'}),
+                                          ('2', 'read_file', {'path': 'file.txt'})]),
+                        ctx=ctx, messages=messages, tools=[], model='fake', effort='low', before_round=before)
+    asyncio.run(engine.run_turn())
+    results = [m for m in messages if m['role'] == 'tool']
+    assert results[1]['content'].startswith('Unchanged result:')
+
+
 def test_mutation_and_explicit_archive_reads_do_not_get_suppressed(tmp_path):
     ctx = ToolContext(work_dir=str(tmp_path), session_id="mutation")
     executed = []
