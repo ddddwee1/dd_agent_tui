@@ -237,6 +237,9 @@ class ToolContext:
     terminals: dict[str, TerminalSession] = field(default_factory=dict)
     tasks: dict[str, AsyncTask] = field(default_factory=dict)
     checkpoint: dict | None = None
+    # Workflow notices are derived from checkpoint state, not another history.
+    checkpoint_notice: str = ""
+    checkpoint_recovery_key: str | None = None
     terminal_next_id: int = 1
     task_next_id: int = 1
     # True for a subagent's ToolContext. Subagent task events are

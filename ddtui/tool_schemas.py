@@ -132,6 +132,8 @@ TOOLS = [
                 "blocking or you need one short bounded inspection because "
                 "the current output changes your next action. "
                 "Use task_start for long-running work whose completion matters. "
+                "A registered workflow with pending stage review must first be reconciled "
+                "through checkpoint_tool(stage=..., workflow_ref=...). "
                 "Same footgun guard as bash."
             ),
             "parameters": {
@@ -580,8 +582,10 @@ TOOLS = [
                 "API conventions, or user-approved decisions. Do not store "
                 "secrets, one-off transient observations, or large raw logs. "
                 "Prefer concise notes with tags. If the note is an inference "
-                "rather than a verified fact, set source='inferred' and lower "
-                "confidence. Before adding, prefer project_note_search and "
+                "rather than a verified fact, set source='inferred'. Observed notes need "
+                "available evidence_refs. Link causal explanations with hypothesis_ids; "
+                "open/refuted hypotheses cannot become observed notes. Provenance checks "
+                "do not establish causality. Before adding, prefer project_note_search and "
                 "project_note_update when an existing related note should be "
                 "consolidated instead of duplicated."
             ),
@@ -607,11 +611,19 @@ TOOLS = [
                     },
                     "source": {
                         "type": "string",
-                        "description": "One of user, observed, inferred, imported. Default observed.",
+                        "description": "One of user, observed, inferred, imported. Default inferred; observed without evidence is saved as inferred.",
                     },
                     "confidence": {
                         "type": "string",
                         "description": "One of low, medium, high. Default medium.",
+                    },
+                    "evidence_refs": {
+                        "type": "array", "items": {"type": "string"}, "maxItems": 8,
+                        "description": "Completed task-N, observed exp-N, or archived tool msg-SHA references from this session. Not assistant summaries.",
+                    },
+                    "hypothesis_ids": {
+                        "type": "array", "items": {"type": "string"}, "maxItems": 8,
+                        "description": "Checkpoint hypothesis ids used by this explanation. Supported status still does not prove a unique root cause.",
                     },
                 },
                 "required": ["title", "body"],
@@ -710,7 +722,8 @@ TOOLS = [
                 "Prefer updating an existing related note over adding a "
                 "near-duplicate note. Unspecified fields are unchanged. "
                 "Set archived=true to hide an outdated note from normal "
-                "search/list results."
+                "search/list results. Changed claims need fresh evidence_refs/hypothesis_ids "
+                "to retain observed provenance; confidence alone is not evidence."
             ),
             "parameters": {
                 "type": "object",
@@ -743,6 +756,14 @@ TOOLS = [
                     "archived": {
                         "type": "boolean",
                         "description": "Set true to archive/soft-delete; false to restore.",
+                    },
+                    "evidence_refs": {
+                        "type": "array", "items": {"type": "string"}, "maxItems": 8,
+                        "description": "Current-session task-N, exp-N or archived tool msg-SHA references for the updated claim.",
+                    },
+                    "hypothesis_ids": {
+                        "type": "array", "items": {"type": "string"}, "maxItems": 8,
+                        "description": "Checkpoint hypothesis ids underlying the updated explanation.",
                     },
                 },
                 "required": ["note_id"],
@@ -1680,7 +1701,12 @@ TOOLS = [
                 "decisions, blockers, active task/subagent refs, touched files, "
                 "and next steps. Use todo_tool for checklist items. Use "
                 "project_note_* only for durable repo knowledge. Keep it short "
-                "and factual."
+                "and factual. For skill-guided work, register stage, skill_ref and workflow_ref "
+                "at the start. After related task results or context recovery, reconcile the "
+                "stage before another managed task by explicitly providing stage and workflow_ref. "
+                "Omitted workflow fields and hypotheses persist. No query tool is mandatory. "
+                "Causal explanations stay open until a scoped discriminating test has evidence; "
+                "supported means model-assessed support, not an automatic root-cause verdict."
             ),
             "parameters": {
                 "type": "object",
@@ -1712,8 +1738,19 @@ TOOLS = [
                     },
                     "hypotheses": {
                         "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Current hypotheses or debugging theories.",
+                        "maxItems": 20,
+                        "items": {"anyOf": [
+                            {"type": "string"},
+                            {"type": "object", "properties": {
+                                "id": {"type": "string", "description": "Stable hypothesis id; preserve it when updating the same explanation."},
+                                "claim": {"type": "string"},
+                                "scope": {"type": "string", "description": "Applicable source/configuration/environment; unknown scope stays open."},
+                                "test": {"type": "string", "description": "Discriminating test, prediction and observed outcome; pass/fail alone does not establish cause."},
+                                "status": {"type": "string", "enum": ["open", "supported", "refuted"]},
+                                "evidence_refs": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                            }, "required": ["id", "claim"], "additionalProperties": False},
+                        ]},
+                        "description": "Current scoped hypotheses. Supported/refuted entries require scope, test and completed task-N, observed exp-N or tool msg-SHA evidence. Legacy strings remain open. Omit to preserve; [] explicitly clears.",
                     },
                     "evidence": {
                         "type": "array",
@@ -1754,6 +1791,17 @@ TOOLS = [
                         "type": "string",
                         "description": "Optional short caveat or handoff note.",
                     },
+                    "stage": {
+                        "type": "string", "enum": ["implement", "debug", "optimize", "deliver"],
+                        "description": "Work phase, separate from waiting/in_progress. Explicitly provide together with workflow_ref to confirm a stage review.",
+                    },
+                    "workflow_ref": {
+                        "type": "string",
+                        "description": "Applicable local workflow file, optionally #heading. Provide with stage after reviewing conditions; sufficient material already in context can be reused.",
+                    },
+                    "skill_ref": {
+                        "type": "string", "description": "Active skill entry path; register once and preserve across phase changes.",
+                    },
                 },
                 "required": ["goal", "status", "summary"],
             },
@@ -1782,9 +1830,9 @@ TOOLS = [
             "description": (
                 "Clear the current conversation checkpoint and remove the "
                 "checkpoint sidebar block. Use when the tracked work, waiting "
-                "state, blocker, or handoff is resolved. Task completion "
-                "notifications may also auto-clear waiting checkpoints whose "
-                "active_refs only contain completed task ids."
+                "state, blocker, or handoff is resolved. Registered workflow and "
+                "hypothesis state survives task completion; clearing it is explicit. "
+                "Task completion may auto-clear a legacy waiting-only checkpoint."
             ),
             "parameters": {
                 "type": "object",

@@ -41,6 +41,7 @@ from .context_compaction import history_tokens
 from .tool_output import limit_tool_output, trim_tool_history
 from .tool_loop_guard import ToolLoopGuard, result_digest
 from .tools_docs import sync_document_visibility
+from .tools_checkpoint import checkpoint_feedback
 from .optimization import completion_feedback, round_feedback
 from .state import ToolContext, TOOL_ERROR_PREFIXES
 from .tools import (
@@ -192,6 +193,9 @@ class TurnEngine:
             trim_tool_history(self.messages, self.ctx)
             if self.before_round is not None:
                 await self.before_round()
+            workflow_feedback = checkpoint_feedback(self.ctx, self.messages)
+            if workflow_feedback:
+                await self._experiment_feedback(workflow_feedback)
             sync_document_visibility(self.ctx, self.messages)
             feedback = round_feedback(self.ctx)
             if feedback:

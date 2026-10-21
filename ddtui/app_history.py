@@ -34,7 +34,7 @@ from .runtime_messages import EXPERIMENT_RUNTIME_KIND, RUNTIME_TASK_EVENT_KIND
 from .state import TokenCounter
 from .tools import DIFF_STRIP_TOOLS, PARENT_TOOL_SCHEMAS, SUBAGENT_TOOL_SCHEMAS
 from .tools_tasks import recover_tasks_for_session
-from .tools_checkpoint import tool_checkpoint_clear, tool_checkpoint_tool
+from .tools_checkpoint import request_stage_review, tool_checkpoint_clear, tool_checkpoint_tool
 from .widgets import (
     AssistantMessage,
     CompactionBlock,
@@ -599,6 +599,8 @@ class AppHistoryMixin:
         if "checkpoint" in payload:
             snapshot = payload.get("checkpoint")
             self.ctx.checkpoint = snapshot if isinstance(snapshot, dict) else None
+            request_stage_review(self.ctx, "Session resumed; reconcile the stage and unresolved hypotheses with the actual current results.")
+            self.ctx.checkpoint_notice = ""
             await self._sync_checkpoint_block()
         self._autosave_path = target
         if recovery_input:

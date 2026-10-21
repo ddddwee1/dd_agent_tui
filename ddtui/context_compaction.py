@@ -16,6 +16,7 @@ from .config import (COMPACT_KEEP_RECENT_TURNS, COMPACT_RECENT_TOKENS,
                      COMPACT_TARGET_FRACTION, COMPACT_TOOL_SNIPPET_CHARS)
 from .history_archive import archive_messages
 from .history_store import stamp_message
+from .tools_checkpoint import workflow_card
 from .runtime_messages import EXPERIMENT_RUNTIME_KIND, RUNTIME_TASK_EVENT_KIND
 
 
@@ -158,6 +159,9 @@ def recovery_message(ctx, batch: str, *, summary: bool) -> dict:
     if checkpoint:
         parts.append("Checkpoint 快照（可能过时，完整记录用 checkpoint_get）：\n" +
                      evidence_excerpt(json.dumps(checkpoint, ensure_ascii=False), 2200))
+        card = workflow_card(ctx)
+        if card:
+            parts.append(card)
     if ctx.doc_receipts:
         parts.append(f"文档阅读记录 {len(ctx.doc_receipts)} 条：需要恢复文档路径时用 doc_route_status。")
         parts.append("历史已读不等于正文仍在当前上下文。自动恢复只覆盖预算内的已读正文；未恢复、过时或只读过目录的内容用 read_doc/follow_doc_link 重新读取。")

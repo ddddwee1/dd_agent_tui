@@ -42,7 +42,7 @@ from .state import (
     ToolContext,
     async_task_status as _task_status,
 )
-from .tools_checkpoint import prune_checkpoint_refs
+from .tools_checkpoint import checkpoint_task_gate, prune_checkpoint_refs, track_checkpoint_task
 from .tools_experiments import snapshot_artifacts, validate_experiment_snapshot
 from .optimization import active_plan, admit_device_request
 from .tool_utils import (
@@ -469,6 +469,9 @@ def tool_task_start(
     err = _check_dangerous(command)
     if err:
         return f"Error: {err}"
+    review_error = checkpoint_task_gate(ctx)
+    if review_error:
+        return review_error
     notice_seconds = _clamp_notice_time(notice_time)
     if not notify_on_complete:
         notice_seconds = None
@@ -586,6 +589,7 @@ def tool_task_start(
         runner_pid=proc.pid,
     )
     ctx.tasks[task_id] = task
+    track_checkpoint_task(ctx, task_id)
     _write_registry(task)
     _write_status(task)
 
@@ -655,6 +659,8 @@ def tool_task_check(
     if task is None:
         return f"Error: unknown task_id {task_id!r}. Use task_list to see tasks."
     status, _rc, _elapsed = _task_status(task)
+    if status != "running":
+        prune_checkpoint_refs(ctx, [task_id])
     if status == "running" and task.notify_on_complete:
         task.check_count += 1
     tail_lines = _clamp_int(tail_lines, TASK_DEFAULT_TAIL_LINES, 0, 500)
@@ -688,6 +694,8 @@ def tool_task_read(
         return f"Error reading task output: {e}"
     status, rc, elapsed = _task_status(task)
     _write_status(task)
+    if status != "running":
+        prune_checkpoint_refs(ctx, [task_id])
     content = chunk.decode("utf-8", errors="replace")
     warn = ""
     if status == "running" and task.notify_on_complete:

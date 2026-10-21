@@ -24,6 +24,7 @@ from .config import (
     PROJECT_NOTES_DIR,
 )
 from .state import ToolContext
+from .tools_checkpoint import evidence_refs as validate_evidence_refs
 
 
 _SOURCES = {"user", "observed", "inferred", "imported"}
@@ -125,7 +126,7 @@ def _normalize_tags(tags: list[str] | str | None) -> list[str]:
 
 
 def _normalize_source(source: str | None) -> str:
-    value = (source or "observed").strip().lower()
+    value = (source or "inferred").strip().lower()
     if value not in _SOURCES:
         raise NoteError(
             f"source must be one of {', '.join(sorted(_SOURCES))}"
@@ -264,6 +265,7 @@ def _format_note_summary(note: dict, query: str = "") -> str:
         f"title: {note.get('title')}\n"
         f"tags: {tags}  source={note.get('source')}  "
         f"confidence={note.get('confidence')}  updated={note.get('updated_at')}\n"
+        f"evidence_refs: {note.get('evidence_refs') or []}; provenance is not a root-cause verdict\n"
         f"snippet:\n{_snippet(note, query)}"
     )
 
@@ -280,6 +282,9 @@ def _format_note_full(note: dict, notes_file: Path) -> str:
         f"tags: {tags}\n"
         f"source: {note.get('source')}\n"
         f"confidence: {note.get('confidence')}\n"
+        f"evidence_session_id: {note.get('evidence_session_id') or 'unbound'}\n"
+        f"evidence_refs: {note.get('evidence_refs') or []}\n"
+        f"hypotheses: {note.get('hypotheses') or []}\n"
         f"notes_file: {notes_file}\n"
         "--- body ---\n"
         f"{note.get('body') or ''}"
@@ -294,13 +299,40 @@ def _get_note(store: dict[str, Any], note_id: str) -> dict:
     return note
 
 
+def _provenance(ctx, source, refs, hypothesis_ids):
+    """Keep unsupported explanations inferred, without interpreting note prose."""
+    ids = hypothesis_ids or []
+    if not isinstance(ids, list) or len(ids) > 8 or not all(isinstance(item, str) for item in ids):
+        raise NoteError("hypothesis_ids must contain at most eight checkpoint hypothesis ids")
+    hypotheses = {item["id"]: item for item in (ctx.checkpoint or {}).get("hypotheses", []) if isinstance(item, dict)}
+    refs = validate_evidence_refs(ctx, refs)
+    linked = []
+    for hypothesis_id in dict.fromkeys(ids):
+        item = hypotheses.get(hypothesis_id)
+        if not item:
+            raise NoteError(f"unknown checkpoint hypothesis {hypothesis_id!r}")
+        linked.append({key: item.get(key) for key in ("id", "claim", "scope", "test", "status", "evidence_refs")})
+        if item.get("status") == "supported":
+            if not item.get("scope") or not item.get("test") or not item.get("evidence_refs"):
+                raise NoteError(f"{hypothesis_id} needs scope, a discriminating test and evidence_refs")
+            refs.extend(validate_evidence_refs(ctx, item.get("evidence_refs")))
+    warning = ""
+    if source == "observed" and (not refs or any(item["status"] != "supported" for item in linked)):
+        source = "inferred"
+        warning = "\nProvenance: saved as inferred; confidence and summaries cannot establish an unsupported explanation."
+    return source, {"evidence_session_id": ctx.session_id, "evidence_refs": list(dict.fromkeys(refs)),
+                    "hypotheses": linked}, warning
+
+
 def tool_project_note_add(
     ctx: ToolContext,
     title: str,
     body: str,
     tags: list[str] | str | None = None,
-    source: str = "observed",
+    source: str = "inferred",
     confidence: str = "medium",
+    evidence_refs: list[str] | None = None,
+    hypothesis_ids: list[str] | None = None,
 ) -> str:
     """Add a new reusable project-local note."""
     try:
@@ -308,6 +340,7 @@ def tool_project_note_add(
         note_tags = _normalize_tags(tags)
         note_source = _normalize_source(source)
         note_confidence = _normalize_confidence(confidence)
+        note_source, provenance, warning = _provenance(ctx, note_source, evidence_refs, hypothesis_ids)
         store, notes_dir, notes_file = _load_store(ctx)
         notes = store.setdefault("notes", {})
         note_id = _make_note_id()
@@ -319,13 +352,14 @@ def tool_project_note_add(
             "tags": note_tags,
             "source": note_source,
             "confidence": note_confidence,
+            **provenance,
             "created_at": now,
             "updated_at": now,
             "rev": 1,
             "archived": False,
         }
         _save_store(store, notes_dir, notes_file)
-    except NoteError as e:
+    except (NoteError, ValueError) as e:
         return f"Error: {e}"
     except Exception as e:
         return f"Error adding project note: {e}"
@@ -334,6 +368,7 @@ def tool_project_note_add(
         f"title: {title}\n"
         f"tags: {', '.join(note_tags) or '-'}\n"
         f"notes_file: {notes_file}"
+        + warning
     )
 
 
@@ -444,6 +479,8 @@ def tool_project_note_update(
     source: str | None = None,
     confidence: str | None = None,
     archived: bool | None = None,
+    evidence_refs: list[str] | None = None,
+    hypothesis_ids: list[str] | None = None,
 ) -> str:
     """Patch an existing note in-place."""
     try:
@@ -480,6 +517,18 @@ def tool_project_note_update(
             if new_confidence != note.get("confidence"):
                 note["confidence"] = new_confidence
                 changed.append("confidence")
+        if any(key in changed for key in ("title", "body", "source", "confidence")) or evidence_refs is not None or hypothesis_ids is not None:
+            new_source, provenance, warning = _provenance(ctx, _normalize_source(note.get("source")), evidence_refs, hypothesis_ids)
+            if new_source != note.get("source"):
+                note["source"] = new_source
+                if "source" not in changed:
+                    changed.append("source")
+            for key, value in provenance.items():
+                if note.get(key) != value:
+                    note[key] = value
+                    changed.append(key)
+        else:
+            warning = ""
         if archived is not None:
             new_archived = bool(archived)
             if new_archived != bool(note.get("archived")):
@@ -491,7 +540,7 @@ def tool_project_note_update(
         note["updated_at"] = _now()
         note["rev"] = old_rev + 1
         _save_store(store, notes_dir, notes_file)
-    except NoteError as e:
+    except (NoteError, ValueError) as e:
         return f"Error: {e}"
     except Exception as e:
         return f"Error updating project note: {e}"
@@ -502,6 +551,7 @@ def tool_project_note_update(
         f"tags: {', '.join(note.get('tags') or []) or '-'}\n"
         f"body: {len(old_body):,} chars -> {len(note.get('body') or ''):,} chars\n"
         f"notes_file: {notes_file}"
+        + warning
     )
 
 
