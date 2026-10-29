@@ -4,6 +4,7 @@ rounds through the shared engine, compact_self, result auto-delivery."""
 import asyncio
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import ddtui.engine as engine_mod
@@ -94,6 +95,29 @@ def test_spawn_prompt_stack_and_override(playground):
         assert any("FakeProv / cheap-model" in c for c in sys_msgs)
         assert any("# Subagent role / constraints" in c and "只读调查" in c
                    for c in sys_msgs)
+    asyncio.run(run())
+
+
+def test_subagent_recovers_model_connection(playground, instant_api_retries):
+    class Recovering(FakeProvider):
+        async def stream(self, messages, tools, model, effort):
+            self.stream_calls.append((model, effort))
+            if len(self.stream_calls) == 1:
+                yield LLMStreamEvent(content="半段回答")
+                raise httpx.RemoteProtocolError("lost")
+            yield LLMStreamEvent(content="完整回答")
+
+    async def run():
+        app = FakeApp(playground)
+        app.provider = Recovering()
+        app._spawn_subagent("继续调查", "只读调查")
+        session = app._live_subagents["sub-1"]
+        await _wait_round(session)
+        assert session.phase == "ready"
+        assert session.messages[-1]["content"] == "完整回答"
+        assert len(app.provider.stream_calls) == 2
+        assert instant_api_retries == [1]
+
     asyncio.run(run())
 
 

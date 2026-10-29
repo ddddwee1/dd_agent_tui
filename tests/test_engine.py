@@ -5,6 +5,8 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+import httpx
+
 import ddtui.engine as engine_mod
 
 from ddtui.engine import (
@@ -308,6 +310,90 @@ def test_stream_abort_notifies_and_appends_nothing():
         assert not any(event[0] == "usage" for event in rec.events)
         assert all(m["role"] != "assistant" for m in msgs)
     asyncio.run(run())
+
+
+def test_reconnect_discards_partial_stream_without_repeating_tools(monkeypatch, instant_api_retries):
+    async def run():
+        clock = SimpleNamespace(now=100.0)
+        monkeypatch.setattr(engine_mod, "time", SimpleNamespace(monotonic=lambda: clock.now))
+        closed = []
+        executed = []
+        rounds = []
+
+        class Recovering(ScriptedProvider):
+            async def stream(self, messages, tools, model, effort):
+                self.calls.append(list(messages))
+                attempt = len(self.calls)
+                try:
+                    clock.now += attempt
+                    if attempt == 1:
+                        yield LLMStreamEvent(tool_call=tc(0, "bash", '{"command":"first"}'))
+                    elif attempt == 2:
+                        yield LLMStreamEvent(reasoning="丢弃的思考")
+                        yield LLMStreamEvent(content="丢弃的回答")
+                        yield LLMStreamEvent(tool_call=tc(0, "bash", '{"command":"incomplete"}'))
+                        yield LLMStreamEvent(usage=ProviderUsage(completion_tokens=999))
+                        raise httpx.ReadError("connection lost")
+                    else:
+                        yield LLMStreamEvent(reasoning="新的思考")
+                        yield LLMStreamEvent(content="完整回答")
+                        yield LLMStreamEvent(usage=ProviderUsage(completion_tokens=12))
+                finally:
+                    closed.append(attempt)
+
+        class RetryRecorder(Recorder):
+            async def on_request_retry(self, retry):
+                self.events.append(("retry", retry.attempt))
+
+        def execute(ctx, name, args):
+            executed.append(args["command"])
+            return "ok"
+
+        async def before_round():
+            rounds.append(True)
+
+        provider = Recovering([])
+        recorder = RetryRecorder()
+        messages = [{"role": "user", "content": "继续"}]
+        await make_engine(provider, messages, observer=recorder, executor=execute,
+                          before_round=before_round).run_turn()
+        assert executed == ["first"]
+        assert len(rounds) == 2
+        assert closed == [1, 2, 3]
+        assert provider.calls[1] == provider.calls[2]
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool", "assistant"]
+        assert messages[-1]["content"] == "完整回答"
+        assert messages[-1]["reasoning_content"] == "新的思考"
+        assert "tool_calls" not in messages[-1]
+        samples = [event for event in recorder.events if event[0] == "usage"]
+        assert len(samples) == 1 and samples[0][1].completion_tokens == 12
+        assert samples[0][2] == 3
+        assert ("aborted",) in recorder.events and ("retry", 1) in recorder.events
+        assert instant_api_retries == [1]
+
+    asyncio.run(run())
+
+
+def test_retry_budget_resets_for_each_model_request(monkeypatch, instant_api_retries):
+    import ddtui.api_retry as retry
+    monkeypatch.setattr(retry, "API_MAX_RETRIES", 1)
+
+    class Recovering(ScriptedProvider):
+        async def stream(self, messages, tools, model, effort):
+            self.calls.append(len(messages))
+            if len(self.calls) in (1, 3):
+                raise httpx.ConnectError("offline")
+            if len(self.calls) == 2:
+                yield LLMStreamEvent(tool_call=tc(0, "read_file", '{"path":"a"}'))
+            else:
+                yield LLMStreamEvent(content="done")
+
+    provider = Recovering([])
+    messages = [{"role": "user", "content": "继续"}]
+    asyncio.run(make_engine(provider, messages, executor=fake_executor).run_turn())
+    assert len(provider.calls) == 4
+    assert instant_api_retries == [1, 1]
+    assert messages[-1]["content"] == "done"
 
 
 def test_outcome_classification():

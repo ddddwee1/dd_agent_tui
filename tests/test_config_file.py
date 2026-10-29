@@ -48,6 +48,19 @@ def test_defaults_when_no_file(load_config):
     assert c.CONFIG_FILE_KEY_COUNT == 0
     assert c.CONFIG_FILE_ERROR == ""
     assert c.CONFIG_FILE_UNUSED_KEYS == ()
+    assert c.API_MAX_RETRIES == 5
+    assert c.API_READ_TIMEOUT == 300
+
+
+@pytest.mark.parametrize("values, expected", [
+    ((2, 90), (2, 90)), ((0, 1), (0, 1)), ((-1, 0), (0, 1)),
+    (("invalid", "invalid"), (5, 300)),
+])
+def test_api_retry_settings(load_config, values, expected):
+    retries, timeout = values
+    c = load_config(env={"DDTUI_API_MAX_RETRIES": str(retries),
+                         "DDTUI_API_READ_TIMEOUT": str(timeout)})
+    assert (c.API_MAX_RETRIES, c.API_READ_TIMEOUT) == expected
 
 
 def test_file_value_used(load_config):

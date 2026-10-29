@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 
+import httpx
 import pytest
 
 import ddtui.context_compaction as cc
@@ -40,6 +41,55 @@ def call(name, ident):
 
 def result(ident, body):
     return {"role": "tool", "tool_call_id": ident, "content": body}
+
+
+@pytest.mark.parametrize("in_context", [False, True])
+def test_summary_reconnect_resets_preview_and_partial_text(instant_api_retries, in_context):
+    async def run():
+        calls = []
+        closed = []
+        preview = ""
+        notices = []
+
+        class Recovering(Provider):
+            async def _response(self):
+                calls.append(True)
+                attempt = len(calls)
+                try:
+                    if attempt == 1:
+                        yield LLMStreamEvent(content="必须丢弃的半段摘要")
+                        raise httpx.ReadError("lost")
+                    yield LLMStreamEvent(content="完整摘要")
+                finally:
+                    closed.append(attempt)
+
+            def stream(self, *args):
+                return self._response()
+
+            def stream_text(self, *args):
+                return self._response()
+
+        async def on_progress(kind, text):
+            nonlocal preview
+            if kind == "start":
+                preview = ""
+                notices.append(text)
+            elif kind == "content":
+                preview += text
+
+        provider = Recovering()
+        if in_context:
+            summary = await cc.summarize_in_context(provider, "m", "low", [], "总结",
+                                                    on_progress=on_progress)
+        else:
+            summary = await cc.summarize(provider, "m", "low", "history", "总结",
+                                        input_tokens=1000, on_progress=on_progress)
+        assert summary == preview == "完整摘要"
+        assert closed == [1, 2]
+        assert any("自动重连（1/3）" in text for text in notices)
+        assert instant_api_retries == [1]
+
+    asyncio.run(run())
 
 
 def long_task(n=12, size=5000):

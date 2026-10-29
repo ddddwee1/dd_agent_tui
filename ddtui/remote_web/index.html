@@ -882,6 +882,11 @@
             scrollLogToEnd();
           }
         }
+      } else if (message.type === "assistant.reset") {
+        streaming = null;
+        streamingNodes = null;
+        renderMessages();
+        notice(payload.message || "模型请求正在重连");
       } else if (message.type === "assistant.delta") {
         const kind = payload.kind || "content";
         if (!streaming || streaming.role !== "assistant") {

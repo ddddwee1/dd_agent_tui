@@ -1535,8 +1535,8 @@ class SubagentTabPane(VerticalScroll):
         self._pending_mounts.clear()
         self._tail_tool_group = None
 
-    def mount_exception_notice(self, text: str) -> None:
-        block = Static(Text(text, style="bold #f92672"), markup=False)
+    def mount_exception_notice(self, text: str, *, style: str = "bold #f92672") -> None:
+        block = Static(Text(text, style=style), markup=False)
         self._append_transcript(block)
         if self.is_mounted:
             self.scroll_end(animate=False)

@@ -1,10 +1,14 @@
 """Text-only streaming keeps provider settings and rejects incomplete output."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
+import ddtui.providers as providers
+from ddtui.api_retry import IncompleteStreamError, retry_request
 from ddtui.providers import CodexResponsesProvider, DeepSeekProvider, LLMStreamEvent, ProviderUsage
 
 
@@ -130,5 +134,104 @@ def test_codex_summary_requires_the_completion_event(completed):
         else:
             with pytest.raises(RuntimeError, match="未收到完成事件"):
                 await collect()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "tool_calls", None])
+def test_deepseek_main_stream_requires_a_completion_marker(finish_reason):
+    async def run():
+        async def chunks():
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="输出"))])
+            if finish_reason:
+                yield SimpleNamespace(choices=[SimpleNamespace(
+                    delta=SimpleNamespace(), finish_reason=finish_reason)])
+
+        response = FakeStream(chunks())
+
+        async def create(**kwargs):
+            return response
+
+        provider = DeepSeekProvider.__new__(DeepSeekProvider)
+        provider.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+        async def collect():
+            return [event async for event in provider.stream([], [], "m", "low")]
+
+        if finish_reason:
+            events = await collect()
+            assert "".join(event.content for event in events) == "输出"
+        else:
+            with pytest.raises(IncompleteStreamError):
+                await collect()
+        assert response.closed
+
+    asyncio.run(run())
+
+
+def test_deepseek_main_stream_closes_on_abort():
+    async def run():
+        async def chunks():
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="半段"))])
+
+        response = FakeStream(chunks())
+
+        async def create(**kwargs):
+            return response
+
+        provider = DeepSeekProvider.__new__(DeepSeekProvider)
+        provider.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        stream = provider.stream([], [], "m", "low")
+        assert (await anext(stream)).content == "半段"
+        await stream.aclose()
+        assert response.closed
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["eof", 429, 503])
+def test_codex_request_recovers_and_closes_http_clients(monkeypatch, instant_api_retries, failure):
+    async def run():
+        requests = []
+        clients = []
+
+        def sse(*events):
+            return "".join("data: " + json.dumps(event) + "\n\n" for event in events)
+
+        def handler(request):
+            requests.append(request)
+            if len(requests) == 1:
+                if isinstance(failure, int):
+                    return httpx.Response(failure, text="temporary failure")
+                return httpx.Response(200, text=sse({"type": "response.output_text.delta", "delta": "半段"}))
+            return httpx.Response(200, text=sse(
+                {"type": "response.output_text.delta", "delta": "完整"},
+                {"type": "response.completed", "response": {"usage": {}}},
+            ))
+
+        client_class = httpx.AsyncClient
+
+        def client(**kwargs):
+            assert kwargs["timeout"].read == providers.API_READ_TIMEOUT
+            instance = client_class(transport=httpx.MockTransport(handler), **kwargs)
+            clients.append(instance)
+            return instance
+
+        async def headers():
+            return {"Authorization": "Bearer test"}
+
+        monkeypatch.setattr(providers.httpx, "AsyncClient", client)
+        provider = CodexResponsesProvider.__new__(CodexResponsesProvider)
+        provider.base_url = "https://model.test"
+        provider.auth = SimpleNamespace(headers=headers)
+
+        async def request():
+            return [event async for event in provider.stream([], [], "m", "low")]
+
+        events = await retry_request(request)
+        assert "".join(event.content for event in events) == "完整"
+        assert len(requests) == 2 and requests[0].content == requests[1].content
+        assert all(instance.is_closed for instance in clients)
+        assert instant_api_retries == [1]
 
     asyncio.run(run())

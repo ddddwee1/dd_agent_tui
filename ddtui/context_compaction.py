@@ -12,6 +12,7 @@ import re
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing
 
+from .api_retry import RequestRetry, retry_request
 from .config import (COMPACT_KEEP_RECENT_TURNS, COMPACT_RECENT_TOKENS,
                      COMPACT_TARGET_FRACTION, COMPACT_TOOL_SNIPPET_CHARS)
 from .history_archive import archive_messages
@@ -214,6 +215,13 @@ async def _report_progress(callback: CompactionProgress | None, kind: str, text:
         await callback(kind, text)
 
 
+async def _retry_summary(request, on_progress: CompactionProgress | None) -> str:
+    async def on_retry(retry: RequestRetry) -> None:
+        await _report_progress(on_progress, "start", retry.message)
+
+    return await retry_request(request, on_retry=on_retry)
+
+
 async def summarize_in_context(provider, model, effort, messages, instruction: str,
                                *, tools=(),
                                on_progress: CompactionProgress | None = None) -> str:
@@ -228,21 +236,24 @@ async def summarize_in_context(provider, model, effort, messages, instruction: s
     histories that no longer fit the window alongside the instruction.
     """
     request = list(messages) + [{"role": "user", "content": instruction}]
-    await _report_progress(on_progress, "start", "生成工作状态摘要（原文在上下文内）…")
-    parts = []
-    async with aclosing(provider.stream(request, list(tools), model, effort)) as stream:
-        async for event in stream:
-            if event.tool_call is not None:
-                raise SummaryCalledTools("摘要请求调用了工具")
-            if event.reasoning:
-                await _report_progress(on_progress, "reasoning", event.reasoning)
-            if event.content:
-                parts.append(event.content)
-                await _report_progress(on_progress, "content", event.content)
-    result = "".join(parts).strip()
-    if not result:
-        raise RuntimeError("摘要返回为空")
-    return result
+    async def attempt() -> str:
+        await _report_progress(on_progress, "start", "生成工作状态摘要（原文在上下文内）…")
+        parts = []
+        async with aclosing(provider.stream(request, list(tools), model, effort)) as stream:
+            async for event in stream:
+                if event.tool_call is not None:
+                    raise SummaryCalledTools("摘要请求调用了工具")
+                if event.reasoning:
+                    await _report_progress(on_progress, "reasoning", event.reasoning)
+                if event.content:
+                    parts.append(event.content)
+                    await _report_progress(on_progress, "content", event.content)
+        result = "".join(parts).strip()
+        if not result:
+            raise RuntimeError("摘要返回为空")
+        return result
+
+    return await _retry_summary(attempt, on_progress)
 
 
 async def summarize(provider, model, effort, rendered: str, guidance: str,
@@ -260,21 +271,24 @@ async def summarize(provider, model, effort, rendered: str, guidance: str,
 
     async def one(text, label, *, partial=False):
         prompt = guidance + ("\n这是历史分段，保留引用供随后合并。\n" if partial else "\n") + text
-        await _report_progress(on_progress, "start", label)
-        parts = []
-        async with aclosing(provider.stream_text([instruction, {"role": "user", "content": prompt}], model, effort)) as stream:
-            async for event in stream:
-                if event.tool_call is not None:
-                    raise RuntimeError("摘要生成不允许调用工具")
-                if event.reasoning:
-                    await _report_progress(on_progress, "reasoning", event.reasoning)
-                if event.content:
-                    parts.append(event.content)
-                    await _report_progress(on_progress, "content", event.content)
-        result = "".join(parts).strip()
-        if not result:
-            raise RuntimeError("摘要返回为空")
-        return result
+        async def attempt() -> str:
+            await _report_progress(on_progress, "start", label)
+            parts = []
+            async with aclosing(provider.stream_text([instruction, {"role": "user", "content": prompt}], model, effort)) as stream:
+                async for event in stream:
+                    if event.tool_call is not None:
+                        raise RuntimeError("摘要生成不允许调用工具")
+                    if event.reasoning:
+                        await _report_progress(on_progress, "reasoning", event.reasoning)
+                    if event.content:
+                        parts.append(event.content)
+                        await _report_progress(on_progress, "content", event.content)
+            result = "".join(parts).strip()
+            if not result:
+                raise RuntimeError("摘要返回为空")
+            return result
+
+        return await _retry_summary(attempt, on_progress)
 
     round_n = 0
     while len(rendered) > chunk_chars:

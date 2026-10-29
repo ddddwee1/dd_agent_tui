@@ -16,8 +16,12 @@ from typing import Any, AsyncIterator
 import httpx
 from openai import AsyncOpenAI
 
+from .api_retry import (
+    IncompleteStreamError, ProviderHTTPError, TransientStreamError, retry_request,
+)
 from .codex_auth import CodexAuth
 from .config import (
+    API_READ_TIMEOUT,
     CODEX_BASE_URL,
     CODEX_MODEL,
     CODEX_MODELS_CACHE_PATH,
@@ -190,15 +194,19 @@ class DeepSeekProvider(LLMProvider):
         self.client = AsyncOpenAI(
             api_key=load_deepseek_api_key(),
             base_url=DEEPSEEK_BASE_URL,
+            max_retries=0,
+            timeout=httpx.Timeout(60.0, read=API_READ_TIMEOUT),
         )
 
     async def complete_text(
         self, messages: list[dict], model: str, effort: str
     ) -> str:
-        response = await self.client.chat.completions.create(
-            model=model,
-            messages=_messages_for_wire(messages),
-            stream=False,
+        response = await retry_request(
+            lambda: self.client.chat.completions.create(
+                model=model,
+                messages=_messages_for_wire(messages),
+                stream=False,
+            )
         )
         return (response.choices[0].message.content or "").strip()
 
@@ -210,24 +218,25 @@ class DeepSeekProvider(LLMProvider):
         effort: str,
     ) -> AsyncIterator[LLMStreamEvent]:
         tool_options = {"tools": tools, "tool_choice": "auto"} if tools else {}
-        async for event in self._stream_response(
+        async with aclosing(self._stream_response(
             messages, model, **tool_options,
             reasoning_effort=effort,
             extra_body={"thinking": {"type": "enabled"}},
-        ):
-            yield event
+        )) as stream:
+            async for event in stream:
+                yield event
 
     async def stream_text(
         self, messages: list[dict], model: str, effort: str
     ) -> AsyncIterator[LLMStreamEvent]:
         # Preserve complete_text's summarization settings; streaming alone
         # must not switch DeepSeek summaries into thinking/tool mode.
-        async with aclosing(self._stream_response(messages, model, require_complete=True)) as stream:
+        async with aclosing(self._stream_response(messages, model)) as stream:
             async for event in stream:
                 yield event
 
     async def _stream_response(
-        self, messages: list[dict], model: str, *, require_complete: bool = False, **options
+        self, messages: list[dict], model: str, **options
     ) -> AsyncIterator[LLMStreamEvent]:
         stream = await self.client.chat.completions.create(
             model=model,
@@ -246,7 +255,7 @@ class DeepSeekProvider(LLMProvider):
                 finish_reason = getattr(chunk.choices[0], "finish_reason", None)
                 if finish_reason in ("length", "content_filter"):
                     raise RuntimeError(f"DeepSeek 流式输出未完成：{finish_reason}")
-                completed = completed or finish_reason == "stop"
+                completed = completed or finish_reason in ("stop", "tool_calls")
                 delta = chunk.choices[0].delta
                 # DeepSeek 官方 API 用 reasoning_content；较新的 vLLM
                 # OpenAI 端点把该字段更名为 reasoning（旧名只在输入侧兼容），
@@ -276,8 +285,8 @@ class DeepSeekProvider(LLMProvider):
                             else None,
                         )
                     )
-        if require_complete and not completed:
-            raise RuntimeError("DeepSeek 流式输出未完成：未收到结束标记")
+        if not completed:
+            raise IncompleteStreamError("DeepSeek 流式输出未完成：未收到结束标记")
 
 
 class CodexResponsesProvider(LLMProvider):
@@ -315,11 +324,15 @@ class CodexResponsesProvider(LLMProvider):
     async def complete_text(
         self, messages: list[dict], model: str, effort: str
     ) -> str:
-        parts: list[str] = []
-        async for event in self.stream(messages, [], model, effort):
-            if event.content:
-                parts.append(event.content)
-        return "".join(parts).strip()
+        async def request() -> str:
+            parts: list[str] = []
+            async with aclosing(self.stream_text(messages, model, effort)) as stream:
+                async for event in stream:
+                    if event.content:
+                        parts.append(event.content)
+            return "".join(parts).strip()
+
+        return await retry_request(request)
 
     async def stream_text(
         self, messages: list[dict], model: str, effort: str
@@ -332,7 +345,7 @@ class CodexResponsesProvider(LLMProvider):
                 completed = completed or event.usage is not None
                 yield event
         if not completed:
-            raise RuntimeError("Codex 流式输出未完成：未收到完成事件")
+            raise IncompleteStreamError("Codex 流式输出未完成：未收到完成事件")
 
     async def stream(
         self,
@@ -379,7 +392,7 @@ class CodexResponsesProvider(LLMProvider):
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
         }
-        timeout = httpx.Timeout(60.0, read=None)
+        timeout = httpx.Timeout(60.0, read=API_READ_TIMEOUT)
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream(
                 "POST",
@@ -390,20 +403,26 @@ class CodexResponsesProvider(LLMProvider):
                 if response.status_code == 401 and allow_refresh:
                     await response.aclose()
                     await self.auth.refresh()
-                    async for event in self._stream_payload(
+                    async with aclosing(self._stream_payload(
                         payload, allow_refresh=False
-                    ):
-                        yield event
+                    )) as stream:
+                        async for event in stream:
+                            yield event
                     return
                 if response.status_code >= 400:
                     body = await response.aread()
-                    raise RuntimeError(
+                    raise ProviderHTTPError(
+                        response.status_code,
                         "Codex Responses request failed: "
                         f"{response.status_code} "
                         f"{body.decode('utf-8', 'replace')[:1000]}"
                     )
+                completed = False
                 async for event in self._events_from_sse(response):
+                    completed = completed or event.usage is not None
                     yield event
+                if not completed:
+                    raise IncompleteStreamError("Codex 流式输出未完成：未收到完成事件")
 
     async def _events_from_sse(
         self, response: httpx.Response
@@ -452,6 +471,17 @@ class CodexResponsesProvider(LLMProvider):
         if event_type in ("error", "response.failed", "response.incomplete"):
             response = event.get("response") or {}
             detail = event.get("error") or event.get("message") or response.get("error") or response.get("incomplete_details") or {}
+            if isinstance(detail, dict) and (
+                detail.get("code") in {
+                    "server_error", "internal_error", "internal_server_error",
+                    "rate_limit_exceeded", "rate_limit_error", "overloaded",
+                    "service_unavailable", "temporarily_unavailable",
+                }
+                or detail.get("type") in {"server_error", "rate_limit_error"}
+            ):
+                raise TransientStreamError(
+                    f"Codex 流式输出暂时失败：{json.dumps(detail, ensure_ascii=False)[:1000]}"
+                )
             raise RuntimeError(f"Codex 流式输出未完成：{event_type} {json.dumps(detail, ensure_ascii=False)[:1000]}")
         if event_type == "response.output_text.delta":
             delta = event.get("delta")

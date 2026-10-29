@@ -23,6 +23,7 @@ from rich.text import Text
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
+from .api_retry import RequestRetry
 from .app_errors import _exception_block
 from .engine import ToolOutcome, TurnEngine, TurnObserver
 from .history_store import stamp_message
@@ -104,6 +105,10 @@ class ParentTurnObserver(TurnObserver):
                     pass
         self._thinking = None
         self._answer = None
+
+    async def on_request_retry(self, retry: RequestRetry) -> None:
+        self._emit("assistant.reset", {"message": retry.message})
+        await self.app._mount_widget(Static(Text(retry.message, style="bold #e6db74")))
 
     async def on_usage(
         self,

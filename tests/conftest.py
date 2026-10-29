@@ -16,3 +16,19 @@ def isolated_history_archive(tmp_path, monkeypatch):
     """Compaction tests must never write into the user's real session archive."""
     import ddtui.history_archive as archive
     monkeypatch.setattr(archive, "HISTORY_ARCHIVE_DIR", tmp_path / "history_sources")
+
+
+@pytest.fixture
+def instant_api_retries(monkeypatch):
+    """Record model backoff without delaying tests or changing UI timers."""
+    from types import SimpleNamespace
+    import ddtui.api_retry as retry
+
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(retry, "API_MAX_RETRIES", 3)
+    monkeypatch.setattr(retry, "asyncio", SimpleNamespace(sleep=sleep))
+    return delays

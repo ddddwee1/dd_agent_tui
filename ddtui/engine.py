@@ -31,9 +31,11 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
+from .api_retry import RequestRetry, retry_request
 from .app_support import _merge_tool_call_delta
 from .history_store import stamp_message
 from .runtime_messages import EXPERIMENT_RUNTIME_KIND, guard_assistant_runtime_claims
@@ -102,6 +104,9 @@ class TurnObserver:
         """Stream died mid-flight (cancel or error) — tear down any
         half-rendered UI. Synchronous on purpose (see module docstring).
         """
+
+    async def on_request_retry(self, retry: RequestRetry) -> None:
+        """The unfinished stream was discarded; a fresh request will follow."""
 
     async def on_usage(
         self,
@@ -202,7 +207,9 @@ class TurnEngine:
                 await self._experiment_feedback(feedback)
                 self.ctx.optimization_plan['model_rounds'] += 1
             self._loop_guard.sync_context(self.messages)
-            msg = await self._stream_once()
+            msg = await retry_request(
+                self._stream_once, on_retry=self.observer.on_request_retry
+            )
             tool_calls = msg.get("tool_calls") or []
             feedback = completion_feedback(self.ctx) if not tool_calls else None
             self.messages.append(msg)
@@ -231,23 +238,24 @@ class TurnEngine:
         started_at = time.monotonic()
         first_token_at: float | None = None
         try:
-            async for ev in self.provider.stream(
+            async with aclosing(self.provider.stream(
                 self.messages, self.tools, self.model, self.effort
-            ):
-                if ev.usage is not None:
-                    usage = ev.usage
-                if first_token_at is None and (
-                    ev.reasoning or ev.content or ev.tool_call is not None
-                ):
-                    first_token_at = time.monotonic()
-                if ev.reasoning:
-                    reasoning += ev.reasoning
-                    await self.observer.on_reasoning_delta(ev.reasoning)
-                if ev.content:
-                    content += ev.content
-                    await self.observer.on_content_delta(ev.content)
-                if ev.tool_call is not None:
-                    _merge_tool_call_delta(tool_calls, ev.tool_call)
+            )) as stream:
+                async for ev in stream:
+                    if ev.usage is not None:
+                        usage = ev.usage
+                    if first_token_at is None and (
+                        ev.reasoning or ev.content or ev.tool_call is not None
+                    ):
+                        first_token_at = time.monotonic()
+                    if ev.reasoning:
+                        reasoning += ev.reasoning
+                        await self.observer.on_reasoning_delta(ev.reasoning)
+                    if ev.content:
+                        content += ev.content
+                        await self.observer.on_content_delta(ev.content)
+                    if ev.tool_call is not None:
+                        _merge_tool_call_delta(tool_calls, ev.tool_call)
         except BaseException:
             # Cancel or stream error: nothing has been appended yet, so
             # the observer just drops its half-rendered widgets.

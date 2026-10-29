@@ -5,6 +5,7 @@ import asyncio
 import copy
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import ddtui.app as app_mod
@@ -98,6 +99,47 @@ def test_full_turn_through_engine(monkeypatch):
             assert all(block._tool_group in groups for block in tool_blocks)
             assert len(app.query(AssistantMessage)) == 1
             assert app._busy is False
+
+    asyncio.run(run())
+
+
+def test_model_reconnect_removes_partial_widgets_and_resets_remote(monkeypatch, tmp_path, instant_api_retries):
+    import ddtui.app_history as history
+    import ddtui.runtime_state as runtime
+
+    class Recovering(FakeProvider):
+        def __init__(self):
+            self.attempts = 0
+
+        async def stream(self, messages, tools, model, effort):
+            self.attempts += 1
+            if self.attempts == 1:
+                yield LLMStreamEvent(reasoning="不完整的思考")
+                yield LLMStreamEvent(content="不完整的回答")
+                raise httpx.ReadError("disconnected")
+            yield LLMStreamEvent(reasoning="完整的思考")
+            yield LLMStreamEvent(content="完整的回答")
+
+    async def run():
+        provider = Recovering()
+        monkeypatch.setattr(app_mod, "build_provider", lambda name: provider)
+        monkeypatch.setattr(history, "HISTORY_DIR", tmp_path / "history")
+        monkeypatch.setattr(runtime, "RUNTIME_DIR", tmp_path / "runtime")
+        app = app_mod.AgentApp(provider_name="fake")
+        emissions = []
+        monkeypatch.setattr(app, "_remote_emit", lambda event, payload=None: emissions.append((event, payload)))
+        async with app.run_test() as pilot:
+            app.run_worker(app._agent_turn("测试重连"), exclusive=True)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert provider.attempts == 2
+            assert [w.text for w in app.query(AssistantMessage)] == ["完整的回答"]
+            assert len(app.query(ThinkingBlock)) == 1
+            assert app.messages[-1]["reasoning_content"] == "完整的思考"
+            assert app.messages[-1]["content"] == "完整的回答"
+            resets = [payload for event, payload in emissions if event == "assistant.reset"]
+            assert len(resets) == 1 and "自动重连（1/3）" in resets[0]["message"]
+            assert not app._busy
 
     asyncio.run(run())
 

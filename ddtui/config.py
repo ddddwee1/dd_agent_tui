@@ -95,6 +95,8 @@ MODEL = _setting_str("DEEPSEEK_MODEL", "deepseek-v4-flash")
 REASONING_EFFORT = _setting_str("DEEPSEEK_REASONING_EFFORT", "max")
 
 DEFAULT_PROVIDER = _setting_str("DDTUI_PROVIDER", "deepseek").strip().lower()
+API_MAX_RETRIES = max(0, _setting_int("DDTUI_API_MAX_RETRIES", default=5))
+API_READ_TIMEOUT = max(1, _setting_int("DDTUI_API_READ_TIMEOUT", default=300))
 
 DEEPSEEK_API_KEY_PATH = Path(API_KEY_PATH)
 DEEPSEEK_BASE_URL = _setting_str("DEEPSEEK_BASE_URL", BASE_URL)

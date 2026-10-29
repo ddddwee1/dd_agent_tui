@@ -13,6 +13,7 @@ import asyncio
 import time
 
 from . import explore_core
+from .api_retry import RequestRetry
 from .app_support import build_env_block, load_agents_md
 from .app_history import CompactionObserver
 from .config import (
@@ -89,6 +90,16 @@ class SubagentTurnObserver(TurnObserver):
                 pass
         self._thinking_started = False
         self._answer_started = False
+
+    async def on_request_retry(self, retry: RequestRetry) -> None:
+        self.sess.phase = "thinking"
+        pane = self.sess.pane
+        if pane is not None:
+            try:
+                pane.mount_exception_notice(retry.message, style="bold #e6db74")
+            except Exception:
+                pass
+        self.app._refresh_status()
 
     async def on_usage(
         self,
