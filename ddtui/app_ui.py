@@ -5,8 +5,10 @@ from __future__ import annotations
 import time
 
 from rich.text import Text
+from rich.cells import cell_len
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Static, TabbedContent, TabPane
+from textual.events import Resize
+from textual.widgets import Button, Static, TabbedContent, TabPane
 
 from .config import (
     COLLAPSED_HISTORY_KEEP,
@@ -20,6 +22,9 @@ from .config import (
 )
 from .history_store import stamp_message
 from .runtime_state import new_session_id
+from .thinking_summary import cancel_thinking_summaries
+from .timeline_view import TimelineView, format_duration
+from .ui_theme import UI
 from .state import (
     SubagentSession,
     TokenCounter,
@@ -31,7 +36,6 @@ from .tools_terminal import drain_terminal_output
 from .widgets import (
     CheckpointBlock,
     CollapsedHistoryMarker,
-    DiffBlock,
     EditPendingScreen,
     MultilineInput,
     StatusBar,
@@ -41,17 +45,19 @@ from .widgets import (
     TasksBlock,
     TerminalTabPane,
     ThinkingBlock,
+    ThinkingSummaryPanel,
     ToolCallBlock,
-    ToolCallGroup,
     UserBubble,
+    WorkbenchOverview,
 )
 
 
 class AppUiMixin:
     def on_mount(self) -> None:
-        self.title = "DeepSeek Agent"
+        self.title = "ddtui"
         self._update_subtitle()
         self._refresh_status()
+        self._refresh_workspace_tabs()
         self.query_one("#user-input", MultilineInput).focus()
         self.call_later(self._autosave_conversation)
         self.call_later(self._show_disconnect_recovery_notice)
@@ -95,6 +101,7 @@ class AppUiMixin:
             self.call_later(self._maybe_start_remote_from_config)
 
     def on_unmount(self) -> None:
+        cancel_thinking_summaries(self)
         client = getattr(self, "_remote_client", None)
         if client is not None:
             client.stop()
@@ -179,6 +186,7 @@ class AppUiMixin:
             steer=len(self._steer),
             explore=self._active_explore is not None,
         )
+        self._refresh_workbench_caption()
 
     def _refresh_task_panel(self) -> None:
         """Mirror ctx.tasks into the sidebar widget.
@@ -210,7 +218,7 @@ class AppUiMixin:
             self.call_later(self._mount_task_block)
             return
         self._tasks_block.render_tasks(running)
-        sidebar.add_class("visible")
+        self._refresh_sidebar_visibility()
 
     async def _mount_task_block(self) -> None:
         try:
@@ -221,7 +229,7 @@ class AppUiMixin:
             return
         if not self._tasks_block.is_mounted:
             await sidebar.mount(self._tasks_block)
-        sidebar.add_class("visible")
+        self._refresh_sidebar_visibility()
         running = [
             task for task in self.ctx.tasks.values()
             if task.proc.poll() is None
@@ -255,7 +263,7 @@ class AppUiMixin:
             self.call_later(self._mount_subagent_block)
             return
         self._subagent_block.render_sessions(sessions)
-        sidebar.add_class("visible")
+        self._refresh_sidebar_visibility()
         # Same cadence: walk every mounted SubagentTabPane and append
         # any new messages that landed since the last refresh. Cheap
         # when nothing's new (early-out inside refresh_from_session).
@@ -274,7 +282,7 @@ class AppUiMixin:
             return
         if not self._subagent_block.is_mounted:
             await sidebar.mount(self._subagent_block)
-        sidebar.add_class("visible")
+        self._refresh_sidebar_visibility()
         self._subagent_block.render_sessions(
             list(self._live_subagents.values())
         )
@@ -336,6 +344,7 @@ class AppUiMixin:
             return
         label = f"{terminal_id}:{term.name[:12]}"
         await tabs.add_pane(TabPane(label, pane, id=pane_id))
+        self._refresh_workspace_tabs()
 
     async def _remove_terminal_tab(self, terminal_id: str) -> None:
         try:
@@ -346,6 +355,7 @@ class AppUiMixin:
             await tabs.remove_pane(f"tab-{terminal_id}")
         except Exception:
             pass
+        self._refresh_workspace_tabs()
 
     async def _sync_checkpoint_block(self) -> None:
         """Mirror ctx.checkpoint into the sidebar."""
@@ -370,18 +380,220 @@ class AppUiMixin:
             self._checkpoint_block = CheckpointBlock()
             await sidebar.mount(self._checkpoint_block)
         self._checkpoint_block.set_checkpoint(checkpoint)
-        sidebar.add_class("visible")
+        self._refresh_sidebar_visibility()
 
     def _refresh_sidebar_visibility(self) -> None:
         try:
             sidebar = self.query_one("#sidebar", VerticalScroll)
         except Exception:
             return
-        has_visible = any(child.is_mounted for child in sidebar.children)
-        if has_visible:
-            sidebar.add_class("visible")
+        try:
+            self.query_one("#workbench-overview", WorkbenchOverview)
+            body = self.query_one("#body")
+        except Exception:
+            sidebar.set_class(any(child.is_mounted and child.display for child in sidebar.children), "visible")
+            return
+        compact = getattr(self, "_workbench_width", self.size.width) < 100
+        opened = self._sidebar_open_compact if compact else self._sidebar_open_wide
+        sidebar.set_class(opened, "visible")
+        body.set_class(compact and opened, "sidebar-only")
+        empty = self.query_one("#workbench-empty", Static)
+        empty.display = not any(
+            child.is_mounted and child.display
+            and child.id not in {"workbench-overview", "workbench-empty"}
+            for child in sidebar.children
+        )
+        toggle = self.query_one("#toggle-sidebar", Button)
+        timeline = getattr(self, "_timeline_view", None)
+        back = "返回时间线" if timeline is not None and timeline.display else "返回对话"
+        label = (back if compact else "收起工作台") if opened else "工作台"
+        if str(toggle.label) != label:
+            toggle.label = label
+
+    def action_toggle_sidebar(self) -> None:
+        if getattr(self, "_workbench_width", self.size.width) < 100:
+            self._sidebar_open_compact = not self._sidebar_open_compact
         else:
-            sidebar.remove_class("visible")
+            self._sidebar_open_wide = not self._sidebar_open_wide
+        self._refresh_workbench()
+        self.query_one("#user-input", MultilineInput).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "toggle-sidebar":
+            event.stop()
+            self.action_toggle_sidebar()
+        elif event.button.id == "timeline-toggle":
+            event.stop()
+            view = self._timeline_view
+            if view.timeline is not None:
+                self._set_timeline_open(not self._timeline_is_visible())
+
+    def _timeline_is_visible(self) -> bool:
+        tabs = self.query_one("#tabs", TabbedContent)
+        return self._timeline_view.display and tabs.active == "tab-main" and not self._sidebar_open_compact
+
+    def _refresh_timeline_control(self) -> None:
+        view = getattr(self, "_timeline_view", None)
+        if view is None or not view.is_attached:
+            return
+        button = self.query_one("#timeline-toggle", Button)
+        timeline = view.timeline
+        button.display = timeline is not None
+        if timeline is not None:
+            elapsed = format_duration(timeline.elapsed(time.monotonic()))
+            label = "返回对话" if self._timeline_is_visible() else f"耗时 {elapsed}"
+            if str(button.label) != label:
+                button.label = label
+
+    def _set_timeline_open(self, opened: bool) -> None:
+        view = self._timeline_view
+        conversation = self.query_one("#conversation", VerticalScroll)
+        if opened:
+            self._sidebar_open_compact = False
+            self.query_one("#tabs", TabbedContent).active = "tab-main"
+        conversation.display = not opened
+        view.display = opened
+        self._refresh_workbench()
+        if opened:
+            view.refresh_timeline()
+            view.table.focus()
+        else:
+            self.query_one("#user-input", MultilineInput).focus()
+
+    def _clear_timeline(self) -> None:
+        view = getattr(self, "_timeline_view", None)
+        if view is not None:
+            view.set_timeline(None)
+            if view.display:
+                self._set_timeline_open(False)
+            self._refresh_timeline_control()
+
+    def on_timeline_view_jump_requested(self, event: TimelineView.JumpRequested) -> None:
+        target = event.target
+        if not target.is_attached:
+            return
+        if target in self._collapsed_widgets:
+            self._expand_collapsed_history()
+        if isinstance(target, ToolCallBlock):
+            target.collapsed = False
+        self._follow_bottom = False
+        self._set_timeline_open(False)
+        self.call_after_refresh(self._scroll_to_timeline_record, target)
+
+    def _scroll_to_timeline_record(self, target) -> None:
+        if target.is_attached:
+            if isinstance(target, (ThinkingBlock, ToolCallBlock)):
+                target.query_one("CollapsibleTitle").focus(scroll_visible=False)
+            target.scroll_visible(animate=False, top=True, immediate=True)
+            self._follow_bottom = False
+
+    def on_resize(self, event: Resize) -> None:
+        self._workbench_width = event.size.width
+        self._workbench_height = event.size.height
+        compact = event.size.width < 100
+        if compact != getattr(self, "_workbench_compact", None):
+            self._sidebar_open_compact = False
+            self._workbench_compact = compact
+        self._refresh_workbench()
+        self.call_after_refresh(self._refresh_workbench)
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if event.tabbed_content.id == "tabs":
+            self._sidebar_open_compact = False
+            self._refresh_workbench()
+
+    def _refresh_workspace_tabs(self) -> None:
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+            tabs.set_class(len(tabs.query(TabPane)) <= 1, "single-pane")
+        except Exception:
+            return
+        self._refresh_workbench()
+
+    def _set_workbench_phase(self, phase: str, detail: str = "") -> None:
+        if (phase, detail) != (getattr(self, "_workbench_phase", ""), getattr(self, "_workbench_detail", "")):
+            self._workbench_phase_started = time.monotonic()
+        self._workbench_phase, self._workbench_detail = phase, detail
+        self._refresh_workbench()
+
+    def _refresh_workbench_caption(self) -> None:
+        try:
+            caption = self.query_one("#workbench-phase", Static)
+            active_tab = self.query_one("#tabs", TabbedContent).active
+        except Exception:
+            return
+        busy = self._busy
+        phase = getattr(self, "_workbench_phase", "idle")
+        if active_tab != "tab-main":
+            label = "观察中 · 输入发送至主会话"
+        elif self.size.width < 100 and self._sidebar_open_compact:
+            label = "工作台 · 输入发送至主会话"
+        elif self._compacting:
+            label = "压缩上下文中"
+        elif busy:
+            labels = {"waiting": "等待模型", "thinking": "思考中", "answering": "回答中", "tool": "执行工具"}
+            label = labels.get(phase, "处理中")
+            if phase == "tool" and self.size.width >= 70:
+                label += f" · {self._workbench_detail}"
+            elapsed = int(time.monotonic() - getattr(self, "_workbench_phase_started", time.monotonic()))
+            label += f" · {elapsed}s"
+        else:
+            label = "就绪"
+        if self._queued:
+            label += f" · 排队 {len(self._queued)}"
+        if self._steer:
+            label += f" · 插话 {len(self._steer)}"
+        value = ("● " + label, busy)
+        if value != getattr(self, "_workbench_caption", None):
+            self._workbench_caption = value
+            caption.update(Text(value[0], style=UI.accent if busy else UI.muted, no_wrap=True, overflow="ellipsis"))
+        self._refresh_timeline_control()
+
+    def _refresh_workbench(self) -> None:
+        try:
+            overview = self.query_one("#workbench-overview", WorkbenchOverview)
+            hint = self.query_one("#hint", Static)
+            summary = self.query_one("#thinking-summary", ThinkingSummaryPanel)
+        except Exception:
+            return
+        goal = next((
+            str(message.get("content") or "") for message in reversed(self.messages)
+            if message.get("role") == "user" and not message.get("ddtui_kind")
+            and not str(message.get("content") or "").startswith("[实时插话] ")
+        ), "")
+        height = getattr(self, "_workbench_height", self.size.height)
+        input_rows = max(3, min(12, height // 3))
+        pending_rows = max(1, min(8, height // 6))
+        self.query_one("#pending").styles.max_height = pending_rows
+        self.query_one("#slash-popup").styles.max_height = max(3, min(8, height - input_rows - pending_rows - 6))
+        self.query_one("#user-input", MultilineInput)._fit_height()
+        hint.display = height >= 16
+        overview.set_goal(goal)
+        text = getattr(self, "_thinking_summary_text", "")
+        summary.set_summary(text, active=self._busy and self._workbench_phase == "thinking")
+        summary.display = bool(text)
+        pieces = (["Enter 排队", "Esc×2 中断", "Cmd+Enter 插话", "Ctrl+X 取消待发", "Ctrl+B 工作台"]
+                  if self._busy else ["Enter 发送", "Option+Enter 换行", "Ctrl+B 工作台", "/help 更多"])
+        selected = []
+        for piece in pieces:
+            if cell_len(" · ".join(selected + [piece])) <= max(10, self.size.width - 2):
+                selected.append(piece)
+        hint_text = " · ".join(selected)
+        if hint_text != getattr(self, "_workbench_hint", None):
+            self._workbench_hint = hint_text
+            hint.update(hint_text)
+        self._refresh_sidebar_visibility()
+        self._refresh_workbench_caption()
+
+    def _set_thinking_summary(self, text: str) -> None:
+        self._thinking_summary_text = text
+        try:
+            panel = self.query_one("#thinking-summary", ThinkingSummaryPanel)
+            panel.set_summary(text, active=self._busy and getattr(self, "_workbench_phase", "thinking") == "thinking")
+            panel.display = bool(text)
+            self._refresh_sidebar_visibility()
+        except Exception:
+            pass
 
     async def _add_sub_tab(self, sess: SubagentSession) -> None:
         """Mount a TabPane(SubagentTabPane) for this session as a
@@ -408,8 +620,9 @@ class AppUiMixin:
         inner = sess.pane if sess.pane is not None else SubagentTabPane(sess)
         if sess.pane is None:
             sess.pane = inner
-        pane = TabPane(sess.id, inner, id=pane_id)
+        pane = TabPane(f"子 agent · {sess.id}", inner, id=pane_id)
         await tabs.add_pane(pane)
+        self._refresh_workspace_tabs()
 
     async def _remove_sub_tab(self, sid: str) -> None:
         """Remove the TabPane for `sid`. If the tab being removed is
@@ -426,6 +639,7 @@ class AppUiMixin:
             # Pane may have already been removed (e.g. /clear racing
             # against end_agent) — silent no-op.
             pass
+        self._refresh_workspace_tabs()
 
     def _reap_idle_subagents(self) -> None:
         """Drop sessions that have been quiescent longer than
@@ -450,6 +664,9 @@ class AppUiMixin:
             self.call_later(self._remove_sub_tab, sid)
 
     def action_clear_chat(self) -> None:
+        cancel_thinking_summaries(self)
+        self._set_thinking_summary("")
+        self._clear_timeline()
         # Rebuild the system prefix from scratch instead of keeping the
         # startup copy: /clear means "fresh conversation", so it re-reads
         # AGENTS.md and re-snapshots the environment (date, git branch).
@@ -625,18 +842,13 @@ class AppUiMixin:
         self.notify("没有选中文本可复制（退出请用 Ctrl+Q）", timeout=2)
 
     def action_toggle_thinking(self) -> None:
-        """Toggle reasoning details together with their enclosing groups."""
+        """Toggle reasoning originals without changing individual tools."""
         blocks = list(self.query(ThinkingBlock))
         if not blocks:
             return
-        target_collapsed = any(
-            not b.collapsed and (b._tool_group is None or not b._tool_group.collapsed)
-            for b in blocks
-        )
+        target_collapsed = any(not b.collapsed for b in blocks)
         for b in blocks:
             b.collapsed = target_collapsed
-            if b._tool_group is not None:
-                b._tool_group.collapsed = target_collapsed
 
     def action_cancel_pending(self) -> None:
         """Ctrl+X: drop everything that hasn't started running yet.
@@ -778,13 +990,11 @@ class AppUiMixin:
             for child in reversed(list(view.children)):
                 if isinstance(child, (UserBubble, SteerBubble)):
                     break
-                calls = child.tool_calls if isinstance(child, ToolCallGroup) else (child,)
-                for block in calls:
-                    if isinstance(block, ToolCallBlock) and block.is_pending:
-                        try:
-                            block.set_result(cancel_note, blocked=True)
-                        except Exception:
-                            pass
+                if isinstance(child, ToolCallBlock) and child.is_pending:
+                    try:
+                        child.set_result(cancel_note, blocked=True)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -817,20 +1027,7 @@ class AppUiMixin:
 
     async def _mount_widget(self, widget) -> None:
         view = self.query_one("#conversation", VerticalScroll)
-        last = view.children[-1] if view.children else None
-        if isinstance(widget, (ThinkingBlock, ToolCallBlock)):
-            group = last if isinstance(last, ToolCallGroup) and last.display else ToolCallGroup()
-            if group is not last:
-                await view.mount(group)
-            mounted = group.add_block(widget)
-            if mounted is not None:
-                await mounted
-        elif isinstance(widget, DiffBlock) and isinstance(last, ToolCallGroup):
-            mounted = last.add_block(widget)
-            if mounted is not None:
-                await mounted
-        else:
-            await view.mount(widget)
+        await view.mount(widget)
         if self._follow_bottom:
             view.scroll_end(animate=False)
 
@@ -992,10 +1189,10 @@ class AppUiMixin:
     def on_collapsed_history_marker_expand_requested(
         self, event: "CollapsedHistoryMarker.ExpandRequested"
     ) -> None:
-        """Marker clicked → restore every widget we've hidden so far
-        and drop the marker. Restoration cost is exactly what the
-        original render would have been — fine because the user
-        explicitly asked for it."""
+        self._expand_collapsed_history()
+
+    def _expand_collapsed_history(self) -> None:
+        """Restore the hidden conversation widgets and remove their marker."""
         n = len(self._collapsed_widgets)
         for w in self._collapsed_widgets:
             try:
@@ -1048,6 +1245,7 @@ class AppUiMixin:
             steer=len(self._steer),
             explore=self._active_explore is not None,
         )
+        self._refresh_workbench()
         try:
             self._remote_emit_status("status")
         except Exception:
@@ -1055,6 +1253,10 @@ class AppUiMixin:
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
+        if busy:
+            self._set_thinking_summary("")
+        self._workbench_phase = "waiting" if busy else "idle"
+        self._workbench_phase_started = time.monotonic()
         self._refresh_status()
         try:
             self._remote_emit_status("busy", force=True)
@@ -1084,3 +1286,8 @@ class AppUiMixin:
         if self._agents_md_loaded:
             sub += " · AGENTS.md ✓"
         self.sub_title = sub
+        try:
+            label = f"{self.model} · {self.effort}"
+            self.query_one("#workbench-model", Static).update(Text(label, no_wrap=True, overflow="ellipsis"))
+        except Exception:
+            pass

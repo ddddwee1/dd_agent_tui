@@ -34,6 +34,7 @@ from .tools_terminal import (
     tool_terminal_send,
 )
 from .widgets import SteerBubble, UserBubble
+from .ui_theme import UI
 
 
 class AppRemoteMixin:
@@ -98,7 +99,7 @@ class AppRemoteMixin:
             await self._remote_notice(
                 "远控未启动：没有 DDTUI_REMOTE_URL，也无法从 "
                 f"{REMOTE_ADDR_FILE} 推导 VPS 地址。",
-                style="bold #f92672",
+                style=f"bold {UI.error}",
             )
             return
         try:
@@ -107,7 +108,7 @@ class AppRemoteMixin:
             await self._remote_notice(
                 "远控未启动：缺少 websockets 依赖。\n"
                 "安装：pip install -e '.[remote]' 或 pip install -r requirements-remote.txt",
-                style="bold #f92672",
+                style=f"bold {UI.error}",
             )
             return
         if self._remote_client is not None:
@@ -131,7 +132,7 @@ class AppRemoteMixin:
         await self._remote_notice(
             f"远控连接中：{url}\n"
             f"登录 token 来源：{REMOTE_TOKEN_FILE if not REMOTE_TOKEN else 'DDTUI_REMOTE_TOKEN'}",
-            style="bold #66d9ef",
+            style=f"bold {UI.accent}",
         )
 
     async def _remote_stop(self) -> None:
@@ -141,7 +142,7 @@ class AppRemoteMixin:
         self._remote_client = None
         self._remote_state = "off"
         self._remote_detail = ""
-        await self._remote_notice("远控已关闭。", style="bold #e6db74")
+        await self._remote_notice("远控已关闭。", style=f"bold {UI.warning}")
 
     async def _remote_status_notice(self) -> None:
         url = self._remote_client.url if self._remote_client else self._remote_default_url()
@@ -154,7 +155,7 @@ class AppRemoteMixin:
             f"token: {token_source}\n"
             f"terminal_send: {'enabled' if REMOTE_ALLOW_TERMINAL_SEND else 'disabled'}\n"
             f"detail: {self._remote_detail or '-'}",
-            style="bold #66d9ef",
+            style=f"bold {UI.accent}",
         )
 
     async def _remote_notice(self, text: str, *, style: str) -> None:

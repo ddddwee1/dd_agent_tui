@@ -9,6 +9,7 @@ serves compact_self.
 
 from __future__ import annotations
 
+
 import asyncio
 import time
 
@@ -30,6 +31,7 @@ from .engine import ToolOutcome, TurnEngine, TurnObserver
 from .history_store import stamp_message
 from .context_compaction import auto_compact
 from .runtime_messages import runtime_task_event_message
+from .thinking_summary import start_thinking_summary
 from .state import (
     SubagentSession,
     ToolContext,
@@ -40,6 +42,7 @@ from .state import (
 from .tools import SUBAGENT_BLOCKED_TOOLS, SUBAGENT_TOOL_SCHEMAS
 from .tool_output import limit_tool_output
 from .tools_tasks import collect_task_events
+from .ui_theme import UI
 from .widgets import SubagentTabPane
 
 
@@ -57,19 +60,48 @@ class SubagentTurnObserver(TurnObserver):
         self.sess = sess
         self._thinking_started = False
         self._answer_started = False
+        self._summary = None
+        self._summary_progress = None
+
+    def close(self) -> None:
+        if self._summary is not None:
+            self._summary.cancel()
+            self._summary = None
+
+    def _summary_updated(self, text: str) -> None:
+        self.sess.thinking_summary = text
 
     async def on_reasoning_delta(self, text: str) -> None:
+        await self._append_reasoning(text)
+
+    async def on_reasoning_summary_delta(self, text: str) -> None:
+        await self._append_reasoning(text, native=True)
+
+    async def _append_reasoning(self, text: str, *, native: bool = False) -> None:
         pane = self.sess.pane
         if pane is not None:
             try:
                 if not self._thinking_started:
-                    pane.start_thinking()
+                    block = pane.start_thinking()
                     self._thinking_started = True
+                    self.sess.thinking_summary = ""
+                    if block is not None:
+                        self._summary = start_thinking_summary(
+                            self.app, block, self.sess.messages,
+                            self.sess.model or self.app.model,
+                            on_update=self._summary_updated,
+                            progress=self._summary_progress,
+                        )
+                        self._summary_progress = self._summary.progress
                 pane.append_thinking(text)
+                if self._summary is not None:
+                    self._summary.feed(text, native=native)
             except Exception:
                 pass
 
     async def on_content_delta(self, text: str) -> None:
+        if self._summary is not None:
+            self._summary.stop()
         self.sess.phase = "answering"
         pane = self.sess.pane
         if pane is not None:
@@ -82,6 +114,8 @@ class SubagentTurnObserver(TurnObserver):
                 pass
 
     def on_stream_aborted(self) -> None:
+        self.close()
+        self.sess.thinking_summary = ""
         pane = self.sess.pane
         if pane is not None:
             try:
@@ -96,7 +130,7 @@ class SubagentTurnObserver(TurnObserver):
         pane = self.sess.pane
         if pane is not None:
             try:
-                pane.mount_exception_notice(retry.message, style="bold #e6db74")
+                pane.mount_exception_notice(retry.message, style=f"bold {UI.warning}")
             except Exception:
                 pass
         self.app._refresh_status()
@@ -125,6 +159,9 @@ class SubagentTurnObserver(TurnObserver):
         self.app._refresh_status()
 
     async def on_assistant_message(self, msg: dict) -> None:
+        if self._summary is not None:
+            self._summary.finish(msg)
+            self._summary = None
         pane = self.sess.pane
         if pane is not None:
             try:
@@ -317,6 +354,7 @@ class AppSubagentMixin:
                 )
             return None
 
+        observer = SubagentTurnObserver(self, sess)
         engine = TurnEngine(
             provider=self.provider,
             ctx=sess.ctx,
@@ -324,7 +362,7 @@ class AppSubagentMixin:
             tools=sess.sub_tools,
             model=sess.model or self.model,
             effort=sess.effort or self.effort,
-            observer=SubagentTurnObserver(self, sess),
+            observer=observer,
             tool_confirm=self.tool_confirm,
             meta_handler=meta,
             never_parallel=SUBAGENT_BLOCKED_TOOLS,
@@ -364,6 +402,7 @@ class AppSubagentMixin:
                 answer = sess.messages[-1].get("content") or ""
             return answer or "(subagent returned no answer)"
         finally:
+            observer.close()
             # Idle / error are terminal-for-this-round; anything else
             # (cancelled, unexpected exit) becomes "error" so the panel
             # signals the user that something went wrong.

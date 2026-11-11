@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+
 from rich.text import Text
 from textual.widgets import Static, TextArea
 
 from .providers import ProviderConfigError, build_provider, provider_names
+from .ui_theme import UI
 from .widgets import MultilineInput, SlashPopup, SteerBubble, UserBubble
 
 
@@ -139,7 +141,7 @@ class AppInputMixin:
                 self._remote_emit_snapshot("slash_command")
                 await self._mount_widget(Static(Text(
                     "已向远端推送当前 session snapshot。",
-                    style="bold #66d9ef",
+                    style=f"bold {UI.accent}",
                 )))
                 return
             await self._mount_widget(Static(Text(
@@ -174,7 +176,7 @@ class AppInputMixin:
                 await self._mount_widget(Static(Text(
                     f"❌ provider 切换失败：{e}\n"
                     f"当前仍使用 {self.provider_name} · {self.model}。",
-                    style="bold #f92672",
+                    style=f"bold {UI.error}",
                 )))
                 return
             old = self.provider_name
@@ -194,7 +196,7 @@ class AppInputMixin:
             await self._mount_widget(Static(Text(
                 f"⚙ provider: {old} → {self.provider_name}; "
                 f"model={self.model}, effort={self.effort}{limit_note}",
-                style="bold #66d9ef",
+                style=f"bold {UI.accent}",
             )))
             return
         if text == "/model" or text.startswith("/model "):
@@ -217,7 +219,7 @@ class AppInputMixin:
                 body = Text(
                     f"⚙ model: {old} → {self.model}"
                     f"（下一轮请求生效{limit_note}）",
-                    style="bold #66d9ef",
+                    style=f"bold {UI.accent}",
                 )
                 known = {c.id for c in self.provider.available_models()}
                 # Unknown ids still go through as typed — the catalog can
@@ -227,7 +229,7 @@ class AppInputMixin:
                     body.append(
                         f"\n⚠ 不在 {self.provider_name} 候选列表里，"
                         "仍按原样发送；打错的话下一轮会报 API 错误。",
-                        style="bold #fd971f",
+                        style=f"bold {UI.warning}",
                     )
                 await self._mount_widget(Static(body))
             return
@@ -246,7 +248,7 @@ class AppInputMixin:
                 self._update_subtitle()
                 await self._mount_widget(Static(Text(
                     f"⚙ effort: {old} → {self.effort}（下一轮请求生效）",
-                    style="bold #66d9ef",
+                    style=f"bold {UI.accent}",
                 )))
             return
         if text == "/rewind":
@@ -332,7 +334,7 @@ class AppInputMixin:
         """
         t = Text()
         t.append("当前 model: ", style="dim")
-        t.append(self.model, style="bold #a6e22e")
+        t.append(self.model, style=f"bold {UI.success}")
         choices = self.provider.available_models()
         if choices:
             t.append(f"\n{self.provider.label} 可选模型：", style="dim")
@@ -342,12 +344,12 @@ class AppInputMixin:
                 t.append("\n  ")
                 t.append(
                     "●" if active else "○",
-                    style="bold #a6e22e" if active else "dim",
+                    style=f"bold {UI.success}" if active else "dim",
                 )
                 t.append(" ")
                 t.append(
                     choice.id.ljust(width),
-                    style="bold #a6e22e" if active else "bold #66d9ef",
+                    style=f"bold {UI.success}" if active else f"bold {UI.accent}",
                 )
                 if choice.note:
                     t.append(f"  {choice.note}", style="dim")

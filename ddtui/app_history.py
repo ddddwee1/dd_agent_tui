@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import asyncio
 import json
 import os
@@ -32,9 +33,11 @@ from .runtime_state import (
 )
 from .runtime_messages import EXPERIMENT_RUNTIME_KIND, RUNTIME_TASK_EVENT_KIND
 from .state import TokenCounter
+from .thinking_summary import round_from_message, summary_from_message
 from .tools import DIFF_STRIP_TOOLS, PARENT_TOOL_SCHEMAS, SUBAGENT_TOOL_SCHEMAS
 from .tools_tasks import recover_tasks_for_session
 from .tools_checkpoint import request_stage_review, tool_checkpoint_clear, tool_checkpoint_tool
+from .ui_theme import UI
 from .widgets import (
     AssistantMessage,
     CompactionBlock,
@@ -313,7 +316,7 @@ class AppHistoryMixin:
             hint = f"发现未完成会话（断在 {phase} 阶段）。"
         await self._mount_widget(Static(Text(
             f"🔌 检测到上次可能异常断线。{hint}",
-            style="bold #e6db74",
+            style=f"bold {UI.warning}",
         )))
 
     def _history_entries(self) -> list[dict]:
@@ -369,7 +372,7 @@ class AppHistoryMixin:
                 )
             except Exception as exc:
                 await self._mount_widget(Static(Text(
-                    f"压缩未应用，原上下文保留：{exc}", style="bold #f92672"
+                    f"压缩未应用，原上下文保留：{exc}", style=f"bold {UI.error}"
                 )))
                 return
             self.messages[:] = candidate
@@ -397,7 +400,7 @@ class AppHistoryMixin:
             f"📦 已{label}：{stats['before_n']} → {stats['after_n']} 条消息，"
             f"估算 {stats['before_tokens']:,} → {stats['after_tokens']:,} tokens；"
             f"{mode}，原始历史可用 history_search/history_read 恢复{residual}",
-            style="bold #66d9ef",
+            style=f"bold {UI.accent}",
         )))
 
     async def _auto_compact_if_needed(self, *, model=None, effort=None) -> None:
@@ -438,7 +441,7 @@ class AppHistoryMixin:
         target, error = self._history_path_for_name(raw_name)
         if error is not None or target is None:
             await self._mount_widget(Static(Text(
-                f"错误：{error}", style="bold #f92672"
+                f"错误：{error}", style=f"bold {UI.error}"
             )))
             return
         try:
@@ -446,7 +449,7 @@ class AppHistoryMixin:
             size = self._write_conversation_snapshot(target)
         except Exception as e:
             await self._mount_widget(Static(Text(
-                f"❌ 保存失败:{e}", style="bold #f92672"
+                f"❌ 保存失败:{e}", style=f"bold {UI.error}"
             )))
             return
 
@@ -458,7 +461,7 @@ class AppHistoryMixin:
         await self._mount_widget(Static(Text(
             f"💾 已保存 {len(self.messages)} 条消息（{size:,} 字节）"
             f"到 {display}{note}",
-            style="bold #a6e22e",
+            style=f"bold {UI.success}",
         )))
 
     async def _list_history(self) -> None:
@@ -474,7 +477,7 @@ class AppHistoryMixin:
             entries = self._history_entries()
         except Exception as e:
             await self._mount_widget(Static(Text(
-                f"列出 {HISTORY_DIR} 失败：{e}", style="bold #f92672"
+                f"列出 {HISTORY_DIR} 失败：{e}", style=f"bold {UI.error}"
             )))
             return
         if not entries:
@@ -485,7 +488,7 @@ class AppHistoryMixin:
         t = Text()
         t.append(f"📂 {HISTORY_DIR}（{len(entries)} 个对话）\n", style="bold")
         for entry in entries:
-            t.append(f"  {entry['name']}", style="bold #a6e22e")
+            t.append(f"  {entry['name']}", style=f"bold {UI.success}")
             t.append(
                 f"  ({entry['size_label']}, 最后编辑 {entry['edited_at_label']})\n",
                 style="dim",
@@ -511,20 +514,20 @@ class AppHistoryMixin:
         target, error = self._history_path_for_name(raw_name)
         if error is not None or target is None:
             await self._mount_widget(Static(Text(
-                f"错误：{error}", style="bold #f92672"
+                f"错误：{error}", style=f"bold {UI.error}"
             )))
             return
         if not target.exists():
             await self._mount_widget(Static(Text(
                 f"错误：找不到 {target}\n用 /list-history 看可用列表。",
-                style="bold #f92672",
+                style=f"bold {UI.error}",
             )))
             return
         try:
             payload = json.loads(target.read_text(encoding="utf-8"))
         except Exception as e:
             await self._mount_widget(Static(Text(
-                f"❌ 读取失败：{e}", style="bold #f92672"
+                f"❌ 读取失败：{e}", style=f"bold {UI.error}"
             )))
             return
         msgs = payload.get("messages")
@@ -533,7 +536,7 @@ class AppHistoryMixin:
         ):
             await self._mount_widget(Static(Text(
                 "❌ 文件格式不识别（缺少合法 messages 数组）",
-                style="bold #f92672",
+                style=f"bold {UI.error}",
             )))
             return
         session_id = str(payload.get("session_id") or "") or new_session_id()
@@ -546,6 +549,7 @@ class AppHistoryMixin:
         # killed — they belong to the wall-clock-current runtime, not
         # the conversation that just got swapped in.
         self._clear_turn_journal()
+        self._clear_timeline()
         self._session_id = session_id
         self.ctx.session_id = session_id
         self.ctx.context_last_prompt = 0
@@ -610,7 +614,7 @@ class AppHistoryMixin:
                 pass
         if recovery_notice:
             await self._mount_widget(Static(Text(
-                f"🔌 {recovery_notice}", style="bold #e6db74"
+                f"🔌 {recovery_notice}", style=f"bold {UI.warning}"
             )))
         if recovered_modified:
             await self._autosave_conversation()
@@ -631,7 +635,7 @@ class AppHistoryMixin:
         await self._mount_widget(Static(Text(
             f"📂 已加载 {len(msgs)} 条消息（saved={saved_at}）{diff_note}\n"
             "Token 计数已重置；从此处续聊即可。",
-            style="bold #a6e22e",
+            style=f"bold {UI.success}",
         )))
 
     async def _replay_messages_to_view(self) -> None:
@@ -647,6 +651,7 @@ class AppHistoryMixin:
                 if tcid:
                     tool_results[tcid] = m.get("content") or ""
 
+        thinking_round = 0
         for m in self.messages:
             role = m.get("role")
             if role == "system":
@@ -657,6 +662,8 @@ class AppHistoryMixin:
                 continue
             content = m.get("content") or ""
             if role == "user":
+                if not m.get("ddtui_kind") and not content.startswith("[实时插话] "):
+                    thinking_round = 0
                 if m.get('ddtui_kind') == EXPERIMENT_RUNTIME_KIND:
                     continue  # Per-round controller facts are available through experiment_status.
                 if m.get("ddtui_kind") == RUNTIME_TASK_EVENT_KIND:
@@ -673,8 +680,11 @@ class AppHistoryMixin:
 
             rc = m.get("reasoning_content")
             if rc:
+                thinking_round = max(thinking_round + 1, round_from_message(m))
                 tb = ThinkingBlock()
                 tb.append_text(rc)
+                tb.set_round_number(thinking_round)
+                tb.set_summary(*summary_from_message(m))
                 tb.finalize(0)
                 # ThinkingBlock is collapsed by default, so a freshly
                 # loaded conversation won't bury the user under walls of
@@ -713,7 +723,7 @@ class AppHistoryMixin:
                             self._todo_block = TodoBlock()
                             await sidebar.mount(self._todo_block)
                         self._todo_block.set_items(items)
-                        sidebar.add_class("visible")
+                        self._refresh_sidebar_visibility()
                     continue
 
                 if name == "checkpoint_tool":
@@ -785,8 +795,10 @@ class AppHistoryMixin:
             "- 鼠标点击输入框上方的排队/steer 气泡 → 编辑或删除该条"
             "（Ctrl+S 保存 · Ctrl+D 删除 · Esc 取消）\n"
             "- `Ctrl+T` 展开 / 折叠所有思考块\n"
+            "- `Ctrl+B` 展开 / 收起工作台（窄窗口切换工作台与对话）\n"
             "- `Ctrl+L` 清空对话\n"
-            "- `Ctrl+C` 退出\n\n"
+            "- `Ctrl+C` 复制选中内容\n"
+            "- `Ctrl+Q` 退出\n\n"
             "### 工具(模型可调用)\n"
             "`bash` "
             "`terminal_start/send/read/interrupt/close/list` "
@@ -866,6 +878,7 @@ class AppHistoryMixin:
         `self.messages` after a truncation. Leaves queued/steer
         bubbles, bg jobs, and live subagents alone — they're
         independent of message-history state."""
+        self._clear_timeline()
         view = self.query_one("#conversation", VerticalScroll)
         for child in list(view.children):
             child.remove()

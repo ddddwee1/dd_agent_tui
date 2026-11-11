@@ -11,7 +11,8 @@ import pytest
 import ddtui.app as app_mod
 import ddtui.engine as engine_mod
 from ddtui.providers import LLMProvider, LLMStreamEvent, ProviderUsage, ToolCallDelta
-from ddtui.widgets import AssistantMessage, CompactionBlock, StatusBar, ThinkingBlock, ToolCallBlock, ToolCallGroup
+from ddtui.timeline_view import TimelineView
+from ddtui.widgets import AssistantMessage, CompactionBlock, StatusBar, ThinkingBlock, ToolCallBlock
 from tests.conftest import REPO_ROOT
 
 
@@ -91,14 +92,37 @@ def test_full_turn_through_engine(monkeypatch):
             assert all(block.collapsed for block in thinking_blocks)
             assert all(block.collapsed for block in tool_blocks)
             conversation = app.query_one("#conversation")
-            groups = list(app.query(ToolCallGroup))
-            assert [len(group.tool_calls) for group in groups] == [3]
-            assert groups[0].thinking_blocks == tuple(thinking_blocks)
-            assert all(group.parent is conversation for group in groups)
-            assert all(group.collapsed for group in groups)
-            assert all(block._tool_group in groups for block in tool_blocks)
+            assert all(block.parent is conversation for block in thinking_blocks + tool_blocks)
+            entries = [type(widget).__name__ for widget in conversation.children
+                       if isinstance(widget, (ThinkingBlock, ToolCallBlock, AssistantMessage))]
+            assert entries == ["ThinkingBlock", "ToolCallBlock", "ToolCallBlock",
+                               "ThinkingBlock", "ToolCallBlock", "AssistantMessage"]
             assert len(app.query(AssistantMessage)) == 1
             assert app._busy is False
+
+            view = app.query_one(TimelineView)
+            timeline = view.timeline
+            assert timeline.status == "done" and timeline.ended_at is not None
+            assert [span.round_number for span in timeline.spans if span.kind == "waiting"] == [1, 2, 3]
+            assert all(span.ended_at is not None for span in timeline.spans)
+            await pilot.click("#timeline-toggle")
+            await pilot.pause()
+            assert view.display and not conversation.display
+            assert view.table.row_count == len(timeline.spans)
+            assert any(key.value == "bar" for key in view.table.columns)
+            arguments_row = next(i for i, span in enumerate(timeline.spans) if span.kind == "tool_args")
+            assert "生成工具参数" in view.table.get_row_at(arguments_row)[0].plain
+            await pilot.resize_terminal(52, 24)
+            await pilot.pause()
+            assert all(key.value != "bar" for key in view.table.columns)
+            tool_row = next(i for i, span in enumerate(timeline.spans) if span.kind == "tool")
+            view.table.move_cursor(row=tool_row)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not view.display and conversation.display
+            assert not tool_blocks[0].collapsed and tool_blocks[1].collapsed
+            assert tool_blocks[0].query_one("CollapsibleTitle").has_focus
+            assert not app._follow_bottom
 
     asyncio.run(run())
 
@@ -140,6 +164,10 @@ def test_model_reconnect_removes_partial_widgets_and_resets_remote(monkeypatch, 
             resets = [payload for event, payload in emissions if event == "assistant.reset"]
             assert len(resets) == 1 and "自动重连（1/3）" in resets[0]["message"]
             assert not app._busy
+            spans = app.query_one(TimelineView).timeline.spans
+            assert [(span.kind, span.status) for span in spans if span.status == "failed"] == [("answer", "failed")]
+            assert [span.round_number for span in spans if span.kind == "waiting"] == [1, 1]
+            assert sum(span.kind == "retry" and span.ended_at is not None for span in spans) == 1
 
     asyncio.run(run())
 
@@ -264,6 +292,7 @@ def test_footer_rate_updates_and_clear_starts_fresh(monkeypatch, tmp_path):
 
             app.action_clear_chat()
             await pilot.pause()
+            assert not app.query_one("#timeline-toggle").display
             assert app.counter.average_tokens_per_second is None
             assert app.counter.decode_tokens_per_second is None
             assert app.counter.turns == 0

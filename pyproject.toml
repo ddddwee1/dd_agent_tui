@@ -15,7 +15,7 @@ authors = [
 dependencies = [
     "openai>=1.40",
     "httpx>=0.27",
-    "textual>=0.80",
+    "textual>=8.0",
 ]
 
 classifiers = [

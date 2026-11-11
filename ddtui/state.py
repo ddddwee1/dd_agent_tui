@@ -349,6 +349,7 @@ class SubagentSession:
     # waiting= task_pause parked the round; task events will wake it
     phase: str = "thinking"
     last_tool: str | None = None
+    thinking_summary: str = ""
     tokens_in: int = 0       # cumulative prompt tokens for this subagent
     tokens_out: int = 0      # cumulative completion tokens
     # Most recent call's prompt_tokens and the model's context window

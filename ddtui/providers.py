@@ -31,6 +31,7 @@ from .config import (
     DEEPSEEK_CONTEXT_LIMIT,
     DEEPSEEK_MODEL,
     DEEPSEEK_REASONING_EFFORT,
+    THINKING_SUMMARY_ENABLED,
 )
 
 
@@ -75,6 +76,7 @@ class LLMStreamEvent:
     reasoning: str = ""
     tool_call: ToolCallDelta | None = None
     usage: Any | None = None
+    reasoning_kind: str = "raw"
 
 
 class ProviderConfigError(RuntimeError):
@@ -94,6 +96,11 @@ class LLMProvider:
     default_model: str
     default_effort: str
     default_context_limit: int | None = None
+    supports_thinking_summary = False
+
+    async def summarize_thinking(self, messages: list[dict], model: str) -> str:
+        """Return a short progress summary without running a tool loop."""
+        return ""
 
     def context_limit_for_model(self, model: str) -> int | None:
         """Return the effective context window used for status-bar
@@ -171,6 +178,7 @@ class DeepSeekProvider(LLMProvider):
     default_model = DEEPSEEK_MODEL
     default_effort = DEEPSEEK_REASONING_EFFORT
     default_context_limit = DEEPSEEK_CONTEXT_LIMIT
+    supports_thinking_summary = True
 
     # DeepSeek publishes no catalog endpoint, so the candidates are
     # inline; specs from the official pricing docs (both models: 1M
@@ -209,6 +217,19 @@ class DeepSeekProvider(LLMProvider):
             )
         )
         return (response.choices[0].message.content or "").strip()
+
+    async def summarize_thinking(self, messages: list[dict], model: str) -> str:
+        response = await self.client.chat.completions.create(
+            model=model,
+            messages=_messages_for_wire(messages),
+            stream=False,
+            max_tokens=192,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        choice = response.choices[0]
+        if choice.finish_reason != "stop":
+            return ""
+        return (choice.message.content or "").strip()
 
     async def stream(
         self,
@@ -382,6 +403,8 @@ class CodexResponsesProvider(LLMProvider):
             payload["reasoning"] = {
                 "effort": self._normalize_reasoning_effort(effort)
             }
+        if THINKING_SUMMARY_ENABLED and model not in getattr(self, "_summary_unsupported_models", ()):
+            payload.setdefault("reasoning", {})["summary"] = "auto"
         return payload
 
     async def _stream_payload(
@@ -411,6 +434,23 @@ class CodexResponsesProvider(LLMProvider):
                     return
                 if response.status_code >= 400:
                     body = await response.aread()
+                    detail = body.decode("utf-8", "replace").lower()
+                    if (
+                        response.status_code == 400
+                        and (payload.get("reasoning") or {}).get("summary")
+                        and "summary" in detail
+                        and any(word in detail for word in ("unsupported", "not supported", "unrecognized", "unknown"))
+                    ):
+                        unsupported = getattr(self, "_summary_unsupported_models", set())
+                        unsupported.add(payload.get("model"))
+                        self._summary_unsupported_models = unsupported
+                        fallback = {**payload, "reasoning": dict(payload["reasoning"])}
+                        fallback["reasoning"].pop("summary")
+                        await response.aclose()
+                        async with aclosing(self._stream_payload(fallback, allow_refresh)) as stream:
+                            async for event in stream:
+                                yield event
+                        return
                     raise ProviderHTTPError(
                         response.status_code,
                         "Codex Responses request failed: "
@@ -494,7 +534,10 @@ class CodexResponsesProvider(LLMProvider):
         ):
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
-                yield LLMStreamEvent(reasoning=delta)
+                yield LLMStreamEvent(
+                    reasoning=delta,
+                    reasoning_kind="summary" if event_type == "response.reasoning_summary_text.delta" else "raw",
+                )
             return
         if event_type == "response.output_item.added":
             item = event.get("item") or {}

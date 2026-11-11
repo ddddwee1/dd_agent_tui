@@ -899,6 +899,15 @@
           streaming.content += payload.text || "";
         }
         appendStreamingDelta(kind, payload.text || "");
+      } else if (message.type === "assistant.summary") {
+        if (!streaming) return;
+        streaming.ddtui_thinking_summary = {
+          text: payload.text || "",
+          source: payload.source || "generated",
+        };
+        if (streamingNodes && streamingNodes.reasoningRoot) {
+          applyThinkingSummary(streamingNodes.reasoningRoot, streaming);
+        }
       } else if (message.type === "compaction.progress") {
         if (!compaction) compaction = { content: "", reasoning: "" };
         compaction.automatic = !!payload.automatic;
@@ -1198,12 +1207,13 @@
         if (tc.id && fn.name) toolCallNames[tc.id] = fn.name;
       }
       if (message.reasoning_content) {
-        appendMessageBlock(
+        const thinking = appendMessageBlock(
           "reasoning",
           message.reasoning_content,
           "reasoning",
           "thinking"
         );
+        applyThinkingSummary(thinking.root, message);
       }
       const content = message.content || "";
       if (content) {
@@ -1240,12 +1250,13 @@
         return;
       }
       if (message.reasoning_content) {
-        appendMessageBlock(
+        const thinking = appendMessageBlock(
           "reasoning",
           message.reasoning_content,
           "reasoning",
           "thinking"
         );
+        applyThinkingSummary(thinking.root, message);
       }
       if (message.tool_calls) {
         for (const tc of message.tool_calls) {
@@ -1277,6 +1288,15 @@
       const block = createMessageBlock(role, content, className, label);
       els.log.appendChild(block.root);
       return block;
+    }
+
+    function applyThinkingSummary(root, message) {
+      const label = root.querySelector("summary .role");
+      const summary = message.ddtui_thinking_summary;
+      if (label) {
+        label.textContent = summary && typeof summary.text === "string" && summary.text
+          ? summary.text : "thinking";
+      }
     }
 
     function createMessageBlock(role, content = "", className = role, label = role) {

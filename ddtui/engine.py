@@ -33,6 +33,7 @@ import json
 import time
 from contextlib import aclosing
 from dataclasses import dataclass
+from functools import partial
 from typing import Awaitable, Callable
 
 from .api_retry import RequestRetry, retry_request
@@ -46,6 +47,7 @@ from .tools_docs import sync_document_visibility
 from .tools_checkpoint import checkpoint_feedback
 from .optimization import completion_feedback, round_feedback
 from .state import ToolContext, TOOL_ERROR_PREFIXES
+from .turn_timeline import TimelineSpan, TurnTimeline
 from .tools import (
     APP_DISPATCHED_TOOLS,
     CONFIRM_TOOLS,
@@ -96,6 +98,9 @@ class TurnObserver:
 
     async def on_reasoning_delta(self, text: str) -> None:
         pass
+
+    async def on_reasoning_summary_delta(self, text: str) -> None:
+        await self.on_reasoning_delta(text)
 
     async def on_content_delta(self, text: str) -> None:
         pass
@@ -172,6 +177,7 @@ class TurnEngine:
         never_parallel: frozenset[str] | None = None,
         before_round: Callable[[], Awaitable[None]] | None = None,
         executor: Callable[[ToolContext, str, dict], str] = execute_tool,
+        timeline: TurnTimeline | None = None,
     ) -> None:
         self.provider = provider
         self.ctx = ctx
@@ -191,6 +197,8 @@ class TurnEngine:
         # interjections and async-task events into `messages` here.
         self.before_round = before_round
         self.executor = executor
+        self.timeline = timeline
+        self._retry_span: TimelineSpan | None = None
         self._loop_guard = ToolLoopGuard()
 
     async def run_turn(self) -> None:
@@ -207,8 +215,10 @@ class TurnEngine:
                 await self._experiment_feedback(feedback)
                 self.ctx.optimization_plan['model_rounds'] += 1
             self._loop_guard.sync_context(self.messages)
+            if self.timeline is not None:
+                self.timeline.round_number += 1
             msg = await retry_request(
-                self._stream_once, on_retry=self.observer.on_request_retry
+                self._stream_once, on_retry=self._on_request_retry
             )
             tool_calls = msg.get("tool_calls") or []
             feedback = completion_feedback(self.ctx) if not tool_calls else None
@@ -229,6 +239,11 @@ class TurnEngine:
 
     # ── streaming ──
 
+    async def _on_request_retry(self, retry: RequestRetry) -> None:
+        if self.timeline is not None:
+            self._retry_span = self.timeline.begin("retry", at=time.monotonic(), anchor="retry")
+        await self.observer.on_request_retry(retry)
+
     async def _stream_once(self) -> dict:
         request_estimate = history_tokens(self.messages, self.tools)
         content = ""
@@ -237,6 +252,13 @@ class TurnEngine:
         usage = None
         started_at = time.monotonic()
         first_token_at: float | None = None
+        timeline = self.timeline
+        span = None
+        if timeline is not None:
+            timeline.end(self._retry_span, at=started_at)
+            self._retry_span = None
+            timeline.request_number += 1
+            span = timeline.begin("waiting", at=started_at, anchor="request")
         try:
             async with aclosing(self.provider.stream(
                 self.messages, self.tools, self.model, self.effort
@@ -244,24 +266,45 @@ class TurnEngine:
                 async for ev in stream:
                     if ev.usage is not None:
                         usage = ev.usage
-                    if first_token_at is None and (
+                    if (first_token_at is None or span is not None) and (
                         ev.reasoning or ev.content or ev.tool_call is not None
                     ):
-                        first_token_at = time.monotonic()
+                        observed_at = time.monotonic()
+                        if first_token_at is None:
+                            first_token_at = observed_at
+                        if span is not None and timeline is not None:
+                            if ev.tool_call is not None:
+                                kind = "tool_args"
+                            elif ev.content:
+                                kind = "answer"
+                            else:
+                                kind = "thinking"
+                            if kind != span.kind:
+                                timeline.end(span, at=observed_at)
+                                span = timeline.begin(kind, at=observed_at, anchor=kind)
                     if ev.reasoning:
                         reasoning += ev.reasoning
-                        await self.observer.on_reasoning_delta(ev.reasoning)
+                        if ev.reasoning_kind == "summary":
+                            await self.observer.on_reasoning_summary_delta(ev.reasoning)
+                        else:
+                            await self.observer.on_reasoning_delta(ev.reasoning)
                     if ev.content:
                         content += ev.content
                         await self.observer.on_content_delta(ev.content)
                     if ev.tool_call is not None:
                         _merge_tool_call_delta(tool_calls, ev.tool_call)
-        except BaseException:
+        except BaseException as error:
+            if timeline is not None:
+                status = "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
+                timeline.end(span, at=time.monotonic(), status=status)
             # Cancel or stream error: nothing has been appended yet, so
             # the observer just drops its half-rendered widgets.
             self.observer.on_stream_aborted()
             raise
-        elapsed = time.monotonic() - started_at
+        finished_at = time.monotonic()
+        if timeline is not None:
+            timeline.end(span, at=finished_at)
+        elapsed = finished_at - started_at
         ttft = None if first_token_at is None else first_token_at - started_at
         if usage is not None:
             self.ctx.context_last_prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
@@ -336,57 +379,73 @@ class TurnEngine:
         # Announce all, execute concurrently, then append in order.
         for tc, name, args, _ in run:
             await self.observer.on_tool_started(tc.get("id"), name, args)
-        results = await asyncio.gather(
-            *[
-                asyncio.to_thread(self.executor, self.ctx, name, args)
-                for _tc, name, args, _ in run
-            ]
+        outcomes = await asyncio.gather(
+            *(
+                self._time_tool(tc, name, partial(self._execute, name, args))
+                for tc, name, args, _ in run
+            )
         )
-        for (tc, name, args, _), result in zip(run, results):
-            outcome = outcome_from_result(name, result)
+        for (tc, name, args, _), outcome in zip(run, outcomes):
             await self._commit(tc, name, args, outcome)
 
     async def _exec_serial(
         self, tc: dict, name: str, args: dict, args_ok: bool
     ) -> None:
         await self.observer.on_tool_started(tc.get("id"), name, args)
+        try:
+            dispatch = partial(self._dispatch_serial, tc, name, args, args_ok)
+            outcome = await self._time_tool(tc, name, dispatch)
+        except asyncio.CancelledError:
+            # Keep the history protocol-valid before the cancel propagates.
+            outcome = ToolOutcome(ok=False, content=f"⛔ {name} cancelled")
+            await self._commit(tc, name, args, outcome)
+            raise
+        await self._commit(tc, name, args, outcome)
 
+    async def _dispatch_serial(self, tc: dict, name: str, args: dict, args_ok: bool) -> ToolOutcome:
         if not args_ok:
-            outcome = ToolOutcome(
+            return ToolOutcome(
                 ok=False,
                 content=(
                     "Error: could not parse arguments JSON: "
                     f"{args.get('_raw', '')}"
                 ),
             )
-            await self._commit(tc, name, args, outcome)
-            return
 
+        if self.meta_handler is not None:
+            meta_result = await self.meta_handler(tc.get("id"), name, args, self._batch_size)
+            if meta_result is not None:
+                return outcome_from_result(name, meta_result)
+
+        if not await self.tool_confirm(name, args):
+            return ToolOutcome(ok=False, content=BLOCKED_BY_CONFIRM)
+        return await self._execute(name, args)
+
+    async def _execute(self, name: str, args: dict) -> ToolOutcome:
+        result = await asyncio.to_thread(self.executor, self.ctx, name, args)
+        return outcome_from_result(name, result)
+
+    async def _time_tool(
+        self, tc: dict, name: str, execution: Callable[[], Awaitable[ToolOutcome]],
+    ) -> ToolOutcome:
+        timeline = self.timeline
+        if timeline is None:
+            return await execution()
+        call_id = tc.get("id")
+        span = timeline.begin(
+            "tool", at=time.monotonic(), label=name, anchor=f"tool:{call_id}" if call_id else "",
+        )
         try:
-            if self.meta_handler is not None:
-                meta_result = await self.meta_handler(
-                    tc.get("id"), name, args, self._batch_size
-                )
-                if meta_result is not None:
-                    outcome = outcome_from_result(name, meta_result)
-                    await self._commit(tc, name, args, outcome)
-                    return
-
-            allowed = await self.tool_confirm(name, args)
-            if not allowed:
-                outcome = ToolOutcome(ok=False, content=BLOCKED_BY_CONFIRM)
-                await self._commit(tc, name, args, outcome)
-                return
-
-            result = await asyncio.to_thread(self.executor, self.ctx, name, args)
-        except asyncio.CancelledError:
-            # Keep the history protocol-valid: this tool_call gets a
-            # stub result before the cancel propagates.
-            outcome = ToolOutcome(ok=False, content=f"⛔ {name} cancelled")
-            await self._commit(tc, name, args, outcome)
+            outcome = await execution()
+        except BaseException as error:
+            status = "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
+            timeline.end(span, at=time.monotonic(), status=status)
             raise
-        outcome = outcome_from_result(name, result)
-        await self._commit(tc, name, args, outcome)
+        status = "done"
+        if not outcome.ok:
+            status = "blocked" if outcome.content == BLOCKED_BY_CONFIRM else "failed"
+        timeline.end(span, at=time.monotonic(), status=status)
+        return outcome
 
     async def _commit(
         self, tc: dict, name: str, args: dict, outcome: ToolOutcome

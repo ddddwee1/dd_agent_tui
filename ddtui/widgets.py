@@ -9,14 +9,15 @@ arguments or method calls (e.g. `TasksBlock.render_tasks(tasks)`,
 
 from __future__ import annotations
 
+
 import json
-from collections import Counter
 import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Callable
 
+from rich.cells import cell_len
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown
 from rich.text import Text
@@ -34,6 +35,8 @@ from .state import (
     TOOL_ERROR_PREFIXES,
     async_task_status,
 )
+from .thinking_summary import normalize_summary, round_from_message, summary_from_message
+from .ui_theme import UI
 
 
 # ── Markdown table pipe-escaping helper ──
@@ -146,15 +149,16 @@ def _sanitize_table_pipes(md_text: str) -> str:
 class UserBubble(Static):
     DEFAULT_CSS = """
     UserBubble {
-        margin: 1 0 0 0;
+        margin: 1 0;
         padding: 0 1;
-        border-left: thick #66d9ef;
+        border-left: solid $border-blurred;
+        background: $surface;
     }
     UserBubble.pending {
-        border-left: thick #ae81ff;
+        border-left: solid $primary;
     }
     UserBubble.pending:hover {
-        background: #3e3d32;
+        background: $panel;
     }
     """
 
@@ -174,7 +178,7 @@ class UserBubble(Static):
     @staticmethod
     def _render_label(text: str) -> Text:
         t = Text()
-        t.append("you  ", style="bold #66d9ef")
+        t.append("你  ", style=f"bold {UI.accent}")
         t.append(text)
         return t
 
@@ -196,18 +200,17 @@ class UserBubble(Static):
 
 class SteerBubble(Static):
     """A user 'steer' interjection — submitted via Alt/Cmd+Enter while a
-    turn is running. Visually marked with ⚡ + golden border so it's
-    obvious this isn't a normal turn-starting message; it'll be injected
+    turn is running. The accent marker identifies an interjection; it is injected
     into the next LLM round as `[实时插话] <text>`."""
 
     DEFAULT_CSS = """
     SteerBubble {
         margin: 1 0 0 0;
         padding: 0 1;
-        border-left: thick #e6db74;
+        border-left: solid $primary;
     }
     SteerBubble.pending:hover {
-        background: #3e3d32;
+        background: $panel;
     }
     """
 
@@ -223,7 +226,7 @@ class SteerBubble(Static):
     @staticmethod
     def _render_label(text: str) -> Text:
         t = Text()
-        t.append("⚡ steer  ", style="bold #e6db74")
+        t.append("插话  ", style=f"bold {UI.accent}")
         t.append(text)
         return t
 
@@ -269,11 +272,11 @@ class EditPendingScreen(ModalScreen[dict | None]):
         max-width: 100;
         height: auto;
         padding: 1 2;
-        background: #2d2e27;
-        border: thick #66d9ef;
+        background: $surface;
+        border: thick $primary;
     }
     #edit-dialog.steer {
-        border: thick #e6db74;
+        border: thick $warning;
     }
     #edit-title {
         height: auto;
@@ -305,9 +308,9 @@ class EditPendingScreen(ModalScreen[dict | None]):
         with Vertical(id="edit-dialog", classes=dialog_classes):
             title = Text()
             if self._kind == "steer":
-                title.append("⚡ 编辑 steer", style="bold #e6db74")
+                title.append("⚡ 编辑 steer", style=f"bold {UI.warning}")
             else:
-                title.append("📋 编辑排队消息", style="bold #66d9ef")
+                title.append("📋 编辑排队消息", style=f"bold {UI.accent}")
             convert_hint = "转排队" if self._kind == "steer" else "转 steer"
             title.append(
                 f"   ·   Ctrl+S 保存   Ctrl+D 删除   Ctrl+T {convert_hint}   Esc 取消",
@@ -391,8 +394,8 @@ class ToolConfirmScreen(ModalScreen[str]):
         height: auto;
         max-height: 80%;
         padding: 1 2;
-        background: #2d2e27;
-        border: thick #fd971f;
+        background: $surface;
+        border: thick $warning;
     }
     #confirm-title {
         height: auto;
@@ -421,7 +424,7 @@ class ToolConfirmScreen(ModalScreen[str]):
     def compose(self):
         with Vertical(id="confirm-dialog"):
             title = Text()
-            title.append(f"⚠ 写操作确认 · {self._tool_name}", style="bold #fd971f")
+            title.append(f"⚠ 写操作确认 · {self._tool_name}", style=f"bold {UI.warning}")
             title.append(
                 "   ·   Y 允许   A 本会话总是允许   N/Esc 拒绝",
                 style="dim",
@@ -470,8 +473,8 @@ class ResumeConversationScreen(ModalScreen[str | None]):
         height: 80%;
         max-height: 32;
         padding: 1 2;
-        background: #2d2e27;
-        border: thick #66d9ef;
+        background: $surface;
+        border: thick $primary;
     }
     #resume-title {
         height: auto;
@@ -503,7 +506,7 @@ class ResumeConversationScreen(ModalScreen[str | None]):
     def compose(self):
         with Vertical(id="resume-dialog"):
             title = Text()
-            title.append("恢复会话", style="bold #66d9ef")
+            title.append("恢复会话", style=f"bold {UI.accent}")
             title.append("   ·   Enter 选择   Esc 取消", style="dim")
             yield Static(title, id="resume-title")
             if not self._entries:
@@ -585,12 +588,12 @@ class CollapsedHistoryMarker(Static):
     CollapsedHistoryMarker {
         margin: 1 0;
         padding: 0 1;
-        color: #a59f85;
-        background: #2d2e27;
+        color: $text-muted;
+        background: $surface;
         text-align: center;
     }
     CollapsedHistoryMarker:hover {
-        background: #3e3d32;
+        background: $panel;
     }
     """
 
@@ -604,7 +607,7 @@ class CollapsedHistoryMarker(Static):
     def _render_label(self) -> Text:
         t = Text()
         t.append("── ", style="dim")
-        t.append(f"已折叠 {self._count} 条历史", style="bold #a59f85")
+        t.append(f"已折叠 {self._count} 条历史", style=f"bold {UI.muted}")
         t.append("  ·  点击展开 ──", style="dim")
         return t
 
@@ -620,9 +623,9 @@ class CollapsedHistoryMarker(Static):
 class AssistantMessage(Static):
     DEFAULT_CSS = """
     AssistantMessage {
-        margin: 0 0 1 0;
+        margin: 1 0;
         padding: 0 1;
-        border-left: thick #a6e22e;
+        color: $foreground;
     }
     """
 
@@ -650,9 +653,9 @@ class AssistantMessage(Static):
         # headings and have them render as such (instead of raw `| col |`
         # text).
         if not self._buffer:
-            return Text("assistant  ", style="bold #a6e22e")
+            return Text("助手  ", style=UI.muted)
         return Group(
-            Text("assistant", style="bold #a6e22e"),
+            Text("助手", style=UI.muted),
             Markdown(_sanitize_table_pipes(self._buffer)),
         )
 
@@ -669,58 +672,96 @@ class ThinkingBlock(Collapsible):
 
     DEFAULT_CSS = """
     ThinkingBlock {
-        margin: 0 0 1 0;
-        background: #272822;
-        border-left: thick #75715e;
+        margin: 0;
+        background: $background;
+        border-left: solid $border-blurred;
+        border-top: none;
         padding-bottom: 0;
         padding-left: 0;
     }
-    ThinkingBlock > CollapsibleTitle { color: #a59f85; }
+    ThinkingBlock > CollapsibleTitle { color: $text-muted; text-style: none; }
     ThinkingBlock > CollapsibleTitle:hover {
-        background: #3e3d32;
-        color: #cfc8b8;
+        background: $panel;
+        color: $foreground;
     }
     ThinkingBlock > CollapsibleTitle:focus {
-        background: #49483e;
-        color: #f8f8f2;
+        background: $panel;
+        color: $foreground;
     }
     ThinkingBlock > Contents { padding: 0 0 0 2; }
-    ThinkingBlock #thinking-body { color: #b9b39f; }
+    ThinkingBlock #thinking-body { color: $text-muted; }
+    ThinkingBlock.streaming > CollapsibleTitle { color: $text-muted; }
+    ThinkingBlock.streaming { border-left: solid $primary; }
+    ThinkingBlock > .thinking-summary-preview {
+        height: auto;
+        padding: 0 1 0 2;
+        color: $text-muted;
+        display: none;
+    }
     """
 
     def __init__(self) -> None:
         self._buffer = ""
         self._streaming = True
-        self._tool_group: ToolCallGroup | None = None
+        self.summary = ""
+        self.summary_source = ""
+        self.round_number = 0
+        self._reasoning_tokens = 0
+        self.summary_cancel: Callable[[], None] | None = None
+        self._summary_preview = Static("", classes="thinking-summary-preview", markup=False)
         self._body = Static("", id="thinking-body", markup=False)
         super().__init__(self._body, title="thinking · 流式中…", collapsed=True)
 
+    def compose(self):
+        for index, child in enumerate(super().compose()):
+            yield child
+            if index == 0:
+                yield self._summary_preview
+
+    def set_summary(self, text: str, source: str = "generated") -> None:
+        self.summary = normalize_summary(text)
+        self.summary_source = source
+        self._summary_preview.update(Text(self.summary, style=UI.thinking_summary))
+        self._summary_preview.display = bool(self.summary)
+
+    def set_round_number(self, number: int) -> None:
+        if number > 0:
+            self.round_number = number
+            self._refresh_title()
+
+    def _refresh_title(self) -> None:
+        label = f"第 {self.round_number} 轮思考" if self.round_number else "思考"
+        self.set_class(self._streaming, "streaming")
+        parts = [label, f"{len(self._buffer):,} 字符"]
+        if self._streaming:
+            parts[0] = label + "中"
+        elif self._reasoning_tokens:
+            parts.append(f"{self._reasoning_tokens:,} tokens")
+        self.title = " · ".join(parts).replace("[", "\\[")
+
+    def _refresh_body(self) -> None:
+        self._body.update(self._buffer)
+
+    def on_unmount(self) -> None:
+        if self.summary_cancel is not None:
+            self.summary_cancel()
+
     def append_text(self, text: str) -> None:
         self._buffer += text
-        self._body.update(self._buffer)
+        self._refresh_body()
         # Keep the (collapsed) title informative: a live character count
         # shows how much reasoning has streamed in without unfolding.
-        self.title = f"thinking · {len(self._buffer):,} 字符 · 流式中…"
-        if self._tool_group is not None:
-            self._tool_group.refresh_title()
+        self._refresh_title()
 
     def finalize(self, reasoning_tokens: int) -> None:
         self._streaming = False
-        chars = len(self._buffer)
-        if reasoning_tokens:
-            self.title = (
-                f"thinking · {chars:,} 字符 · {reasoning_tokens:,} tokens"
-                " (点击展开/折叠)"
-            )
-        else:
-            self.title = f"thinking · {chars:,} 字符 (点击展开/折叠)"
-        if self._tool_group is not None:
-            self._tool_group.refresh_title()
+        self._reasoning_tokens = reasoning_tokens
+        self._refresh_title()
 
     def discard(self) -> None:
-        """Remove uncommitted reasoning and update its enclosing group."""
-        if self._tool_group is not None:
-            self._tool_group.discard_thinking(self)
+        """Cancel the summary worker and remove uncommitted reasoning."""
+        if self.summary_cancel is not None:
+            self.summary_cancel()
         self.remove()
 
     @property
@@ -734,9 +775,9 @@ class CompactionBlock(Collapsible):
     DEFAULT_CSS = """
     CompactionBlock {
         margin: 0 0 1 0;
-        border-left: thick #66d9ef;
+        border-left: thick $primary;
     }
-    CompactionBlock > CollapsibleTitle { color: #66d9ef; }
+    CompactionBlock > CollapsibleTitle { color: $primary; }
     """
 
     def __init__(self, *, automatic: bool) -> None:
@@ -798,23 +839,27 @@ class ToolCallBlock(Collapsible):
 
     DEFAULT_CSS = """
     ToolCallBlock {
-        margin: 0 0 1 0;
-        background: #272822;
-        border-left: thick #fd971f;
+        margin: 0;
+        background: $background;
+        border-left: solid $border-blurred;
+        border-top: none;
         padding-bottom: 0;
         padding-left: 0;
     }
-    ToolCallBlock > CollapsibleTitle { color: #a86612; }
+    ToolCallBlock > CollapsibleTitle { color: $foreground 55%; text-style: none; }
     ToolCallBlock > CollapsibleTitle:hover {
-        background: #3e3d32;
-        color: #ffb454;
+        background: $panel;
+        color: $primary;
     }
     ToolCallBlock > CollapsibleTitle:focus {
-        background: #49483e;
-        color: #ffd28a;
+        background: $panel;
+        color: $foreground;
     }
     ToolCallBlock > Contents { padding: 0 0 0 2; }
-    ToolCallBlock #toolcall-body { color: #b9b39f; }
+    ToolCallBlock #toolcall-body { color: $text-muted; }
+    ToolCallBlock.running > CollapsibleTitle { color: $text-muted; }
+    ToolCallBlock.running { border-left: solid $primary; }
+    ToolCallBlock.has-error > CollapsibleTitle { color: $error; }
     """
 
     def __init__(self, name: str, args: dict) -> None:
@@ -822,50 +867,62 @@ class ToolCallBlock(Collapsible):
         self._args = args
         self._result: str | None = None
         self._blocked = False
-        self._tool_group: ToolCallGroup | None = None
         # markup=False so result text containing '[' or ']' won't be parsed.
         self._body = Static(self._build_body(), id="toolcall-body", markup=False)
         super().__init__(self._body, title=self._build_title(), collapsed=True)
+        self.add_class("running")
 
     def set_result(self, result: str, blocked: bool = False) -> None:
         self._result = result
         self._blocked = blocked or result.startswith(TOOL_ERROR_PREFIXES)
+        self.remove_class("running")
+        self.set_class(self._blocked, "has-error")
         self._body.update(self._build_body())
         self.title = self._build_title()
-        if self._tool_group is not None:
-            self._tool_group.refresh_title()
 
     @property
     def is_pending(self) -> bool:
         return self._result is None
 
     def _short_args(self) -> str:
-        try:
-            preview = json.dumps(self._args, ensure_ascii=False)
-        except Exception:
-            preview = str(self._args)
-        if len(preview) > 80:
-            preview = preview[:80] + "…"
-        return preview
+        for key in ("path", "pattern", "command", "query", "url", "name"):
+            value = self._args.get(key)
+            if isinstance(value, str) and value:
+                preview = " ".join(value.split())
+                break
+        else:
+            try:
+                preview = json.dumps(self._args, ensure_ascii=False)
+            except Exception:
+                preview = str(self._args)
+        short = Text(preview, no_wrap=True, overflow="ellipsis")
+        short.truncate(60, overflow="ellipsis")
+        return short.plain
 
     def _build_title(self) -> str:
         if self._result is None:
             status = "执行中…"
         elif self._blocked:
-            status = "⊘ 已拦截"
+            status = "✗ 异常"
         else:
             status = "✓"
-        title = f"● {self._tool_name}  {self._short_args()}  {status}"
+        title = f"● {self.description}  {status}"
         # Escaping '[' prevents Textual markup parser from treating
         # JSON brackets (e.g. ["vec"]) as malformed markup tags.
         return title.replace('[', '\\[')
+
+    @property
+    def description(self) -> str:
+        return f"{self._tool_name}  {self._short_args()}"
 
     def _build_body(self) -> RenderableType:
         try:
             args_pretty = json.dumps(self._args, ensure_ascii=False, indent=2)
         except Exception:
             args_pretty = str(self._args)
-        parts: list[RenderableType] = [Text(args_pretty), Text("")]
+        parts: list[RenderableType] = [
+            Text(f"工具 · {self._tool_name}", style=UI.muted), Text(args_pretty), Text(""),
+        ]
 
         if self._result is None:
             parts.append(Text("执行中…", style="italic dim"))
@@ -882,105 +939,48 @@ class ToolCallBlock(Collapsible):
         return Group(*parts)
 
 
-class ToolCallGroup(Collapsible):
-    """Consecutive thinking, tool calls and diffs, collapsed by default.
-
-    Both live and replay views push the original detail widgets into this
-    container. Results still update their own blocks; the group title stays
-    informative without forcing open a group the user chose to collapse.
-    """
+class WorkbenchOverview(Static):
+    """The current user goal, kept visible independently of background tasks."""
 
     DEFAULT_CSS = """
-    ToolCallGroup {
+    WorkbenchOverview {
         height: auto;
-        margin: 0 0 1 0;
-        background: #272822;
-        border-left: thick #fd971f;
-        padding: 0;
+        margin: 1 0;
+        padding: 0 1;
+        color: $foreground;
     }
-    ToolCallGroup > CollapsibleTitle { color: #ffb454; }
-    ToolCallGroup > CollapsibleTitle:hover { background: #3e3d32; }
-    ToolCallGroup > CollapsibleTitle:focus { background: #49483e; }
-    ToolCallGroup > Contents { padding: 0 0 0 1; }
-    ToolCallGroup .tool-group-items { height: auto; }
-    ToolCallGroup ToolCallBlock { border-left: none; margin-bottom: 0; }
-    ToolCallGroup ThinkingBlock { border-left: none; margin-bottom: 0; }
     """
 
-    def __init__(self) -> None:
-        self._calls: list[ToolCallBlock] = []
-        self._thoughts: list[ThinkingBlock] = []
-        self._pending_details: list = []
-        self._items = Vertical(classes="tool-group-items")
-        super().__init__(self._items, title="工具调用", collapsed=True)
+    def set_goal(self, goal: str) -> None:
+        goal = " ".join(goal.split()) or "等待输入任务"
+        if len(goal) > 100:
+            goal = goal[:99] + "…"
+        if goal != getattr(self, "_goal", None):
+            self._goal = goal
+            self.update(Text.assemble(("当前目标\n", UI.muted), goal))
 
-    @property
-    def tool_calls(self) -> tuple[ToolCallBlock, ...]:
-        return tuple(self._calls)
 
-    @property
-    def thinking_blocks(self) -> tuple[ThinkingBlock, ...]:
-        return tuple(self._thoughts)
+class ThinkingSummaryPanel(Static):
+    """The latest main-conversation summary in the workbench sidebar."""
 
-    def discard_thinking(self, block: ThinkingBlock) -> None:
-        self._thoughts.remove(block)
-        block._tool_group = None
-        if block in self._pending_details:
-            self._pending_details.remove(block)
-        if self._thoughts or self._calls:
-            self.refresh_title()
-        else:
-            self.display = False
-            self.remove()
+    DEFAULT_CSS = """
+    ThinkingSummaryPanel {
+        height: auto;
+        max-height: 12;
+        margin: 1 0;
+        padding: 0 1;
+        border-top: solid $border-blurred;
+        color: $foreground;
+        display: none;
+    }
+    """
 
-    def add_block(self, block):
-        """Queue pre-mount children; otherwise return an awaitable mount."""
-        if isinstance(block, ToolCallBlock):
-            self._calls.append(block)
-        elif isinstance(block, ThinkingBlock):
-            self._thoughts.append(block)
-        if isinstance(block, (ThinkingBlock, ToolCallBlock)):
-            block._tool_group = self
-            self.refresh_title()
-        if self._items.is_mounted:
-            return self._items.mount(block)
-        self._pending_details.append(block)
-        return None
-
-    async def on_mount(self) -> None:
-        if self._pending_details:
-            pending, self._pending_details = self._pending_details, []
-            await self._items.mount(*pending)
-
-    def refresh_title(self) -> None:
-        pending = sum(call.is_pending for call in self._calls)
-        failed = sum(not call.is_pending and call._blocked for call in self._calls)
-        done = len(self._calls) - pending - failed
-        names = Counter(call._tool_name for call in self._calls)
-        preview = ", ".join(f"{name} ×{count}" if count > 1 else name
-                            for name, count in list(names.items())[:3])
-        if len(names) > 3:
-            preview += " …"
-        if len(self._calls) == 1:
-            preview += "  " + self._calls[0]._short_args()
-        status = []
-        if pending:
-            status.append(f"执行中 {pending}")
-        if done:
-            status.append(f"✓ {done}")
-        if failed:
-            status.append(f"异常 {failed}")
-        parts = []
-        if self._thoughts:
-            parts.append("思考与工具" if self._calls else "思考")
-            chars = sum(len(block.text) for block in self._thoughts)
-            parts.append(f"thinking {len(self._thoughts)} 段 · {chars:,} 字符")
-            if any(block._streaming for block in self._thoughts):
-                parts.append("思考中…")
-        if self._calls:
-            parts.append(f"工具调用 · {len(self._calls)} 项 · {preview} · {' / '.join(status)}")
-        title = " · ".join(parts)
-        self.title = title.replace("[", "\\[")
+    def set_summary(self, text: str, *, active: bool = True) -> None:
+        label = "当前思考" if active else "思考摘要"
+        state = (text, label)
+        if state != getattr(self, "_last_state", None):
+            self._last_state = state
+            self.update(Text.assemble((label + "\n", UI.muted), (text, UI.thinking_summary)))
 
 
 class DiffBlock(Collapsible):
@@ -992,19 +992,19 @@ class DiffBlock(Collapsible):
     DEFAULT_CSS = """
     DiffBlock {
         margin: 0 0 1 0;
-        background: #272822;
-        border-left: thick #ae81ff;
+        background: $background;
+        border-left: thick $primary;
         padding-bottom: 0;
         padding-left: 0;
     }
-    DiffBlock > CollapsibleTitle { color: #ae81ff; }
+    DiffBlock > CollapsibleTitle { color: $primary; }
     DiffBlock > CollapsibleTitle:hover {
-        background: #3e3d32;
-        color: #c7a6ff;
+        background: $panel;
+        color: $primary;
     }
     DiffBlock > CollapsibleTitle:focus {
-        background: #49483e;
-        color: #f8f8f2;
+        background: $panel;
+        color: $foreground;
     }
     DiffBlock > Contents { padding: 0 0 0 2; }
     """
@@ -1028,19 +1028,18 @@ class DiffBlock(Collapsible):
 
     @staticmethod
     def _render_diff(diff_text: str) -> Text:
-        """Color a unified diff using Monokai-ish accents without turning
-        the whole block into a bright card."""
+        """Highlight additions and deletions on quiet semantic backgrounds."""
         t = Text()
         for line in diff_text.splitlines(keepends=True):
             head = line.rstrip("\n")
             if head.startswith("+++") or head.startswith("---"):
                 t.append(line, style="bold")
             elif head.startswith("@@"):
-                t.append(line, style="bold #66d9ef")
+                t.append(line, style=f"bold {UI.accent}")
             elif head.startswith("+"):
-                t.append(line, style="bold #f8f8f2 on #314f2f")
+                t.append(line, style=f"bold {UI.text} on {UI.added}")
             elif head.startswith("-"):
-                t.append(line, style="bold #f8f8f2 on #5a2130")
+                t.append(line, style=f"bold {UI.text} on {UI.removed}")
             else:
                 t.append(line)
         return t
@@ -1052,19 +1051,19 @@ class ExploreSummaryBlock(Collapsible):
     DEFAULT_CSS = """
     ExploreSummaryBlock {
         margin: 0 0 1 0;
-        background: #272822;
-        border-left: thick #ae81ff;
+        background: $background;
+        border-left: thick $primary;
         padding-bottom: 0;
         padding-left: 0;
     }
-    ExploreSummaryBlock > CollapsibleTitle { color: #ae81ff; }
+    ExploreSummaryBlock > CollapsibleTitle { color: $primary; }
     ExploreSummaryBlock > CollapsibleTitle:hover {
-        background: #3e3d32;
-        color: #c7a6ff;
+        background: $panel;
+        color: $primary;
     }
     ExploreSummaryBlock > CollapsibleTitle:focus {
-        background: #49483e;
-        color: #f8f8f2;
+        background: $panel;
+        color: $foreground;
     }
     ExploreSummaryBlock > Contents { padding: 0 0 0 2; }
     """
@@ -1090,7 +1089,7 @@ class CheckpointBlock(Static):
     CheckpointBlock {
         margin: 1 0;
         padding: 0 1;
-        border: round #66d9ef;
+        border: round $primary;
     }
     """
 
@@ -1114,7 +1113,7 @@ class CheckpointBlock(Static):
     ) -> None:
         if not items:
             return
-        t.append(f"\n{label}", style="bold #66d9ef")
+        t.append(f"\n{label}", style=f"bold {UI.accent}")
         extra = max(0, len(items) - limit)
         for item in items[:limit]:
             t.append("\n  - ", style="dim")
@@ -1125,7 +1124,7 @@ class CheckpointBlock(Static):
     def _build(self) -> Text:
         cp = self._checkpoint or {}
         t = Text()
-        t.append("Checkpoint", style="bold #66d9ef")
+        t.append("任务计划", style=UI.muted)
         if not cp:
             t.append("\n  (empty)", style="dim italic")
             return t
@@ -1134,19 +1133,19 @@ class CheckpointBlock(Static):
         t.append(f"  {status} · {confidence}", style="dim")
         goal = self._short(str(cp.get("goal") or ""), 80)
         if goal:
-            t.append("\nGoal  ", style="bold")
+            t.append("\n目标  ", style="bold")
             t.append(goal)
         focus = self._short(str(cp.get("current_focus") or ""), 80)
         if focus:
-            t.append("\nFocus ", style="bold")
+            t.append("\n当前步骤 ", style="bold")
             t.append(focus, style="dim")
         blockers = [str(x) for x in cp.get("blockers") or []]
         next_steps = [str(x) for x in cp.get("next_steps") or []]
         refs = [str(x) for x in cp.get("active_refs") or []]
-        self._append_items(t, "Blockers", blockers, limit=2)
-        self._append_items(t, "Next", next_steps, limit=3)
+        self._append_items(t, "阻碍", blockers, limit=2)
+        self._append_items(t, "下一步", next_steps, limit=3)
         if refs:
-            t.append("\nRefs  ", style="bold")
+            t.append("\n参考  ", style="bold")
             t.append(", ".join(refs[:4]), style="dim")
             if len(refs) > 4:
                 t.append(f", … +{len(refs) - 4}", style="dim")
@@ -1166,9 +1165,9 @@ class TodoBlock(Static):
     TodoBlock {
         margin: 1 0;
         padding: 0 1;
-        border: round #ae81ff;
+        border: round $primary;
     }
-    TodoBlock.all-done { border: round #e6db74; }
+    TodoBlock.all-done { border: round $warning; }
     """
 
     def __init__(self) -> None:
@@ -1186,7 +1185,7 @@ class TodoBlock(Static):
         n_pend = n - n_done - n_prog
 
         t = Text()
-        t.append("TODO  ", style="bold #ae81ff")
+        t.append("待办  ", style=UI.muted)
         t.append(
             f"({n_prog} 进行中 · {n_done} 完成 · {n_pend} 待办)",
             style="dim",
@@ -1200,14 +1199,14 @@ class TodoBlock(Static):
             t.append("\n")
             if status == "completed":
                 t.append("  [", style="dim")
-                t.append("✓", style="bold #a6e22e")
+                t.append("✓", style=f"bold {UI.success}")
                 t.append("] ", style="dim")
                 t.append(content, style="strike dim")
             elif status == "in_progress":
                 t.append("  [", style="bold")
-                t.append("▶", style="bold #66d9ef")
+                t.append("▶", style=f"bold {UI.accent}")
                 t.append("] ", style="bold")
-                t.append(content, style="bold #66d9ef")
+                t.append(content, style=f"bold {UI.accent}")
             else:  # pending
                 t.append("  [ ] ", style="dim")
                 t.append(content, style="dim")
@@ -1227,7 +1226,7 @@ class SubagentsBlock(Static):
     SubagentsBlock {
         margin: 1 0;
         padding: 0 1;
-        border: round #f92672;
+        border: round $error;
     }
     """
 
@@ -1237,20 +1236,20 @@ class SubagentsBlock(Static):
     # (waiting), has an answer waiting (ready), or is between rounds
     # (idle).
     _PHASE_GLYPH = {
-        "thinking":  ("◐", "bold #ae81ff"),
-        "answering": ("▶", "bold #66d9ef"),
-        "tool":      ("⚙", "bold #fd971f"),
-        "compacting": ("📦", "bold #66d9ef"),
-        "waiting":   ("◌", "bold #e6db74"),
-        "ready":     ("▣", "bold #a6e22e"),
-        "idle":      ("○", "bold #75715e"),
-        "done":      ("✓", "bold #a6e22e"),
-        "error":     ("✗", "bold #f92672"),
+        "thinking":  ("◐", f"bold {UI.accent}"),
+        "answering": ("▶", f"bold {UI.accent}"),
+        "tool":      ("⚙", f"bold {UI.accent}"),
+        "compacting": ("📦", f"bold {UI.accent}"),
+        "waiting":   ("◌", f"bold {UI.warning}"),
+        "ready":     ("▣", f"bold {UI.success}"),
+        "idle":      ("○", UI.muted),
+        "done":      ("✓", f"bold {UI.success}"),
+        "error":     ("✗", f"bold {UI.error}"),
     }
 
     def render_sessions(self, sessions: list[SubagentSession]) -> None:
         t = Text()
-        t.append("Subagents  ", style="bold #f92672")
+        t.append("子 agent  ", style=UI.muted)
         n_busy = sum(
             1 for s in sessions
             if s.phase in ("thinking", "answering", "tool", "compacting")
@@ -1280,9 +1279,9 @@ class SubagentsBlock(Static):
                 elapsed = now - s.started_at
                 t.append(f"  {elapsed:5.1f}s", style="dim")
             if s.phase == "compacting":
-                t.append("  · 上下文压缩中…", style="#66d9ef")
+                t.append("  · 上下文压缩中…", style=UI.accent)
             elif s.last_tool and s.phase != "idle":
-                t.append(f"  · {s.last_tool}", style="#fd971f")
+                t.append(f"  · {s.last_tool}", style=UI.accent)
             if s.tokens_in or s.tokens_out:
                 t.append(
                     f"\n    [{s.tokens_in:,}↓ / {s.tokens_out:,}↑]",
@@ -1294,13 +1293,15 @@ class SubagentsBlock(Static):
             if s.context_limit and s.last_prompt_tokens:
                 pct = s.last_prompt_tokens * 100.0 / s.context_limit
                 if pct >= 85:
-                    ctx_style = "bold #f92672"
+                    ctx_style = f"bold {UI.error}"
                 elif pct >= 70:
-                    ctx_style = "bold #e6db74"
+                    ctx_style = f"bold {UI.warning}"
                 else:
                     ctx_style = "dim"
                 t.append(f"  ctx {pct:.0f}%", style=ctx_style)
-            if s.prompt_preview:
+            if s.phase == "thinking" and getattr(s, "thinking_summary", ""):
+                t.append(f"\n    {s.thinking_summary}", style=UI.thinking_summary)
+            elif s.prompt_preview:
                 t.append(f'\n    "{s.prompt_preview}"', style="dim italic")
         self._update_live_text(t)
 
@@ -1331,12 +1332,12 @@ class TerminalTabPane(VerticalScroll):
         rc = self.sess.proc.poll()
         if rc is None and not self.sess.closed:
             status = "running"
-            style = "bold #66d9ef"
+            style = f"bold {UI.accent}"
         else:
             status = f"exited {rc}"
-            style = "bold #a6e22e" if rc == 0 else "bold #f92672"
+            style = f"bold {UI.success}" if rc == 0 else f"bold {UI.error}"
         header = Text()
-        header.append(f"{self.sess.id}  ", style="bold #66d9ef")
+        header.append(f"{self.sess.id}  ", style=f"bold {UI.accent}")
         header.append(self.sess.name, style="bold")
         header.append(f"  {status}", style=style)
         header.append(f"\ncmd: {self.sess.command}", style="dim")
@@ -1398,24 +1399,11 @@ class SubagentTabPane(VerticalScroll):
         # the user prompt, so the DOM order ends up user → thinking →
         # answer → tools.
         self._pending_mounts: list = []
-        self._tail_tool_group: ToolCallGroup | None = None
+        self._thinking_round = 0
         self._transcript_ready = False
 
     def _append_transcript(self, widget) -> None:
-        """Keep live, replay and pre-mount buffering on the same group path."""
-        if isinstance(widget, (ThinkingBlock, ToolCallBlock)):
-            if self._tail_tool_group is None:
-                self._tail_tool_group = ToolCallGroup()
-                if self._transcript_ready:
-                    self.mount(self._tail_tool_group)
-                else:
-                    self._pending_mounts.append(self._tail_tool_group)
-            self._tail_tool_group.add_block(widget)
-            return
-        if isinstance(widget, DiffBlock) and self._tail_tool_group is not None:
-            self._tail_tool_group.add_block(widget)
-            return
-        self._tail_tool_group = widget if isinstance(widget, ToolCallGroup) else None
+        """Append each entry directly, preserving live and replay order."""
         if self._transcript_ready:
             self.mount(widget)
         else:
@@ -1437,19 +1425,23 @@ class SubagentTabPane(VerticalScroll):
             for w in pending:
                 try:
                     self._append_transcript(w)
+                    if isinstance(w, ThinkingBlock) and not w._streaming:
+                        self._thinking_round = max(self._thinking_round, w.round_number)
                 except Exception:
                     pass
             self.scroll_end(animate=False)
 
     # ───────── live streaming hooks (called from _run_subagent_round) ─────────
 
-    def start_thinking(self) -> None:
+    def start_thinking(self) -> ThinkingBlock:
         """Mount a fresh ThinkingBlock for the current LLM call.
         Idempotent — repeated calls within the same round are no-ops."""
         if self._live_thinking is not None:
-            return
+            return self._live_thinking
         self._live_thinking = ThinkingBlock()
+        self._live_thinking.set_round_number(self._thinking_round + 1)
         self._append_transcript(self._live_thinking)
+        return self._live_thinking
 
     def add_compaction_block(self, block: CompactionBlock) -> None:
         self._append_transcript(block)
@@ -1466,6 +1458,7 @@ class SubagentTabPane(VerticalScroll):
     def finalize_thinking(self, reasoning_tokens: int) -> None:
         if self._live_thinking is not None:
             self._live_thinking.finalize(reasoning_tokens)
+            self._thinking_round = self._live_thinking.round_number
             self._live_thinking = None
 
     def start_answer(self) -> None:
@@ -1518,6 +1511,8 @@ class SubagentTabPane(VerticalScroll):
         stream error or cancellation. Caller should follow up with
         mount_exception_notice() so the user sees what went wrong
         instead of a silent gap."""
+        live = (self._live_thinking, self._live_answer)
+        self._pending_mounts = [widget for widget in self._pending_mounts if widget not in live]
         if self._live_thinking is not None:
             try:
                 self._live_thinking.discard()
@@ -1530,12 +1525,8 @@ class SubagentTabPane(VerticalScroll):
             except Exception:
                 pass
             self._live_answer = None
-        # Also drop anything that was queued pre-mount but not yet
-        # flushed — that's the same in-flight content.
-        self._pending_mounts.clear()
-        self._tail_tool_group = None
 
-    def mount_exception_notice(self, text: str, *, style: str = "bold #f92672") -> None:
+    def mount_exception_notice(self, text: str, *, style: str = f"bold {UI.error}") -> None:
         block = Static(Text(text, style=style), markup=False)
         self._append_transcript(block)
         if self.is_mounted:
@@ -1571,13 +1562,18 @@ class SubagentTabPane(VerticalScroll):
             # not interesting in a transcript view.
             return
         if role == "user":
+            if not m.get("ddtui_kind") and not str(m.get("content") or "").startswith("[实时插话] "):
+                self._thinking_round = 0
             self._append_transcript(UserBubble(m.get("content") or ""))
             return
         if role == "assistant":
             rc = m.get("reasoning_content")
             if rc:
+                self._thinking_round = max(self._thinking_round + 1, round_from_message(m))
                 tb = ThinkingBlock()
                 tb.append_text(rc)
+                tb.set_round_number(self._thinking_round)
+                tb.set_summary(*summary_from_message(m))
                 # Historical reasoning has no live token count; pass 0 so
                 # `finalize` titles the block with just its character count.
                 # It stays collapsed by default (matching the live path and
@@ -1621,7 +1617,7 @@ class TasksBlock(Static):
     TasksBlock {
         margin: 1 0;
         padding: 0 1;
-        border: round #ae81ff;
+        border: round $primary;
     }
     """
 
@@ -1634,7 +1630,7 @@ class TasksBlock(Static):
 
     def render_tasks(self, tasks: list[AsyncTask]) -> None:
         t = Text()
-        t.append("Tasks  ", style="bold #ae81ff")
+        t.append("后台任务  ", style=UI.muted)
         t.append(f"({len(tasks)} 跑)", style="dim")
         if not tasks:
             t.append("\n  (empty)", style="dim italic")
@@ -1645,8 +1641,8 @@ class TasksBlock(Static):
             label = self._clip(task.name or task.command, 30)
             output = self._clip(str(task.output_path), 34)
             t.append("\n  ")
-            t.append("▶ ", style="bold #66d9ef")
-            t.append(f"{task.id}", style="bold #66d9ef")
+            t.append("▶ ", style=f"bold {UI.accent}")
+            t.append(f"{task.id}", style=f"bold {UI.accent}")
             t.append(f"  {elapsed:5.1f}s ", style="dim")
             t.append(label)
             if rc is not None:
@@ -1691,8 +1687,9 @@ class SlashPopup(Static):
     SlashPopup {
         height: auto;
         padding: 0 1;
-        border: round #66d9ef;
-        background: #272822;
+        border: round $primary;
+        background: $background;
+        overflow-y: auto;
         display: none;
     }
     """
@@ -1789,11 +1786,11 @@ class SlashPopup(Static):
         # table rather than a ragged left edge.
         width = max(len(left) for left, _ in rows)
         t = Text()
-        t.append(title, style="bold #66d9ef")
+        t.append(title, style=f"bold {UI.accent}")
         t.append(subtitle, style="dim")
         for left, right in rows:
             t.append("\n  ")
-            t.append(left.ljust(width), style="bold #66d9ef")
+            t.append(left.ljust(width), style=f"bold {UI.accent}")
             if right:
                 t.append("  ")
                 t.append(right, style="dim")
@@ -1926,7 +1923,13 @@ class MultilineInput(TextArea):
             visible = self.wrapped_document.height
         except Exception:
             visible = self.document.line_count
-        rows = max(self._MIN_ROWS, min(self._MAX_ROWS, visible + 2))
+        limit = self._MAX_ROWS
+        try:
+            height = getattr(self.app, "_workbench_height", self.screen.size.height)
+            limit = max(self._MIN_ROWS, min(limit, height // 3))
+        except Exception:
+            pass
+        rows = max(self._MIN_ROWS, min(limit, visible + 2))
         if getattr(self, "_fit_height_rows", None) != rows:
             self.styles.height = rows
             self._fit_height_rows = rows
@@ -1964,35 +1967,6 @@ class MultilineInput(TextArea):
 
 
 # ───────── status bar ─────────
-
-def _interp_rgb(
-    c1: tuple[int, int, int], c2: tuple[int, int, int], t: float
-) -> tuple[int, int, int]:
-    """Linearly interpolate between two RGB triples; t clamped to [0, 1]."""
-    t = max(0.0, min(1.0, t))
-    return (
-        int(c1[0] + (c2[0] - c1[0]) * t),
-        int(c1[1] + (c2[1] - c1[1]) * t),
-        int(c1[2] + (c2[2] - c1[2]) * t),
-    )
-
-
-def _ctx_bg_color(ratio: float) -> str:
-    """Pick a status-bar background hex from a green→amber→red gradient.
-
-    *ratio* is last-call (prompt+completion) / the active provider/model
-    context window; values above 1.0 saturate at the dark-red end. Colors
-    are dark / desaturated so the foreground text stays legible.
-    """
-    GREEN = (30, 48, 36)   # 接近 catppuccin green, 调到 ~18% 亮度
-    AMBER = (58, 51, 37)   # 暗琥珀
-    RED = (61, 30, 38)     # 暗红
-    if ratio < 0.5:
-        rgb = _interp_rgb(GREEN, AMBER, ratio / 0.5)
-    else:
-        rgb = _interp_rgb(AMBER, RED, (ratio - 0.5) / 0.5)
-    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
-
 
 def _short_cwd(cwd: str) -> str:
     """Compress $HOME to ~ for status-bar display."""
@@ -2036,42 +2010,24 @@ def _detect_git_branch(cwd: str) -> str | None:
 
 
 class StatusBar(Static):
-    # No background here — render_status() sets it inline based on the
-    # current context-usage ratio (see _ctx_bg_color). Leaving CSS
-    # without a default keeps the very first paint (before any turn
-    # has run) from flashing $primary purple before the green baseline.
+    """Keep context usage visible while secondary metrics yield to narrow widths."""
+
     DEFAULT_CSS = """
     StatusBar {
         height: 1;
-        color: $text;
+        color: $text-muted;
+        background: $surface;
         padding: 0 1;
     }
     """
 
-    # Indeterminate scroll: a single block bounces left ↔ right across a
-    # 7-cell track. 12 frames; ~80ms per frame → ~1s per round-trip.
-    BAR_FRAMES = (
-        "▰▱▱▱▱▱▱",
-        "▱▰▱▱▱▱▱",
-        "▱▱▰▱▱▱▱",
-        "▱▱▱▰▱▱▱",
-        "▱▱▱▱▰▱▱",
-        "▱▱▱▱▱▰▱",
-        "▱▱▱▱▱▱▰",
-        "▱▱▱▱▱▰▱",
-        "▱▱▱▱▰▱▱",
-        "▱▱▱▰▱▱▱",
-        "▱▱▰▱▱▱▱",
-        "▱▰▱▱▱▱▱",
-    )
+    BAR_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
     def __init__(self, work_dir: str, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._work_dir = work_dir
         self._frame = 0
-        self._last_bg_color: str | None = None
-        # Cached at construction; refreshed by refresh_location() after
-        # each turn so an agent-initiated `git checkout` shows up.
+        self._last_status = None
         self._cwd_short = _short_cwd(work_dir)
         self._branch = _detect_git_branch(work_dir)
 
@@ -2079,8 +2035,6 @@ class StatusBar(Static):
         self._frame = (self._frame + 1) % len(self.BAR_FRAMES)
 
     def refresh_location(self) -> None:
-        """Recompute cwd + branch. Cheap (one subprocess), but call from
-        a background thread to avoid blocking the event loop."""
         self._cwd_short = _short_cwd(self._work_dir)
         self._branch = _detect_git_branch(self._work_dir)
 
@@ -2088,6 +2042,11 @@ class StatusBar(Static):
         if self._branch:
             return f"{self._cwd_short} · ⎇ {self._branch}"
         return self._cwd_short
+
+    def on_resize(self) -> None:
+        if self._last_status is not None:
+            counter, options = self._last_status
+            self.render_status(counter, **options)
 
     def render_status(
         self,
@@ -2100,58 +2059,69 @@ class StatusBar(Static):
         steer: int = 0,
         explore: bool = False,
     ) -> None:
-        # Decode-only rate so a slow prefill cannot drag the number;
-        # 首响 shows where the latest request's wall time actually went.
-        speed = counter.decode_tokens_per_second
-        speed_text = "--" if speed is None else f"{speed:.1f}"
-        ttft = counter.last_ttft
-        if ttft is None:
-            ttft_text = ""
-        elif ttft >= 10:
-            ttft_text = f" · 首响 {ttft:.0f}s"
-        else:
-            ttft_text = f" · 首响 {ttft:.1f}s"
-        location = f"{self._location()} · 生成 {speed_text} tok/s{ttft_text}"
-        # Drive the background gradient off last-call tokens (what
-        # matters is whether the *next* call still fits). Pre-first-turn
-        # we sit at the green baseline.
+        self._last_status = (counter, dict(
+            context_limit=context_limit, busy=busy, compacting=compacting,
+            queued=queued, steer=steer, explore=explore,
+        ))
+        width = max(1, self.size.width - 2) if self.size.width else 100
         last_total = counter.last_prompt + counter.last_completion
         limit = context_limit if context_limit and context_limit > 0 else None
-        ratio = (last_total / limit) if (counter.turns > 0 and limit) else 0.0
-        bg_color = _ctx_bg_color(ratio)
-        if bg_color != self._last_bg_color:
-            self.styles.background = bg_color
-            self._last_bg_color = bg_color
-
-        if counter.turns == 0:
-            body = f"{location} · 等待第一轮…"
+        ratio = last_total / limit if limit and counter.turns else 0
+        color = UI.error if ratio >= .85 else UI.warning if ratio >= .7 else UI.accent
+        context = Text("上下文 ", style=UI.muted)
+        if not counter.turns:
+            context.append("--")
+        elif limit:
+            filled = max(0, min(6, round(ratio * 6)))
+            if width >= 55:
+                context.append("▰" * filled, style=color)
+                context.append("▱" * (6 - filled) + " ", style=UI.border)
+            if width >= 110:
+                context.append(f"{last_total:,}/{limit:,} ")
+            context.append(f"{ratio * 100:.0f}%", style=color)
         else:
-            # "Context" = prompt + completion of the most recent API call —
-            # i.e. context-window usage. The `(NN%)` suffix anchors the
-            # visual gradient to a number so the user can tell at a
-            # glance how alarming the color is.
-            pct = ratio * 100
-            if limit:
-                context_text = f"Context {last_total:,}/{limit:,} ({pct:.0f}%)"
-            else:
-                context_text = f"Context {last_total:,}"
-            body = f"{location} · {context_text} · {counter.turns} 轮"
-
+            context.append(f"{last_total:,}", style=color)
         if compacting:
-            body = f"📦 上下文压缩中… · {body}"
-        if explore:
-            body += " · 🔍 explore: on"
-        if queued:
-            body += f" · 📋 排队 {queued}"
-        if steer:
-            body += f" · ⚡ steer {steer}"
+            context = Text.assemble(("上下文压缩中 · ", UI.accent), context)
 
-        if busy:
-            t = Text()
-            for ch in self.BAR_FRAMES[self._frame]:
-                t.append(ch, style="bold #66d9ef" if ch == "▰" else "dim")
-            t.append("  ")
-            t.append(body)
-            self.update(t, layout=False)
-        else:
-            self.update(body, layout=False)
+        speed = counter.decode_tokens_per_second
+        rate = "--" if speed is None else f"{speed:.1f}"
+        candidates = [Text(f"生成 {rate} tok/s", style=UI.muted)]
+        if counter.last_ttft is not None:
+            candidates.append(Text(f"首响 {counter.last_ttft:.1f}s", style=UI.muted))
+        if queued:
+            candidates.append(Text(f"排队 {queued}", style=UI.accent))
+        if steer:
+            candidates.append(Text(f"插话 {steer}", style=UI.accent))
+        if explore:
+            candidates.append(Text("探索中", style=UI.accent))
+
+        def join(parts):
+            result = Text()
+            for index, part in enumerate(parts):
+                if index:
+                    result.append(" · ", style=UI.border)
+                result.append_text(part)
+            return result
+
+        extras = []
+        minimum_location = min(20, width // 5)
+        for candidate in candidates:
+            proposal = join(extras + [candidate, context])
+            if proposal.cell_len <= width - minimum_location - 2:
+                extras.append(candidate)
+        right = join(extras + [context])
+        right.truncate(width, overflow="ellipsis")
+        location_budget = max(0, width - right.cell_len - 2)
+        location = self._location()
+        if cell_len(location) > location_budget:
+            location = Path(self._work_dir).name or self._cwd_short
+            if self._branch:
+                location += f" · ⎇ {self._branch}"
+        left = Text(location, style=UI.muted)
+        left.truncate(location_budget, overflow="ellipsis")
+        if busy and location_budget >= 4:
+            left.truncate(location_budget - 2, overflow="ellipsis")
+            left = Text.assemble((self.BAR_FRAMES[self._frame] + " ", UI.accent), left)
+        padding = max(0, width - left.cell_len - right.cell_len)
+        self.update(Text.assemble(left, " " * padding, right), layout=False)

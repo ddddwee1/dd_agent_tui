@@ -9,12 +9,13 @@ with subagents). This module owns the parent-specific glue:
 - `_parent_meta_handler` serves the app-level meta tools that need live
   app state: the subagent four, the explore span three, and the
   compact_self redirect.
-- `_agent_turn` (outer loop) is unchanged: it commits user messages,
+- `_agent_turn` (outer loop) commits user messages,
   drains the queued-input tray between turns, and owns busy state,
   cancellation, and rollback.
 """
 
 from __future__ import annotations
+
 
 import asyncio
 from functools import partial
@@ -28,7 +29,11 @@ from .app_errors import _exception_block
 from .engine import ToolOutcome, TurnEngine, TurnObserver
 from .history_store import stamp_message
 from .runtime_messages import runtime_task_event_message
+from .thinking_summary import start_thinking_summary
+from .timeline_view import TimelineView
 from .tools import PARENT_TOOL_SCHEMAS
+from .turn_timeline import TurnTimeline
+from .ui_theme import UI
 from .widgets import (
     AssistantMessage,
     DiffBlock,
@@ -55,11 +60,31 @@ class ParentTurnObserver(TurnObserver):
         "todo_tool", "checkpoint_tool", "checkpoint_clear",
     })
 
-    def __init__(self, app) -> None:
+    def __init__(self, app, timeline_view: TimelineView | None = None) -> None:
         self.app = app
+        self._timeline_view = timeline_view
         self._thinking: ThinkingBlock | None = None
         self._answer: AssistantMessage | None = None
         self._blocks: dict[str, ToolCallBlock] = {}
+        self._summary = None
+        self._summary_progress = None
+
+    def close(self) -> None:
+        if self._summary is not None:
+            self._summary.cancel()
+            self._summary = None
+
+    def _set_phase(self, phase: str, detail: str = "") -> None:
+        update = getattr(self.app, "_set_workbench_phase", None)
+        if update is not None:
+            update(phase, detail)
+
+    def _summary_updated(self, text: str) -> None:
+        update = getattr(self.app, "_set_thinking_summary", None)
+        if update is not None:
+            update(text)
+        source = self._thinking.summary_source if self._thinking is not None else ""
+        self._emit("assistant.summary", {"text": text, "source": source})
 
     def _scroll_view(self) -> VerticalScroll:
         return self.app.query_one("#conversation", VerticalScroll)
@@ -73,24 +98,48 @@ class ParentTurnObserver(TurnObserver):
     # ── streaming ──
 
     async def on_reasoning_delta(self, text: str) -> None:
+        await self._append_reasoning(text)
+
+    async def on_reasoning_summary_delta(self, text: str) -> None:
+        await self._append_reasoning(text, native=True)
+
+    async def _append_reasoning(self, text: str, *, native: bool = False) -> None:
         if self._thinking is None:
+            self._set_phase("thinking")
             self._thinking = ThinkingBlock()
             await self.app._mount_widget(self._thinking)
+            if self._timeline_view is not None:
+                self._timeline_view.link("thinking", self._thinking)
+            self._summary_updated("")
+            self._summary = start_thinking_summary(
+                self.app, self._thinking, self.app.messages,
+                getattr(self.app, "model", ""), on_update=self._summary_updated,
+                progress=self._summary_progress,
+            )
+            self._summary_progress = self._summary.progress
         self._thinking.append_text(text)
         self._emit("assistant.delta", {"kind": "reasoning", "text": text})
+        self._summary.feed(text, native=native)
         if self.app._follow_bottom:
             self._scroll_view().scroll_end(animate=False)
 
     async def on_content_delta(self, text: str) -> None:
+        if self._summary is not None:
+            self._summary.stop()
         if self._answer is None:
+            self._set_phase("answering")
             self._answer = AssistantMessage()
             await self.app._mount_widget(self._answer)
+            if self._timeline_view is not None:
+                self._timeline_view.link("answer", self._answer)
         self._answer.append_text(text)
         self._emit("assistant.delta", {"kind": "content", "text": text})
         if self.app._follow_bottom:
             self._scroll_view().scroll_end(animate=False)
 
     def on_stream_aborted(self) -> None:
+        self.close()
+        self._summary_updated("")
         # Half-streamed widgets are not yet backed by any message in
         # history (append happens after the stream finishes) — remove
         # them so no ghost bubbles linger after ESC×2 / stream errors.
@@ -108,7 +157,10 @@ class ParentTurnObserver(TurnObserver):
 
     async def on_request_retry(self, retry: RequestRetry) -> None:
         self._emit("assistant.reset", {"message": retry.message})
-        await self.app._mount_widget(Static(Text(retry.message, style="bold #e6db74")))
+        notice = Static(Text(retry.message, style=f"bold {UI.warning}"))
+        await self.app._mount_widget(notice)
+        if self._timeline_view is not None:
+            self._timeline_view.link("retry", notice)
 
     async def on_usage(
         self,
@@ -120,6 +172,9 @@ class ParentTurnObserver(TurnObserver):
         self.app.counter.add(usage, elapsed=elapsed, ttft=ttft)
 
     async def on_assistant_message(self, msg: dict) -> None:
+        if self._summary is not None:
+            self._summary.finish(msg)
+            self._summary = None
         if (
             self._answer is not None
             and self._answer.text != (msg.get("content") or "")
@@ -138,6 +193,7 @@ class ParentTurnObserver(TurnObserver):
     # ── tools ──
 
     async def on_tool_started(self, tc_id: str, name: str, args: dict) -> None:
+        self._set_phase("tool", name)
         self._emit(
             "tool.started",
             {"tool_call_id": tc_id, "name": name, "arguments": args},
@@ -153,6 +209,8 @@ class ParentTurnObserver(TurnObserver):
             block = ToolCallBlock(name, args)
             await self.app._mount_widget(block)
             self._blocks[tc_id or name] = block
+            if tc_id and self._timeline_view is not None:
+                self._timeline_view.link(f"tool:{tc_id}", block)
 
     async def on_tool_result(
         self, tc_id: str, name: str, args: dict, outcome: ToolOutcome
@@ -189,7 +247,7 @@ class AppAgentLoopMixin:
         return "\n\n".join(events)
 
     async def _mount_task_event_notice(self, text: str) -> None:
-        await self._mount_widget(Static(Text(text, style="bold #66d9ef")))
+        await self._mount_widget(Static(Text(text, style=f"bold {UI.accent}")))
 
     async def _drain_task_events_to_messages(self) -> None:
         text = self._pop_task_event_text()
@@ -348,6 +406,7 @@ class AppAgentLoopMixin:
             self._refresh_status()
 
         await self._auto_compact_if_needed(model=model, effort=effort)
+        self._set_workbench_phase("waiting")
         self._write_turn_journal(
             phase="streaming",
             message_len_current=len(self.messages),
@@ -360,6 +419,15 @@ class AppAgentLoopMixin:
         error was caught (the error is shown to the UI and the trailing
         user/tool messages are rolled back so the user can retry).
         """
+        view = self._timeline_view
+        timeline = view.timeline
+        if timeline is None:
+            timeline = TurnTimeline()
+            view.set_timeline(timeline)
+        else:
+            timeline.resume()
+        self._refresh_timeline_control()
+        observer = ParentTurnObserver(self, timeline_view=view)
         engine = TurnEngine(
             provider=self.provider,
             ctx=self.ctx,
@@ -367,14 +435,20 @@ class AppAgentLoopMixin:
             tools=PARENT_TOOLS,
             model=self.model,
             effort=self.effort,
-            observer=ParentTurnObserver(self),
+            observer=observer,
             tool_confirm=self.tool_confirm,
             meta_handler=self._parent_meta_handler,
             before_round=partial(self._before_round, model=self.model, effort=self.effort),
+            timeline=timeline,
         )
+        status = "failed"
         try:
             await engine.run_turn()
+            status = "done"
             return True
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
         except Exception as e:
             # Roll back the in-flight turn from history AND wipe its
             # widgets from the view, then surface the error in a fresh
@@ -383,10 +457,15 @@ class AppAgentLoopMixin:
             # `self.messages` — confusing on retry.
             self._rollback_last_user_turn()
             self._wipe_orphaned_turn_widgets()
-            await self._mount_widget(
-                _exception_block("本轮运行失败（已回滚）", e)
-            )
+            notice = _exception_block("本轮运行失败（已回滚）", e)
+            await self._mount_widget(notice)
+            view.link("request", notice)
             return False
+        finally:
+            timeline.finish(status)
+            observer.close()
+            view.refresh_timeline()
+            self._refresh_timeline_control()
 
     async def _parent_meta_handler(
         self, tc_id: str, name: str, args: dict, batch_size: int
@@ -469,6 +548,6 @@ class AppAgentLoopMixin:
             self._todo_block = TodoBlock()
             await sidebar.mount(self._todo_block)
         self._todo_block.set_items(items)
-        sidebar.add_class("visible")
+        self._refresh_sidebar_visibility()
         if items and all(i.get("status") == "completed" for i in items):
             self._start_dismiss()

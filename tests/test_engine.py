@@ -17,6 +17,7 @@ from ddtui.engine import (
 )
 from ddtui.providers import LLMProvider, LLMStreamEvent, ProviderUsage, ToolCallDelta
 from ddtui.state import TokenCounter, ToolContext
+from ddtui.turn_timeline import TurnTimeline
 
 SLEEP = 0.15
 
@@ -170,13 +171,17 @@ def test_parallel_reads_run_concurrently_in_order():
         ])
 
         def slow_read(ctx, name, args):
-            time.sleep(SLEEP)
+            time.sleep(SLEEP / 5 if args["path"] == "a" else SLEEP)
             return f"content of {args.get('path')}"
 
         msgs = [{"role": "user", "content": "r"}]
+        timeline = TurnTimeline()
         t0 = time.monotonic()
-        await make_engine(p, msgs, executor=slow_read).run_turn()
+        await make_engine(p, msgs, executor=slow_read, timeline=timeline).run_turn()
         assert time.monotonic() - t0 < SLEEP * 2  # concurrent, not 3×serial
+        reads = [span for span in timeline.spans if span.kind == "tool"]
+        assert len(reads) == 3
+        assert reads[1].started_at < reads[0].ended_at < reads[1].ended_at
         tool_msgs = [m for m in msgs if m["role"] == "tool"]
         assert [m["content"] for m in tool_msgs] == [
             "content of a", "content of b", "content of c",
@@ -275,8 +280,9 @@ def test_cancel_mid_tool_appends_stub_and_propagates():
             return "never"
 
         msgs = [{"role": "user", "content": "c"}]
+        timeline = TurnTimeline()
         task = asyncio.ensure_future(
-            make_engine(p, msgs, executor=hang).run_turn()
+            make_engine(p, msgs, executor=hang, timeline=timeline).run_turn()
         )
         await asyncio.sleep(0.1)
         task.cancel()
@@ -287,6 +293,8 @@ def test_cancel_mid_tool_appends_stub_and_propagates():
             cancelled = True
         assert cancelled
         assert any(m["role"] == "tool" and "⛔" in m["content"] for m in msgs)
+        tool_span = next(span for span in timeline.spans if span.kind == "tool")
+        assert tool_span.status == "cancelled" and tool_span.ended_at is not None
     asyncio.run(run())
 
 

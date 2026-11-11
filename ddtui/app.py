@@ -14,7 +14,7 @@ import os
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Header, Static, TabbedContent, TabPane
+from textual.widgets import Button, Static, TabbedContent, TabPane
 
 from .app_agent_loop import AppAgentLoopMixin
 from .app_confirm import AppConfirmMixin, ToolConfirmHook, always_allow
@@ -35,6 +35,8 @@ from .config import (
 from .providers import ProviderConfigError, build_provider
 from .runtime_state import new_session_id
 from .state import TokenCounter, ToolContext
+from .timeline_view import TimelineView
+from .ui_theme import WORKBENCH_THEME
 from .widgets import (
     CheckpointBlock,
     CollapsedHistoryMarker,
@@ -43,8 +45,10 @@ from .widgets import (
     StatusBar,
     SubagentsBlock,
     TasksBlock,
+    ThinkingSummaryPanel,
     TerminalTabPane,
     TodoBlock,
+    WorkbenchOverview,
 )
 
 
@@ -60,39 +64,85 @@ class AgentApp(
     App,
 ):
     CSS = """
-    Screen { layout: vertical; background: #272822; color: #f8f8f2; }
-    Header { height: 1; background: #3e3d32; color: #f8f8f2; }
+    Screen { layout: vertical; background: $background; color: $foreground; }
+    #workbench-header {
+        height: 1;
+        padding: 0 1;
+        background: $panel;
+        color: $foreground;
+    }
+    #workbench-brand { width: 7; color: $primary; text-style: bold; }
+    #workbench-project { width: 1fr; text-overflow: ellipsis; }
+    #workbench-model {
+        width: auto;
+        max-width: 55%;
+        padding-left: 2;
+        color: $text-muted;
+        text-overflow: ellipsis;
+    }
     #body { height: 1fr; layout: horizontal; }
     #main { width: 1fr; layout: vertical; }
     #sidebar {
         height: 1fr;
-        width: 26%;
-        min-width: 30;
-        max-width: 60;
+        width: 34;
+        min-width: 28;
+        max-width: 38;
         layout: vertical;
-        border-left: solid #ae81ff;
+        border-left: solid $border-blurred;
         padding: 0 1;
-        background: #272822;
+        background: $surface;
         display: none;
     }
     #sidebar.visible { display: block; }
-    #conversation { height: 1fr; padding: 0 1; background: #272822; }
-    /* TabbedContent host: take all remaining vertical space inside
-       #main, and let each TabPane occupy its full area without an
-       inner padding (the panes themselves set their own padding). */
+    #body.sidebar-only > #main { display: none; }
+    #body.sidebar-only > #sidebar { width: 1fr; min-width: 0; max-width: 100%; }
+    #workbench-empty { height: auto; padding: 1 1; color: $text-muted; }
+    #sidebar CheckpointBlock, #sidebar TodoBlock, #sidebar TasksBlock, #sidebar SubagentsBlock {
+        border: none;
+        border-top: solid $border-blurred;
+        padding: 1 1 0 1;
+        margin: 1 0;
+    }
+    #conversation { height: 1fr; padding: 0 2; background: $background; }
     #tabs { height: 1fr; }
     #tabs TabPane { padding: 0; }
-    #hint { height: 1; padding: 0 1; color: #a59f85; background: #272822; }
-    /* Pending tray: parks queued/steer bubbles above the input box
-       until the turn consumes them. height: auto + max-height keeps
-       it invisible when empty. */
+    #tabs.single-pane > ContentTabs { display: none; }
+    #tabs ContentTabs { background: $background; }
+    #composer { height: auto; padding: 0 1; }
+    #composer-meta { height: 1; margin-top: 0; }
+    #workbench-phase { width: 1fr; color: $text-muted; text-overflow: ellipsis; }
+    #toggle-sidebar {
+        width: auto;
+        min-width: 8;
+        height: 1;
+        padding: 0 1;
+        border: none;
+        background: $background;
+        color: $text-muted;
+    }
+    #toggle-sidebar:hover, #toggle-sidebar:focus { color: $primary; text-style: underline; }
+    #hint { height: 1; color: $text-muted; background: $background; }
     #pending {
         height: auto;
         max-height: 8;
-        padding: 0 1;
-        background: #2d2e27;
+        background: $surface;
         overflow-y: auto;
     }
+    #user-input { background: $panel; color: $foreground; border: solid $border-blurred; }
+    #user-input:focus { border: solid $primary; }
+    #status-row { height: 1; background: $surface; }
+    #status { width: 1fr; background: $surface; color: $text-muted; }
+    #timeline-toggle {
+        display: none;
+        width: auto;
+        min-width: 0;
+        height: 1;
+        padding: 0 1;
+        border: none;
+        background: $surface;
+        color: $primary;
+    }
+    #timeline-toggle:hover, #timeline-toggle:focus { text-style: underline; }
     """
 
     BINDINGS = [
@@ -105,6 +155,7 @@ class AgentApp(
         Binding("ctrl+q", "quit", "退出"),
         Binding("ctrl+l", "clear_chat", "清空对话"),
         Binding("ctrl+t", "toggle_thinking", "展开/折叠思考"),
+        Binding("ctrl+b", "toggle_sidebar", "展开/收起工作台", priority=True),
         Binding("ctrl+x", "cancel_pending", "取消队列/steer"),
         # Double-tap ESC to interrupt. priority=True so the App handler
         # wins over any future widget-level ESC binding (TextArea today
@@ -121,6 +172,13 @@ class AgentApp(
 
     def __init__(self, provider_name: str = DEFAULT_PROVIDER) -> None:
         super().__init__()
+        self.register_theme(WORKBENCH_THEME)
+        self.theme = WORKBENCH_THEME.name
+        self._sidebar_open_wide = True
+        self._sidebar_open_compact = False
+        self._workbench_phase = "idle"
+        self._workbench_detail = ""
+        self._thinking_summary_text = ""
         try:
             self.provider = build_provider(provider_name)
         except ProviderConfigError as first_error:
@@ -292,7 +350,10 @@ class AgentApp(
     # ─ compose ─
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        with Horizontal(id="workbench-header"):
+            yield Static("ddtui", id="workbench-brand", markup=False)
+            yield Static(os.path.basename(self.ctx.work_dir) or self.ctx.work_dir, id="workbench-project", markup=False)
+            yield Static("", id="workbench-model", markup=False)
         with Horizontal(id="body"):
             with Vertical(id="main"):
                 # Top-level tab bar: "main" is the parent conversation;
@@ -301,23 +362,30 @@ class AgentApp(
                 # ends or gets idle-reaped. Input box / status bar /
                 # sidebar are shared across tabs (always operate on
                 # the parent), so the sub tabs are pure observation.
-                with TabbedContent(initial="tab-main", id="tabs"):
-                    with TabPane("main", id="tab-main"):
+                with TabbedContent(initial="tab-main", id="tabs", classes="single-pane"):
+                    with TabPane("主会话", id="tab-main"):
                         yield VerticalScroll(id="conversation")
-                yield Static(
-                    "Enter 发送 · Option+Enter 换行 · Cmd+Enter steer · Tab 补全 slash 命令 · 点击下方排队/steer 气泡可编辑/删除 · ESC×2 中断 · Ctrl+X 全部取消 · Ctrl+L 清空 · Ctrl+Q 退出",
-                    id="hint",
-                )
-                yield Vertical(id="pending")
-                popup = SlashPopup(id="slash-popup")
-                # Argument hints need live state (the active provider's
-                # model catalog), so the popup pulls them through a
-                # callback instead of holding a static table.
-                popup.arg_candidates = self._slash_arg_candidates
-                yield popup
-                yield MultilineInput(id="user-input")
-                yield StatusBar(self.ctx.work_dir, id="status")
-            yield VerticalScroll(id="sidebar")
+                        self._timeline_view = TimelineView(id="task-timeline")
+                        yield self._timeline_view
+            with VerticalScroll(id="sidebar"):
+                yield WorkbenchOverview(id="workbench-overview")
+                yield ThinkingSummaryPanel(id="thinking-summary")
+                yield Static("暂无后台任务\n任务和子 agent 会显示在这里。", id="workbench-empty", markup=False)
+        with Vertical(id="composer"):
+            with Horizontal(id="composer-meta"):
+                yield Static("● 就绪", id="workbench-phase", markup=False)
+                yield Button("收起工作台", id="toggle-sidebar", tooltip="Ctrl+B 展开 / 收起工作台")
+            yield Vertical(id="pending")
+            popup = SlashPopup(id="slash-popup")
+            popup.arg_candidates = self._slash_arg_candidates
+            yield popup
+            user_input = MultilineInput(id="user-input")
+            user_input.border_title = "消息 · 输入 / 查看命令"
+            yield user_input
+            yield Static("", id="hint", markup=False)
+        with Horizontal(id="status-row"):
+            yield Button("会话耗时", id="timeline-toggle", tooltip="查看会话时间线")
+            yield StatusBar(self.ctx.work_dir, id="status")
 
 
 def main() -> None:

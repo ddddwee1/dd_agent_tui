@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+
 import json
 import traceback
 
 from rich.text import Text
 from textual.widgets import Collapsible, Static
+
+from .ui_theme import UI
 
 
 def _one_line(text: str, limit: int = 180) -> str:
@@ -80,7 +83,7 @@ def _format_exception_for_ui(exc: BaseException) -> tuple[str, str]:
 def _exception_block(title: str, exc: BaseException) -> Collapsible:
     summary, detail = _format_exception_for_ui(exc)
     return Collapsible(
-        Static(Text(detail, style="#f92672"), markup=False),
+        Static(Text(detail, style=UI.error), markup=False),
         title=f"❌ {title} · {summary}".replace("[", "\\["),
         collapsed=False,
     )

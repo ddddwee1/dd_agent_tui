@@ -81,7 +81,7 @@ def test_footer_rate_placeholder_and_controls(tmp_path, busy):
             text = str(bar.render())
             assert "生成 84.0 tok/s" in bar.render_line(0).text
             assert "首响 1.0s" in bar.render_line(0).text
-            assert "Context 1,084" in text
-            assert "排队 2" in text and "steer 1" in text and "explore: on" in text
+            assert "上下文 1,084" in text
+            assert "排队 2" in text and "插话 1" in text and "探索中" in text
 
     asyncio.run(run())
