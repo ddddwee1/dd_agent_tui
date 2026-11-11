@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import math
+import hashlib
 from pathlib import PurePosixPath
 
 
@@ -63,6 +64,11 @@ def encoded(payload: dict) -> bytes:
     if len(value) > MAX_MESSAGE_BYTES:
         raise CollabError("Handoff message exceeds 128 KiB; keep raw evidence on its machine")
     return value
+
+
+def result_id(worker_id: str, result: dict) -> str:
+    """Stable across receipt/status commits; only immutable result content counts."""
+    return hashlib.sha256(encoded({"worker_id": identifier(worker_id), "result": result})).hexdigest()
 
 
 def request_message(payload: dict) -> dict:

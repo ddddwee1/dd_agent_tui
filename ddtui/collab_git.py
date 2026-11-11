@@ -157,6 +157,54 @@ class GitTransport:
         return self.write_control(f"refs/heads/codex/collab-{worker}",
                                   f"collab/results/{identifier(payload['task_id'])}.json", payload)
 
+    def read_result(self, request, known_result=None):
+        worker = identifier(request["worker_id"])
+        tip = self.fetch_ref(f"refs/heads/codex/collab-{worker}")
+        if not tip:
+            return None
+        path = f"collab/results/{request['task_id']}.json"
+        if git(self.cache, "cat-file", "-e", f"{tip}:{path}", check=False).returncode:
+            return None
+        receipt = self.read_json(tip, path)
+        if (not isinstance(receipt, dict) or receipt.get("schema_version") != 1 or receipt.get("worker_id") != worker
+                or receipt.get("task_id") != request["task_id"]):
+            raise CollabError("Result receipt identity does not match its assigned task")
+        payload = receipt.get("result")
+        if payload is not None and not isinstance(payload, dict):
+            raise CollabError("Remote result must be an object")
+        if not payload or payload.get("revision") != request["revision"]:
+            return None
+        if payload.get("source_commit") != request["source_commit"]:
+            raise CollabError("Remote result is bound to a different source commit")
+        from .collab_protocol import SHA
+        candidate = payload.get("candidate_commit", "")
+        if not isinstance(candidate, str) or not SHA.fullmatch(candidate):
+            raise CollabError("Result requires a full candidate commit ID")
+        result = result_message(payload, request, candidate)
+        if known_result is not None:
+            if known_result != result:
+                raise CollabError("A remote result changed inside an immutable request revision")
+            return None
+        candidate_tip = self.fetch_ref(f"refs/heads/codex/{request['task_id']}-{worker}")
+        if not candidate_tip:
+            raise CollabError("Candidate branch is missing; result cannot be admitted")
+        self.ensure_commit(candidate)
+        git(self.cache, "merge-base", "--is-ancestor", request["source_commit"], candidate)
+        git(self.cache, "merge-base", "--is-ancestor", candidate, candidate_tip)
+        self.validate_candidate(request, self.cache, candidate)
+        shared_text(encoded(result))
+        return {"result": result, "receipt_commit": tip}
+
+    def publish_ack(self, payload):
+        return self.write_control(REQUEST_REF, f"collab/acks/{identifier(payload['task_id'])}.json", payload)
+
+    def read_ack(self, task_id):
+        tip = self.fetch_ref(REQUEST_REF)
+        path = f"collab/acks/{identifier(task_id)}.json"
+        if not tip or git(self.cache, "cat-file", "-e", f"{tip}:{path}", check=False).returncode:
+            return None
+        return self.read_json(tip, path)
+
     def workspace(self, request):
         self.ensure_commit(request["source_commit"])
         directory = self.home / "workspaces" / self.binding["name"] / request["task_id"]
@@ -191,6 +239,15 @@ class GitTransport:
         result = result_message(payload, request, head)
         if git(workspace, "status", "--porcelain").stdout:
             raise CollabError("Commit task source before publishing a result")
+        self.validate_candidate(request, workspace, head)
+        for path in result["evidence"]:
+            evidence = (workspace / path).resolve()
+            if not evidence.is_relative_to(workspace.resolve()) or not evidence.is_file():
+                raise CollabError("Evidence must refer to an existing file inside the task checkout")
+        return result
+
+    def validate_candidate(self, request, workspace, head):
+        """Shared sender/receiver source validation, independent of remote evidence files."""
         git(workspace, "merge-base", "--is-ancestor", request["source_commit"], head)
         commits = git(workspace, "rev-list", f"{request['source_commit']}..{head}").stdout.decode().split()
         if len(commits) > 128:
@@ -219,11 +276,6 @@ class GitTransport:
                 if size > 2 * 1024 * 1024 or total > 32 * 1024 * 1024:
                     raise CollabError("Candidate exceeds the small-source budget (2 MiB/file, 32 MiB total)")
                 shared_text(git(workspace, "cat-file", "blob", blob.decode()).stdout)
-        for path in result["evidence"]:
-            evidence = (workspace / path).resolve()
-            if not evidence.is_relative_to(workspace.resolve()) or not evidence.is_file():
-                raise CollabError("Evidence must refer to an existing file inside the task checkout")
-        return result
 
     def publish_candidate(self, request, workspace: Path, commit):
         git(workspace, "cat-file", "-e", f"{commit}^{{commit}}")

@@ -1,0 +1,12 @@
+{
+  "name": "ddtui-local",
+  "interface": {"displayName": "ddtui 本地工具"},
+  "plugins": [
+    {
+      "name": "git-collab",
+      "source": {"source": "local", "path": "./plugins/git-collab"},
+      "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,7 +1,8 @@
 """Optional local Git handoff daemon and terminal recovery commands.
 
-The daemon uses only Git and the standard library. It never starts an LLM,
-executes repository commands, or depends on the TUI staying connected.
+The default daemon only transports Git messages using the standard library.
+Explicit coordinator routes can start bounded Codex CLI reviews independently
+of the TUI and MCP connections.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ import uuid
 from .collab_git import GitTransport, repository_url
 from .collab_protocol import CollabError, MAX_MESSAGE_BYTES, identifier
 from .collab_store import ClaimLock, Store, collab_home
+from .collab_coordinator import Coordinator
+from .collab_codex import CodexContinuations
 
 
 class HandoffService:
@@ -33,6 +36,8 @@ class HandoffService:
         self.git_lock = threading.RLock()
         self.retry_after = {}
         self.failures = {}
+        self.coordinator = Coordinator(self.store)
+        self.codex = CodexContinuations(self)
 
     def defer(self, name):
         count = min(6, self.failures.get(name, 0) + 1)
@@ -51,7 +56,7 @@ class HandoffService:
         action = message.get("action")
         binding = message.get("binding", "default")
         if action == "ping":
-            return {"pid": os.getpid(), "protocol": 1}
+            return {"pid": os.getpid(), "protocol": 1, "features": ["coordinator", "codex", "result_ack"]}
         if action == "bind":
             worker = message.get("worker_id")
             if not worker:
@@ -59,21 +64,56 @@ class HandoffService:
                 worker = existing["worker_id"] if existing else "worker-" + uuid.uuid4().hex[:8]
             return self.store.bind(binding, repository_url(message["url"]),
                                    worker,
-                                   message.get("interval", 15))
+                                   message.get("interval", 15), message.get("role"))
         if action in ("on", "off"):
             result = self.store.listening(binding, action == "on")
             self.wake.set()
             return result
         if action == "status":
             config = self.store.binding(binding)
+            if config["role"] == "coordinator":
+                return {"binding": config, "results": len(self.coordinator.events(binding)),
+                        "pending_acks": sum(p["binding"] == binding for p in self.coordinator.acks()),
+                        "codex": [r for r in self.coordinator.routes() if r["binding"] == binding]}
             return {"binding": config, "tasks": [self.task_summary(t) for t in self.store.tasks(binding)],
                     "pending_receipts": [{"task_id": p["task_id"], "error": p["error"]}
                                          for p in self.store.pending() if p["binding"] == binding],
                     "pending_results": [{"task_id": p["task_id"], "revision": p["revision"], "error": p["error"]}
                                         for p in self.store.publications() if p["binding"] == binding]}
         if action == "tasks":
+            if self.store.binding(binding)["role"] == "coordinator":
+                return self.coordinator.requests(binding)
             return [self.task_summary(t) for t in self.store.tasks(binding)]
+        if action in ("results", "result", "ack", "codex_configure", "codex_status", "codex_pause", "codex_resume", "codex_retry"):
+            self.coordinator.require(binding)
+            if action == "results":
+                return self.coordinator.events(binding, message.get("task_id"))
+            if action == "result":
+                return self.coordinator.event(binding, message["event_id"])
+            if action in ("ack", "codex_retry"):
+                event = self.coordinator.event(binding, message["event_id"])
+                self.codex.ensure_idle(binding, event["task_id"])
+                if action == "codex_retry":
+                    if message.get("previous_stopped") is not True:
+                        raise CollabError("Confirm previous execution stopped and reconcile its output before retrying")
+                    result = self.coordinator.retry(binding, message["event_id"])
+                else:
+                    result = self.coordinator.acknowledge(binding, message["event_id"])
+            elif action == "codex_configure":
+                result = self.coordinator.configure(binding, identifier(message["task_id"]),
+                    workspace=message.get("workspace"), timeout=message.get("timeout", 120),
+                    max_turns=message.get("max_turns", 10), model=message.get("model"))
+            elif action == "codex_pause":
+                result = self.coordinator.pause(binding, identifier(message["task_id"]))
+            elif action == "codex_resume":
+                result = self.coordinator.resume(binding, identifier(message["task_id"]))
+            else:
+                return self.coordinator.route(binding, identifier(message["task_id"]))
+            self.wake.set()
+            return result
         if action == "shutdown":
+            if any(job.is_alive() for job in self.codex.jobs.values()):
+                raise CollabError("A Codex continuation is running; pause and wait before stopping the daemon")
             if any(task["owner"] for cfg in self.store.bindings() for task in self.store.tasks(cfg["name"])):
                 raise CollabError("Release claimed tasks before stopping the daemon")
             self.stopping.set()
@@ -81,6 +121,8 @@ class HandoffService:
         if action == "publish":
             with self.git_lock:
                 commit = self.transport(binding).publish_request(message["request"])
+            if self.store.binding(binding)["role"] == "coordinator":
+                self.coordinator.register(binding, message["request"])
             self.wake.set()
             return {"request_commit": commit}
         task_id = identifier(message.get("task_id"))
@@ -150,9 +192,41 @@ class HandoffService:
                                       time.time() - config["last_attempt"] >= config["interval"]):
                 try:
                     with self.git_lock:
-                        requests = self.transport(name).requests()
+                        transport = self.transport(name)
+                        requests = transport.requests()
+                    errors = []
                     for request in requests:
-                        self.store.ingest(name, request)
+                        try:
+                            if config["role"] == "coordinator":
+                                self.coordinator.register(name, request)
+                                if request["state"] == "active":
+                                    known = next((e["result"] for e in self.coordinator.events(name, request["task_id"])
+                                                  if e["revision"] == request["revision"]), None)
+                                    with self.git_lock:
+                                        incoming = transport.read_result(request, known_result=known)
+                                    if incoming:
+                                        self.coordinator.ingest(name, request, incoming)
+                            else:
+                                self.store.ingest(name, request)
+                        except (CollabError, OSError, ValueError) as error:
+                            errors.append(f"{request['task_id']}: {error}")
+                    if config["role"] == "worker":
+                        from .collab_protocol import result_id
+                        for task in self.store.tasks(name):
+                            if not task["result"]:
+                                continue
+                            with self.git_lock:
+                                ack = transport.read_ack(task["task_id"])
+                            if (isinstance(ack, dict) and ack.get("schema_version") == 1 and ack.get("worker_id") == config["worker_id"]
+                                    and ack.get("task_id") == task["task_id"] and ack.get("revision") == task["result"]["revision"]
+                                    and ack.get("candidate_commit") == task["result"]["candidate_commit"]
+                                    and ack.get("event_id") == result_id(config["worker_id"], task["result"])
+                                    and ack.get("phase") in ("received", "processed")):
+                                with self.store.db() as db:
+                                    db.execute("UPDATE tasks SET result_ack_state=? WHERE binding=? AND task_id=?",
+                                               (ack["phase"], name, task["task_id"]))
+                    if errors:
+                        raise CollabError("; ".join(errors)[:2000])
                     self.store.poll_status(name)
                 except (CollabError, OSError, ValueError) as error:
                     self.store.poll_status(name, str(error))
@@ -182,6 +256,17 @@ class HandoffService:
             except (CollabError, OSError, ValueError) as error:
                 self.store.sent(item, str(error))
                 self.defer(item["binding"])
+        for item in self.coordinator.acks():
+            if not force and time.time() < self.retry_after.get(item["binding"], 0):
+                continue
+            try:
+                with self.git_lock:
+                    self.transport(item["binding"]).publish_ack(json.loads(item["payload"]))
+                self.coordinator.ack_sent(item)
+            except (CollabError, OSError, ValueError) as error:
+                self.coordinator.ack_sent(item, str(error))
+                self.defer(item["binding"])
+        self.codex.tick()
         from .runtime_state import pid_alive
         for config in self.store.bindings():
             for task in self.store.tasks(config["name"]):
@@ -233,12 +318,16 @@ def rpc(home: Path, action: str, *, timeout=90, **payload):
     return response["result"]
 
 
-def ensure_daemon(home: Path):
+def ensure_daemon(home: Path, require=None):
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        return rpc(home, "ping", timeout=0.5)
+        state = rpc(home, "ping", timeout=0.5)
     except CollabError:
-        pass
+        state = None
+    if state:
+        if require and require not in state.get("features", []):
+            raise CollabError("Running handoff daemon needs an upgrade; pause tasks, stop it, then restart with the updated package")
+        return state
     logfile = home / "daemon.log"
     fd = os.open(logfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
@@ -313,22 +402,50 @@ def main(argv=None):
     bind.add_argument("url")
     bind.add_argument("--worker-id")
     bind.add_argument("--interval", type=float, default=15)
+    bind.add_argument("--role", choices=("worker", "coordinator"))
     for name in ("on", "off", "status", "tasks", "stop"):
         commands.add_parser(name)
     task = commands.add_parser("task").add_subparsers(dest="task_command", required=True)
     for name in ("status", "release"):
         task.add_parser(name).add_argument("task_id")
     task.add_parser("publish").add_argument("file", type=Path)
+    results = commands.add_parser("results")
+    results.add_argument("--task", dest="task_id")
+    commands.add_parser("result").add_argument("event_id")
+    commands.add_parser("ack").add_argument("event_id")
+    codex = commands.add_parser("codex").add_subparsers(dest="codex_command", required=True)
+    enable = codex.add_parser("enable")
+    enable.add_argument("task_id")
+    enable.add_argument("--workspace")
+    enable.add_argument("--timeout", type=int, default=120)
+    enable.add_argument("--max-turns", type=int, default=10)
+    enable.add_argument("--model")
+    for name in ("pause", "resume", "status"):
+        codex.add_parser(name).add_argument("task_id")
+    retry = codex.add_parser("retry")
+    retry.add_argument("event_id")
+    retry.add_argument("--previous-stopped", action="store_true")
     args = parser.parse_args(argv)
     home = args.home.expanduser().resolve()
     try:
         if args.command == "serve":
             serve(home)
             return 0
-        ensure_daemon(home)
+        require = "coordinator" if args.command in ("results", "result", "ack", "codex") or (args.command == "bind" and args.role == "coordinator") else None
+        ensure_daemon(home, require=require)
         options = {"binding": args.binding}
         if args.command == "bind":
-            result = rpc(home, "bind", **options, url=args.url, worker_id=args.worker_id, interval=args.interval)
+            result = rpc(home, "bind", **options, url=args.url, worker_id=args.worker_id, interval=args.interval, role=args.role)
+        elif args.command in ("results", "result", "ack"):
+            result = rpc(home, args.command, **options, **({"task_id": args.task_id} if args.command == "results" else {"event_id": args.event_id}))
+        elif args.command == "codex":
+            if args.codex_command == "enable":
+                result = rpc(home, "codex_configure", **options, task_id=args.task_id, workspace=args.workspace,
+                             timeout=args.timeout, max_turns=args.max_turns, model=args.model)
+            elif args.codex_command == "retry":
+                result = rpc(home, "codex_retry", **options, event_id=args.event_id, previous_stopped=args.previous_stopped)
+            else:
+                result = rpc(home, "codex_" + args.codex_command, **options, task_id=args.task_id)
         elif args.command == "task":
             if args.task_command == "publish":
                 if args.file.stat().st_size > MAX_MESSAGE_BYTES:

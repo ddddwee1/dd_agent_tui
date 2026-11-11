@@ -102,6 +102,12 @@ class Store:
                     PRIMARY KEY(binding, task_id, revision)
                 );
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(bindings)")}
+            if "role" not in columns:
+                db.execute("ALTER TABLE bindings ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'")
+            task_columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+            if "result_ack_state" not in task_columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN result_ack_state TEXT")
         self.path.chmod(0o600)
 
     @contextlib.contextmanager
@@ -118,19 +124,27 @@ class Store:
         finally:
             db.close()
 
-    def bind(self, name, url, worker_id, interval=15):
+    def bind(self, name, url, worker_id, interval=15, role=None):
         identifier(name)
         identifier(worker_id)
+        if role is not None and role not in ("worker", "coordinator"):
+            raise CollabError("Binding role must be worker or coordinator")
         if not isinstance(interval, (int, float)) or not 5 <= interval <= 3600:
             raise CollabError("Poll interval must be between 5 and 3600 seconds")
         with self.db() as db:
             old = db.execute("SELECT * FROM bindings WHERE name=?", (name,)).fetchone()
             if old and (old["url"] != url or old["worker_id"] != worker_id):
                 raise CollabError("A binding has a fixed repository and worker; use another binding name")
+            if old and role and old["role"] != role:
+                if old["role"] == "coordinator":
+                    raise CollabError("An existing coordinator has a fixed role; use another binding name")
+                if db.execute("SELECT 1 FROM tasks WHERE binding=?", (name,)).fetchone():
+                    raise CollabError("Release and retire existing worker tasks before changing binding role")
+                db.execute("UPDATE bindings SET role=? WHERE name=?", (role, name))
             try:
-                db.execute("INSERT INTO bindings(name,url,worker_id,interval) VALUES(?,?,?,?) "
+                db.execute("INSERT INTO bindings(name,url,worker_id,interval,role) VALUES(?,?,?,?,?) "
                            "ON CONFLICT(name) DO UPDATE SET interval=excluded.interval",
-                           (name, url, worker_id, interval))
+                           (name, url, worker_id, interval, role or (old["role"] if old else "worker")))
             except sqlite3.IntegrityError as error:
                 raise CollabError("This repository already has a local binding") from error
         return self.binding(name)
@@ -320,7 +334,7 @@ class Store:
             task = self._task(db.execute("SELECT * FROM tasks WHERE binding=? AND task_id=?", key[:2]).fetchone())
             result = json.loads(item["payload"])["result"]
             state = "awaiting_input" if task["owner"] else "paused"
-            db.execute("UPDATE tasks SET result=?,state=?,updated=? WHERE binding=? AND task_id=?",
+            db.execute("UPDATE tasks SET result=?,state=?,result_ack_state=NULL,updated=? WHERE binding=? AND task_id=?",
                        (encoded(result).decode(), state, time.time(), *key[:2]))
             task["result"] = result
             self._receipt(db, task, state, event="result_ready")

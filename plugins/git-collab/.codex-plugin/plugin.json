@@ -1,0 +1,12 @@
+{
+  "name": "git-collab",
+  "version": "0.2.0",
+  "description": "Coordinate agents through the shared Git handoff service.",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "requires_local_executor": true,
+  "interface": {
+    "displayName": "Git 协作",
+    "shortDescription": "任务交接、结果回执与有界 Codex 自动续跑"
+  }
+}

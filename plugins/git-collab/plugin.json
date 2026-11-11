@@ -1,0 +1,15 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "git-collab",
+  "version": "0.2.0",
+  "description": "Coordinate local Codex and remote agents through a clean Git handoff repository.",
+  "extensions": {
+    "com.openai": {
+      "requires_local_executor": true,
+      "interface": {
+        "displayName": "Git 协作",
+        "shortDescription": "任务交接、结果回执与有界 Codex 自动续跑"
+      }
+    }
+  }
+}

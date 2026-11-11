@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "git_collab": {
+      "command": "ddtui-collab-mcp",
+      "args": []
+    }
+  }
+}

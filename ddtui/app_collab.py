@@ -98,8 +98,8 @@ class AppCollabMixin:
                 self._collab_connected = True
                 if command == "tasks":
                     result = [{"task_id": t["task_id"], "revision": t["revision"], "state": t["state"],
-                               "owner": t["owner"], "priority": t["request"]["priority"]} for t in result]
-                if command == "status":
+                               "owner": t["owner"], "priority": t["request"]["priority"]} for t in result] if all("owner" in t for t in result) else result
+                if command == "status" and "tasks" in result:
                     result = {"binding": result["binding"], "tasks": len(result["tasks"]),
                               "pending_receipts": len(result["pending_receipts"]),
                               "pending_results": len(result["pending_results"])}

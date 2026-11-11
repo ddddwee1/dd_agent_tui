@@ -24,7 +24,7 @@
 
 ## 安装
 
-要求 Python 3.10+、Textual 8.0+。
+要求 Python 3.11+、Textual 8.0+。
 
 开发模式安装：
 
@@ -160,7 +160,7 @@ DDTUI_LOCAL_STREAM_USAGE = false
 
 ## 可选 Git 任务交接
 
-`ddtui-collab` 是独立的本地常驻收发进程，只使用 Git 和 Python 标准库，通过权限为 0600 的 Unix socket 与 TUI 通信。跨机通信通过交接仓完成，不需要 VPS relay、入站端口或双方直连。默认不启动，绑定后默认不监听；多个 TUI 会话共用一个收发进程，每个会话同时承接一个任务。
+`ddtui-collab` 是独立的本地常驻收发进程，传输层只使用 Git 和 Python 标准库，通过权限为 0600 的 Unix socket 与 TUI/MCP 通信。跨机通信通过交接仓完成，不需要 VPS relay、入站端口或双方直连。默认不启动，绑定后默认不监听；多个 TUI 会话共用一个收发进程，每个会话同时承接一个任务。协调端可以另外显式启用有预算的 Codex CLI 结果审查与后续请求生成。
 
 安装或更新 `pip install -e .` 后提供 `ddtui-collab` 命令；也可使用 `python -m ddtui.collab`。当前实现支持 macOS 和 Linux/WSL。运行数据默认保存在 `~/.ddtui/collab`，可用 `DDTUI_COLLAB_HOME` 指定较短的私有路径；同机各会话应使用相同路径。
 
@@ -194,7 +194,7 @@ ddtui-collab --binding default task status <task-id>
 ddtui-collab --binding default task release <task-id>
 ```
 
-`release` 可重复调用，但不能清除仍由执行进程持有的锁；旧会话的凭证不能释放新领取记录。断网时可以完成本地释放，远端回执保留待发状态。退出 TUI 不会关闭独立的收发进程；后者接收并缓存消息，LLM 执行由连接的 TUI 承担。`ddtui-collab stop` 在没有被领取任务时停止收发进程；也可用系统服务管理 `ddtui-collab serve`。
+`release` 可重复调用，但不能清除仍由执行进程持有的锁；旧会话的凭证不能释放新领取记录。断网时可以完成本地释放，远端回执保留待发状态。退出 TUI 不会关闭独立的收发进程；执行端的 LLM 由连接的 TUI 承担，协调端启用的 Codex 路由独立运行。`ddtui-collab stop` 要求已释放任务且没有运行中的 Codex 轮次；也可用系统服务管理 `ddtui-collab serve`。
 
 协作占用锁用于防止任务重复执行。NPU 执行继续使用项目原评测入口及其共享环境锁、包安装锁和物理卡锁；不同任务在同卡进行完整 A/B 采集时串行执行。
 
@@ -222,13 +222,56 @@ ddtui-collab --binding default task release <task-id>
 在协调端建立独立绑定并发布；发布行为不要求开启该绑定的收件监听：
 
 ```bash
-ddtui-collab --binding coordinator bind <repo-url> --worker-id coordinator
+ddtui-collab --binding coordinator bind <repo-url> --worker-id coordinator --role coordinator
 ddtui-collab --binding coordinator task publish /path/to/request.json
+ddtui-collab --binding coordinator on
 ```
 
 协调端独占写入 `codex/collab-requests` 分支的 `collab/tasks/<task-id>.json`。同一修订内容不可变化，修改时增加 `revision`。`worker_id` 必须匹配远端绑定；`priority` 影响任务列表顺序，领取由各 TUI 显式执行。`depends_on` 要求同一绑定内依赖任务的当前修订已有完成结果。协调端仍需审查证据后再决定后续任务。
 
-执行端独占写入 `codex/collab-<worker-id>` 分支，当前回执位于 `collab/results/<task-id>.json`。字段包括接收修订、执行修订、领取代次、状态，以及已准备好的结果。源码候选位于 `codex/<task-id>-<worker-id>` 分支。所有 push 均为普通快进，不强推，不回写协调端分支。协调端读取上述分支即可实现 Codex 或其他 agent 适配。
+执行端独占写入 `codex/collab-<worker-id>` 分支，当前回执位于 `collab/results/<task-id>.json`。字段包括接收修订、执行修订、领取代次、状态，以及已准备好的结果。源码候选位于 `codex/<task-id>-<worker-id>` 分支。所有 push 均为普通快进，不强推，不回写协调端分支。
+
+### 本地协调端接收与自动续跑
+
+`--role coordinator` 复用相同的 Git、SQLite 和 socket 核心，监听各任务指定的 worker 分支。结果按任务、修订及不可变内容去重，不因领取/暂停回执变化再次调用模型。接收端独立核对起点、候选分支、祖先关系、每个提交的允许路径、大小和敏感内容，然后持久化结果并发送 `received` 回执。结果审查完成后发送 `processed`；回执位于请求分支的 `collab/acks/<task-id>.json`，不修改任务修订。执行端 `task status` 的 `result_ack_state` 可查看对侧确认。
+
+手动审查时使用：
+
+```bash
+ddtui-collab --binding coordinator results --task operator-a
+ddtui-collab --binding coordinator result <event-id>
+ddtui-collab --binding coordinator ack <event-id>
+```
+
+自动续跑需要本机已安装并登录 Codex CLI，且用户已经授权该任务自动推进。为每个任务单独启用：
+
+```bash
+codex login status
+ddtui-collab --binding coordinator codex enable operator-a --timeout 120 --max-turns 10
+ddtui-collab --binding coordinator codex status operator-a
+ddtui-collab --binding coordinator codex pause operator-a
+ddtui-collab --binding coordinator codex resume operator-a
+```
+
+每个任务使用独立的 `codex exec` 会话，后续结果通过 `exec resume` 恢复同一会话。默认审查已核验候选的独立 checkout；`--workspace` 可显式选定本机 Git 工作区，`--model` 可固定模型。上下文与模型一经绑定便保持固定。运行使用只读 sandbox、完整 stdin 提示与绑定当前任务/修订的输出 schema，Codex 只返回结构化的 `await`、`request`、`close` 或 `needs_attention` 决策，不执行实验、上板或上传。它不会自动唤醒任意已有的桌面聊天。
+
+`request` 发布修订加一的后续任务，以已收取候选为源码起点，保留 worker、路径、依赖和原始授权契约；后续指令只覆盖当前一步，不逐轮堆积历史。`close` 发布 `retired` 请求；`await` 确认本轮结果并等待。硬件、完整验证、精度阈值、环境/卡锁及提交权限仍遵守原契约，执行端的 `completed` 不能转成正式验收通过。
+
+超时允许 10–3600 秒，轮次预算允许 1–1000；每次模型调用消耗一轮。`pause` 停止新增审查和保存决策的投递，在途调用到边界结束；`resume` 保留剩余预算。`enable` 可在空闲时明确补充预算。多个任务按各自会话推进，本机最多同时运行两轮 Codex，启动服务前可用 `DDTUI_CODEX_MAX_CONCURRENCY` 调整为 1–8。远端多个 ddtui 会话各领取一个任务，物理设备仍由原项目共享锁串行保护。
+
+模型决策先落盘再发 Git。断网或服务重启后只重试投递保存的决策，不重新调用模型；超时、缺少成功结束事件或崩溃期间的未知轮次进入 `needs_attention`。私有输出位于协作 home 的 `codex/`，不进入交接仓。核对输出与存活进程后，可人工 `ack`，或明确执行 `codex retry <event-id> --previous-stopped`。执行是否结束尚不清楚时不重试。接收监听开关、自动续跑开关和 TUI 任务领取分别控制。
+
+### Codex 插件
+
+仓库中的 [Git 协作插件](plugins/git-collab/README.md) 提供 skill 和 13 个 MCP 工具，直接调用同一收发服务，包含绑定、监听、任务发布、结果读取/确认和自动续跑控制。安装插件不会绑定仓库、开启监听或调用模型。
+
+```bash
+python -m pip install -e .
+codex plugin marketplace add /absolute/path/to/dd_agent_tui
+codex plugin add git-collab@ddtui-local --json
+```
+
+安装时使用 Python 3.11+，确保生成的 `ddtui-collab-mcp` 可在 Codex 的 PATH 中找到。插件依赖本机安装的共享核心，不内置另一套收发实现。安装后在新的 Codex 聊天中加载插件；已有聊天的工具列表不会保证实时刷新。若已有旧版收发进程，先暂停和释放在途工作，再 `ddtui-collab stop` 并重新连接。
 
 ### 结构化交接结果
 
