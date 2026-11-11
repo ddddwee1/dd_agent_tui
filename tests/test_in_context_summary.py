@@ -29,7 +29,7 @@ def test_in_context_summary_repeats_conversation_wire_shape():
     assert sent_tools == tools
     assert request[:-1] == original
     assert request[-1]["role"] == "user"
-    assert "上下文压缩" in request[-1]["content"]
+    assert "context compaction" in request[-1]["content"]
     assert any(m.get("ddtui_kind") == "history_summary" for m in candidate)
 
 

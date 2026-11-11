@@ -10,7 +10,7 @@
 
 ## 功能概览
 
-- 中文优先的对话体验。
+- 中文优先的对话体验。框架提示词使用英文，用户可见回复和界面思考摘要默认中文；不限制模型思考、内部工作记录或 agent 间沟通的语言。
 - 支持 DeepSeek thinking mode，以及 Codex OAuth provider。
 - 流式展示思考过程和最终回答。
 - 内置工具调用：bash、文件读写/编辑、搜索/glob、网页抓取、Brave Search、TODO、子 agent。

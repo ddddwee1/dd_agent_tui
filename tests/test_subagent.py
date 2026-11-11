@@ -88,10 +88,10 @@ def test_spawn_prompt_stack_and_override(playground):
         assert app.provider.stream_calls == [("cheap-model", "low")]
 
         sys_msgs = [m["content"] for m in sess.messages if m["role"] == "system"]
-        assert any("你是 ddtui 的子 agent" in c for c in sys_msgs)
-        assert not any("# 任务管理与记忆" in c for c in sys_msgs)  # not parent's
+        assert any("You are a ddtui subagent" in c for c in sys_msgs)
+        assert not any("# Task management and memory" in c for c in sys_msgs)
         assert any("测试命令是 make test" in c for c in sys_msgs)   # AGENTS.md kept
-        assert any("# 环境" in c for c in sys_msgs)
+        assert any("# Environment" in c for c in sys_msgs)
         assert any("FakeProv / cheap-model" in c for c in sys_msgs)
         assert any("# Subagent role / constraints" in c and "只读调查" in c
                    for c in sys_msgs)
