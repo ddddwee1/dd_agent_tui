@@ -258,7 +258,7 @@ class AppSubagentMixin:
                 raise
             except Exception as exc:
                 sess.messages.append(stamp_message({"role": "system", "ddtui_kind": "context_recovery",
-                                                    "content": f"上下文压缩未应用，原历史保留：{exc}"}))
+                                                    "content": f"Context compaction was not applied; original history retained: {exc}"}))
             finally:
                 progress.finish(outcome)
 
@@ -347,10 +347,10 @@ class AppSubagentMixin:
                 finally:
                     progress.finish(outcome)
                 return (
-                    f"已压缩：{stats['before_n']} → "
-                    f"{stats['after_n']} 条消息，约 "
-                    f"-{stats['saved']:,} 字符。原始历史可用 "
-                    "history_search/history_read 恢复。"
+                    f"Compacted: {stats['before_n']} → "
+                    f"{stats['after_n']} messages, approximately "
+                    f"{stats['saved']:,} characters saved. Recover original history with "
+                    "history_search/history_read."
                 )
             return None
 

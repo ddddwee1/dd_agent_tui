@@ -358,10 +358,10 @@ async def explore_end(
 
     kind = str(active.get("kind") or "custom")
     summary_content = (
-        f"# 探索摘要 {explore_id}（{kind}）\n\n"
+        f"# Exploration summary {explore_id} ({kind})\n\n"
         f"{summary}\n\n"
         f"raw_archive: {archive_path}\n"
-        f"history_batch: {batch}; history_search/history_read 可按引用恢复原文。"
+        f"history_batch: {batch}; use history_search/history_read to recover original text by reference."
     )
     summary_message = stamp_message({
         "role": "system",

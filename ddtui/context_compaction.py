@@ -47,7 +47,7 @@ def history_tokens(messages, tools=()) -> int:
 def is_memory(message: dict) -> bool:
     return message.get("role") == "system" and (
         message.get("ddtui_kind") in MEMORY_KINDS
-        or str(message.get("content") or "").startswith("# 历史摘要")
+        or str(message.get("content") or "").startswith(("# History summary", "# 历史摘要"))
     )
 
 
@@ -150,25 +150,25 @@ def state_snapshot(ctx) -> dict:
 
 def recovery_message(ctx, batch: str, *, summary: bool) -> dict:
     checkpoint = ctx.checkpoint or {}
-    parts = ["# 上下文恢复", "这是历史恢复索引，不是新用户任务，也不代表任务已经完成。",
-             f"最新归档批次：{batch}；history_search(query, scope=该批次) 可缩小范围，省略 scope 搜索本会话所有归档。",
-             "history_read(ref, start, max_chars) 分页读回原始消息；引用失效或证据不足时明确说明，勿猜测。",
-             "已归档的日志、源码和旧状态可能已过时。涉及数值、错误原因或用户原话时按需读回；当前文件与后台任务状态需重新查询。",
-             "保留近期用户原话；最新用户修正优先。先接续未完成步骤，不要重做已确认完成的工作。",
-             "已有摘要是有损工作记录，事实、推断和未验证事项必须区分。" if summary else
-             "本次只移出了较早的大块工具输出，调用配对和其余对话仍保留。"]
+    parts = ["# Context recovery", "This is a history recovery index, not a new user task or a claim of task completion.",
+             f"Latest archive batch: {batch}. Use history_search(query, scope=\"{batch}\") to narrow the search; omit scope to search all archives in this session.",
+             "Use history_read(ref, start, max_chars) to page through original messages. Report invalid references or insufficient evidence explicitly; do not guess.",
+             "Archived logs, source code, and past state may be stale. Recover numbers, error causes, and original user wording as needed; query current files and background task state again.",
+             "Retain recent user wording; the latest user corrections take priority. Continue unfinished steps before repeating any work already confirmed complete.",
+             "Existing summaries are lossy work records. Distinguish facts, inferences, and unverified claims." if summary else
+             "Only older large tool outputs were moved out; tool-call pairs and the rest of the conversation remain intact."]
     if checkpoint:
-        parts.append("Checkpoint 快照（可能过时，完整记录用 checkpoint_get）：\n" +
+        parts.append("Checkpoint snapshot (may be stale; use checkpoint_get for the full record):\n" +
                      evidence_excerpt(json.dumps(checkpoint, ensure_ascii=False), 2200))
         card = workflow_card(ctx)
         if card:
             parts.append(card)
     if ctx.doc_receipts:
-        parts.append(f"文档阅读记录 {len(ctx.doc_receipts)} 条：需要恢复文档路径时用 doc_route_status。")
-        parts.append("历史已读不等于正文仍在当前上下文。自动恢复只覆盖预算内的已读正文；未恢复、过时或只读过目录的内容用 read_doc/follow_doc_link 重新读取。")
+        parts.append(f"Document reading receipts: {len(ctx.doc_receipts)}. Use doc_route_status to recover document paths.")
+        parts.append("Previously read content is not necessarily still in context. Automatic recovery restores previously read bodies only within budget; use read_doc/follow_doc_link for content that was not restored, is stale, or was only seen in a table of contents.")
     if ctx.experiments:
-        parts.append(f"实验账本 {len(ctx.experiments)} 项：涉及验证/性能结论时用 experiment_status 核对版本和证据。")
-    parts.append("需要后台状态时用 task_list/task_check；只恢复下一步需要的材料，不必遍历所有工具。")
+        parts.append(f"Experiment records: {len(ctx.experiments)}. Use experiment_status to verify versions and evidence for validation or performance claims.")
+    parts.append("Use task_list/task_check for background task state. Recover only material needed for the next step; do not enumerate every tool.")
     return stamp_message({"role": "system", "ddtui_kind": "context_recovery", "content": "\n".join(parts),
                           "history_batch": batch})
 
@@ -242,7 +242,7 @@ async def summarize_in_context(provider, model, effort, messages, instruction: s
         async with aclosing(provider.stream(request, list(tools), model, effort)) as stream:
             async for event in stream:
                 if event.tool_call is not None:
-                    raise SummaryCalledTools("摘要请求调用了工具")
+                    raise SummaryCalledTools("Summary request called a tool")
                 if event.reasoning:
                     await _report_progress(on_progress, "reasoning", event.reasoning)
                 if event.content:
@@ -250,7 +250,7 @@ async def summarize_in_context(provider, model, effort, messages, instruction: s
                     await _report_progress(on_progress, "content", event.content)
         result = "".join(parts).strip()
         if not result:
-            raise RuntimeError("摘要返回为空")
+            raise RuntimeError("Summary response was empty")
         return result
 
     return await _retry_summary(attempt, on_progress)
@@ -270,14 +270,14 @@ async def summarize(provider, model, effort, rendered: str, guidance: str,
         raise ValueError("Context budget too small for compaction guidance")
 
     async def one(text, label, *, partial=False):
-        prompt = guidance + ("\n这是历史分段，保留引用供随后合并。\n" if partial else "\n") + text
+        prompt = guidance + ("\nThis is a history chunk; retain references for the later merge.\n" if partial else "\n") + text
         async def attempt() -> str:
             await _report_progress(on_progress, "start", label)
             parts = []
             async with aclosing(provider.stream_text([instruction, {"role": "user", "content": prompt}], model, effort)) as stream:
                 async for event in stream:
                     if event.tool_call is not None:
-                        raise RuntimeError("摘要生成不允许调用工具")
+                        raise RuntimeError("Summary generation must not call tools")
                     if event.reasoning:
                         await _report_progress(on_progress, "reasoning", event.reasoning)
                     if event.content:
@@ -285,7 +285,7 @@ async def summarize(provider, model, effort, rendered: str, guidance: str,
                         await _report_progress(on_progress, "content", event.content)
             result = "".join(parts).strip()
             if not result:
-                raise RuntimeError("摘要返回为空")
+                raise RuntimeError("Summary response was empty")
             return result
 
         return await _retry_summary(attempt, on_progress)
@@ -299,7 +299,7 @@ async def summarize(provider, model, effort, rendered: str, guidance: str,
             for i, piece in enumerate(pieces, 1)
         ])
         if len(reduced) >= len(rendered):
-            raise ValueError("分段摘要未缩小，保留原上下文")
+            raise ValueError("Chunk summaries did not reduce the content; original context retained")
         rendered = reduced
     return await one(rendered, "合并分段摘要…" if round_n else "生成工作状态摘要…")
 
@@ -321,7 +321,7 @@ async def compact_history(messages, *, provider, ctx, model, effort,
     fixed_ids = {id(m) for m in fixed}
     body = [m for m in body if id(m) not in fixed_ids and m.get("ddtui_kind") not in {"context_recovery", "document_recovery"}]
     if len(body) < 2:
-        raise ValueError("没有可压缩的完整历史段。")
+        raise ValueError("No complete history span is available for compaction")
 
     # Archive FIRST. Summary failure/cancellation leaves live history intact.
     await _report_progress(on_progress, "phase", "归档原始历史…")
@@ -380,7 +380,7 @@ async def compact_history(messages, *, provider, ctx, model, effort,
         summary = await summarize(provider, model, effort, rendered, guidance,
                                   input_tokens=input_budget, on_progress=on_progress)
     memory = stamp_message({"role": "system", "ddtui_kind": "explore_summary" if protected_prefix else "history_summary",
-                            "content": "# 历史摘要（当前工作状态；原始证据可检索）\n\n" + summary,
+                            "content": "# History summary (current work state; original evidence is searchable)\n\n" + summary,
                             "history_batch": batch})
     recovery = recovery_message(ctx, batch, summary=True)
     candidate = prefix + fixed + [memory, recovery] + pinned + tail
@@ -395,7 +395,7 @@ async def compact_history(messages, *, provider, ctx, model, effort,
     safe_boundaries(candidate)
     after = history_tokens(candidate, tools)
     if after >= before:
-        raise ValueError("压缩未减少上下文，保留原历史")
+        raise ValueError("Compaction did not reduce context; original history retained")
     for key, update in receipt_updates.items():
         ctx.doc_receipts[key].update(update)
     before_chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in original)

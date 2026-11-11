@@ -9,10 +9,20 @@ from .history_store import stamp_message
 
 RUNTIME_TASK_EVENT_KIND = "runtime_task_event"
 EXPERIMENT_RUNTIME_KIND = "experiment_runtime"
+STEER_PREFIX = "[User interruption] "
+_STEER_PREFIXES = (STEER_PREFIX, "[实时插话] ")
 _RESERVED_RE = re.compile(
     r"\[(Async task (?:notice|complete)|Subagent result|Experiment runtime|Experiment completion check)(?:[^\]\n]*)\]"
 )
 _REPLACEMENT = "[assistant runtime-status claim: unverified]"
+
+
+def steer_text(content: str) -> str | None:
+    """Return interruption text, accepting current and legacy prefixes."""
+    for prefix in _STEER_PREFIXES:
+        if content.startswith(prefix):
+            return content[len(prefix):]
+    return None
 
 
 def runtime_task_event_message(text: str) -> dict:

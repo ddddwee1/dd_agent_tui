@@ -9,6 +9,8 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from .runtime_messages import steer_text
+
 
 SUMMARY_KEY = "ddtui_thinking_summary"
 ROUND_KEY = "ddtui_thinking_round"
@@ -52,7 +54,7 @@ def thinking_summary_context(messages) -> tuple[str, str, list[dict], int]:
         if (
             message.get("role") == "user"
             and not message.get("ddtui_kind")
-            and not str(message.get("content") or "").startswith("[实时插话] ")
+            and steer_text(str(message.get("content") or "")) is None
         ):
             break
     scope.reverse()
@@ -67,12 +69,12 @@ def thinking_summary_context(messages) -> tuple[str, str, list[dict], int]:
             text, _ = summary_from_message(message)
             previous = text or previous
             for call in message.get("tool_calls") or []:
-                names[call.get("id")] = str((call.get("function") or {}).get("name") or "工具")[:80]
+                names[call.get("id")] = str((call.get("function") or {}).get("name") or "tool")[:80]
         elif role == "tool":
             result = str(message.get("content") or "")
             if len(result) > 400:
                 result = result[:150] + "…" + result[-249:]
-            tools.append({"name": names.get(message.get("tool_call_id"), "工具"), "result_excerpt": result})
+            tools.append({"name": names.get(message.get("tool_call_id"), "tool"), "result_excerpt": result})
             tools = tools[-3:]
     return task[:500], previous, tools, rounds + 1
 

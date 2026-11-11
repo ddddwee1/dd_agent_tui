@@ -83,18 +83,19 @@ def test_aborted_round_cannot_replace_committed_task_continuity():
     retry.cancel()
 
 
-def test_context_follows_tools_and_steer_but_new_user_task_starts_fresh():
+@pytest.mark.parametrize("steer_prefix", ["[User interruption] ", "[实时插话] "])
+def test_context_follows_tools_and_steer_but_new_user_task_starts_fresh(steer_prefix):
     messages = [
         {"role": "user", "content": "排查布局"},
         {"role": "assistant", "reasoning_content": "第一轮", SUMMARY_KEY: {"text": "先检查布局。"},
          "tool_calls": [{"id": "read-1", "function": {"name": "read_file"}}]},
         {"role": "tool", "tool_call_id": "read-1", "content": "Error: 文件不存在"},
-        {"role": "user", "content": "[实时插话] 注意窄窗口"},
+        {"role": "user", "content": f"{steer_prefix}注意窄窗口"},
         {"role": "user", "content": "后台任务完成", "ddtui_kind": "runtime_task_event"},
         {"role": "assistant", "reasoning_content": "第二轮"},
     ]
     task, previous, tools, round_number = thinking_summary_context(messages)
-    assert task == "排查布局\n[实时插话] 注意窄窗口"
+    assert task == f"排查布局\n{steer_prefix}注意窄窗口"
     assert previous == "先检查布局。" and round_number == 3
     assert tools == [{"name": "read_file", "result_excerpt": "Error: 文件不存在"}]
     messages.append({"role": "user", "content": "另一个任务"})

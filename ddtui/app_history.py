@@ -31,7 +31,7 @@ from .runtime_state import (
     read_json,
     turn_journal_path,
 )
-from .runtime_messages import EXPERIMENT_RUNTIME_KIND, RUNTIME_TASK_EVENT_KIND
+from .runtime_messages import EXPERIMENT_RUNTIME_KIND, RUNTIME_TASK_EVENT_KIND, steer_text
 from .state import TokenCounter
 from .thinking_summary import round_from_message, summary_from_message
 from .tools import DIFF_STRIP_TOOLS, PARENT_TOOL_SCHEMAS, SUBAGENT_TOOL_SCHEMAS
@@ -662,15 +662,16 @@ class AppHistoryMixin:
                 continue
             content = m.get("content") or ""
             if role == "user":
-                if not m.get("ddtui_kind") and not content.startswith("[实时插话] "):
+                interruption = steer_text(content)
+                if not m.get("ddtui_kind") and interruption is None:
                     thinking_round = 0
                 if m.get('ddtui_kind') == EXPERIMENT_RUNTIME_KIND:
                     continue  # Per-round controller facts are available through experiment_status.
                 if m.get("ddtui_kind") == RUNTIME_TASK_EVENT_KIND:
                     await self._mount_task_event_notice(content)
-                elif content.startswith("[实时插话] "):
+                elif interruption is not None:
                     await self._mount_widget(
-                        SteerBubble(content[len("[实时插话] "):])
+                        SteerBubble(interruption)
                     )
                 else:
                     await self._mount_widget(UserBubble(content))
@@ -839,8 +840,9 @@ class AppHistoryMixin:
             self.notify("没有可退回的用户消息", timeout=2.5)
             return
         raw_content = self.messages[last_user_idx].get("content") or ""
-        if raw_content.startswith("[实时插话] "):
-            raw_content = raw_content[len("[实时插话] "):]
+        interruption = steer_text(raw_content)
+        if interruption is not None:
+            raw_content = interruption
         del self.messages[last_user_idx:]
         self._drop_explore_if_truncated()
         await self._rebuild_conversation_view()

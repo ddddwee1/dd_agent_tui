@@ -28,7 +28,7 @@ from .api_retry import RequestRetry
 from .app_errors import _exception_block
 from .engine import ToolOutcome, TurnEngine, TurnObserver
 from .history_store import stamp_message
-from .runtime_messages import runtime_task_event_message
+from .runtime_messages import STEER_PREFIX, runtime_task_event_message
 from .thinking_summary import start_thinking_summary
 from .timeline_view import TimelineView
 from .tools import PARENT_TOOL_SCHEMAS
@@ -383,7 +383,7 @@ class AppAgentLoopMixin:
             pending_steer = self._steer
             self._steer = []
             for s, parked in pending_steer:
-                message = stamp_message({"role": "user", "content": f"[实时插话] {s}"})
+                message = stamp_message({"role": "user", "content": f"{STEER_PREFIX}{s}"})
                 self.messages.append(message)
                 try:
                     self._remote_emit(

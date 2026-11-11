@@ -119,7 +119,7 @@ def test_explore_end_replaces_span_with_summary(tmp_path, monkeypatch):
     ]
     summary = app.messages[4]
     assert summary.get("ddtui_kind") == "explore_summary"
-    assert "# 探索摘要 exp-1（debug）" in summary["content"]
+    assert "# Exploration summary exp-1 (debug)" in summary["content"]
     assert not any(
         "call_probe" in json.dumps(m, ensure_ascii=False) for m in app.messages
     )

@@ -129,13 +129,16 @@ def test_two_compactions_merge_old_state_and_preserve_sources():
     cc.safe_boundaries(second)
 
 
-def test_legacy_system_summaries_are_consolidated():
+@pytest.mark.parametrize("header", ["# History summary", "# 历史摘要"])
+def test_legacy_system_summaries_are_consolidated(header):
     messages = long_task()
-    messages[1:1] = [{"role": "system", "content": "# 历史摘要（来自 /compact）\n旧记忆"}]
+    messages[1:1] = [{"role": "system", "content": f"{header}\n旧记忆"}]
     provider = Provider()
     candidate, _ = compact(messages, provider=provider)
     assert "旧记忆" in str(provider.calls)
-    assert len([m for m in candidate if m.get("content", "").startswith("# 历史摘要")]) == 1
+    summaries = [m for m in candidate if cc.is_memory(m) and m.get("ddtui_kind") == "history_summary"]
+    assert len(summaries) == 1
+    assert summaries[0]["content"].startswith("# History summary")
 
 
 def test_evidence_excerpt_keeps_middle_errors_and_tail():

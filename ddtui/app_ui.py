@@ -21,6 +21,7 @@ from .config import (
     SUBAGENT_REAP_INTERVAL_SEC,
 )
 from .history_store import stamp_message
+from .runtime_messages import steer_text
 from .runtime_state import new_session_id
 from .thinking_summary import cancel_thinking_summaries
 from .timeline_view import TimelineView, format_duration
@@ -559,7 +560,7 @@ class AppUiMixin:
         goal = next((
             str(message.get("content") or "") for message in reversed(self.messages)
             if message.get("role") == "user" and not message.get("ddtui_kind")
-            and not str(message.get("content") or "").startswith("[实时插话] ")
+            and steer_text(str(message.get("content") or "")) is None
         ), "")
         height = getattr(self, "_workbench_height", self.size.height)
         input_rows = max(3, min(12, height // 3))

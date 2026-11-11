@@ -36,6 +36,7 @@ from .state import (
     async_task_status,
 )
 from .thinking_summary import normalize_summary, round_from_message, summary_from_message
+from .runtime_messages import steer_text
 from .ui_theme import UI
 
 
@@ -201,7 +202,7 @@ class UserBubble(Static):
 class SteerBubble(Static):
     """A user 'steer' interjection — submitted via Alt/Cmd+Enter while a
     turn is running. The accent marker identifies an interjection; it is injected
-    into the next LLM round as `[实时插话] <text>`."""
+    into the next LLM round as `[User interruption] <text>`."""
 
     DEFAULT_CSS = """
     SteerBubble {
@@ -1562,7 +1563,7 @@ class SubagentTabPane(VerticalScroll):
             # not interesting in a transcript view.
             return
         if role == "user":
-            if not m.get("ddtui_kind") and not str(m.get("content") or "").startswith("[实时插话] "):
+            if not m.get("ddtui_kind") and steer_text(str(m.get("content") or "")) is None:
                 self._thinking_round = 0
             self._append_transcript(UserBubble(m.get("content") or ""))
             return

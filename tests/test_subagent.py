@@ -242,7 +242,7 @@ def test_compact_self_keeps_list_identity(playground):
             await kwargs["on_progress"]("content", "摘要片段")
             assert app._live_subagents["sub-1"].phase == "compacting"
             kept = [m for m in messages if m["role"] == "system"]
-            kept.append({"role": "system", "content": "# 历史摘要\n（压缩）"})
+            kept.append({"role": "system", "content": "# History summary\n(compacted)"})
             return kept, {"before_n": len(messages), "after_n": len(kept), "saved": 12345}
 
         app._compact_messages = fake_compact
@@ -251,8 +251,8 @@ def test_compact_self_keeps_list_identity(playground):
         list_id = id(sess.messages)
         await _wait_round(sess)
         assert id(sess.messages) == list_id  # engine shares this object
-        assert any("# 历史摘要" in (m.get("content") or "") for m in sess.messages)
-        assert any("已压缩" in (m.get("content") or "")
+        assert any("# History summary" in (m.get("content") or "") for m in sess.messages)
+        assert any("Compacted:" in (m.get("content") or "")
                    for m in sess.messages if m["role"] == "tool")
         assert sess.last_result == "压缩后继续"
     asyncio.run(run())

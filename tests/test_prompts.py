@@ -50,7 +50,7 @@ def test_prompt_key_rules_present():
 
 
 def test_all_injection_tags_framed():
-    for tag in ["# 历史摘要", "# 上下文恢复", "# 探索摘要", "[实时插话]",
+    for tag in ["# History summary", "# Context recovery", "# Exploration summary", "[User interruption]",
                 "[Async task notice]", "[Async task complete]",
                 "[Subagent result]"]:
         assert tag in SYSTEM_PROMPT, tag

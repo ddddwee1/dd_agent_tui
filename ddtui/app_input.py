@@ -362,7 +362,7 @@ class AppInputMixin:
         self, event: "MultilineInput.SteerSubmitted"
     ) -> None:
         """Cmd/Ctrl+Enter inside the input box: stash the text into the
-        steer buffer; the next LLM round will see it as `[实时插话]`."""
+        steer buffer; the next LLM round will see it as `[User interruption]`."""
         text = event.value.strip()
         if not text:
             return

@@ -18,6 +18,7 @@ from ddtui.mcp_server import _condense_messages
 from ddtui.providers import CodexResponsesProvider, LLMStreamEvent, _messages_for_wire
 from ddtui.state import ToolContext
 from ddtui.tool_output import limit_tool_output, trim_tool_history
+from ddtui.widgets import SteerBubble
 from tests.test_app_loop import FakeProvider
 from tests.test_context_compaction import compact, long_task
 from tests.test_subagent import FakeApp, _wait_round
@@ -55,7 +56,7 @@ def test_session_save_resume_and_legacy_continuation(tmp_path, monkeypatch):
 
             times = [_assert_timestamp(message) for message in app.messages]
             assert times == sorted(times)
-            steer = next(m for m in app.messages if m.get("content") == "[实时插话] 保留接口")
+            steer = next(m for m in app.messages if m.get("content") == "[User interruption] 保留接口")
             assert any(kind == "message.append" and payload.get("message") is steer
                        for kind, payload in emitted)
             assert any(m.get("ddtui_kind") == "runtime_task_event" for m in app.messages)
@@ -65,13 +66,17 @@ def test_session_save_resume_and_legacy_continuation(tmp_path, monkeypatch):
             assert saved["messages"] == list(app.messages)
             await app._load_conversation(app._autosave_path.stem)
             assert list(app.messages) == saved["messages"]
+            assert len(app.query(SteerBubble)) == 1
 
             legacy = copy.deepcopy(saved)
             for message in legacy["messages"]:
                 message.pop("ddtui_timestamp")
+                if message.get("content") == "[User interruption] 保留接口":
+                    message["content"] = "[实时插话] 保留接口"
             (history.HISTORY_DIR / "legacy.json").write_text(json.dumps(legacy), encoding="utf-8")
             await app._load_conversation("legacy")
             assert list(app.messages) == legacy["messages"]
+            assert len(app.query(SteerBubble)) == 1
             old_count = len(app.messages)
             app.provider.rounds = [[LLMStreamEvent(content="继续完成")]]
             await app._agent_turn("继续")
