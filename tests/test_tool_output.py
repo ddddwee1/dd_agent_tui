@@ -75,8 +75,7 @@ def test_web_preview_archives_complete_fetched_text(tmp_path, monkeypatch):
     original = noisy_output()
 
     class Response:
-        headers = {"Content-Type": "text/plain; charset=utf-8"}
-        status = 200
+        headers = {"Content-Type": "application/json"}
 
         def __enter__(self):
             return self
@@ -84,12 +83,10 @@ def test_web_preview_archives_complete_fetched_text(tmp_path, monkeypatch):
         def __exit__(self, *args):
             pass
 
-        def geturl(self):
-            return "https://example.test/log"
-
         def read(self, size):
-            return original.encode()[:size]
+            return json.dumps({"title": "Log", "content": original}).encode()[:size]
 
+    monkeypatch.setattr("ddtui.tools_web.load_deepseek_api_key", lambda: "test-key")
     monkeypatch.setattr("ddtui.tools_web.urlopen", lambda *a, **kw: Response())
     result = tool_web_fetch(ctx, "https://example.test/log", max_output_chars=3000)
     assert len(result) <= 3000

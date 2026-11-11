@@ -160,21 +160,24 @@ NO_RIPGREP = _setting_flag("DDTUI_NO_RIPGREP", default=False)
 # DDTUI_NO_GITIGNORE=0 to make ripgrep honor .gitignore again and make
 # the Python fallback shell out to `git check-ignore`.
 NO_GITIGNORE = _setting_flag("DDTUI_NO_GITIGNORE", default=True)
-WEB_FETCH_TIMEOUT = 20
-WEB_FETCH_MAX_BYTES = 2_000_000   # cap raw download (~2 MB)
+# Web tools share the DeepSeek provider's credentials and API base URL.
+# Accept both the API root and an OpenAI-compatible /v1 base URL.
+DEEPSEEK_WEB_TOOLS_BASE_URL = (
+    DEEPSEEK_BASE_URL.rstrip("/").removesuffix("/v1") + "/v1/tools"
+)
+WEB_FETCH_ENDPOINT = DEEPSEEK_WEB_TOOLS_BASE_URL + "/fetch"
+WEB_FETCH_TIMEOUT = 60
+WEB_FETCH_MAX_BYTES = 2_000_000   # cap API JSON, including after decompression
+WEB_FETCH_URL_MAX_CHARS = 8_192
 WEB_FETCH_MAX_CHARS = 10_000      # cap returned text
 WEB_FETCH_HARD_CHAR_CAP = 50_000  # absolute upper bound when caller overrides
 
-# Web search (Brave). Key file is one line, ASCII; missing → web_search
-# returns a clear error rather than crashing.
-WEB_SEARCH_API_KEY_PATH = _setting_str(
-    "BRAVE_API_KEY_FILE", str(Path.home() / "brave_apikey.txt")
-)
-WEB_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+WEB_SEARCH_ENDPOINT = DEEPSEEK_WEB_TOOLS_BASE_URL + "/search"
 WEB_SEARCH_DEFAULT_COUNT = 5
-WEB_SEARCH_MAX_COUNT = 20         # Brave per-request cap
-WEB_SEARCH_TIMEOUT = 15
-WEB_SEARCH_SNIPPET_MAX_CHARS = 240  # truncate per-result description
+WEB_SEARCH_MAX_COUNT = 50
+WEB_SEARCH_QUERY_MAX_CHARS = 128
+WEB_SEARCH_TIMEOUT = 60
+WEB_SEARCH_SNIPPET_MAX_CHARS = 1_000  # retain model-oriented result summaries
 
 # Runtime log dir for task + terminal output/status files. Kept in the
 # per-user ~/.ddtui tree rather than world-readable /tmp — command output

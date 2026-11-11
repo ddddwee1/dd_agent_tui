@@ -13,7 +13,7 @@
 - 中文优先的对话体验。框架提示词使用英文，用户可见回复和界面思考摘要默认中文；不限制模型思考、内部工作记录或 agent 间沟通的语言。
 - 支持 DeepSeek thinking mode，以及 Codex OAuth provider。
 - 流式展示思考过程和最终回答。
-- 内置工具调用：bash、文件读写/编辑、搜索/glob、网页抓取、Brave Search、TODO、子 agent。
+- 内置工具调用：bash、文件读写/编辑、搜索/glob、网页抓取、DeepSeek Search、TODO、子 agent。
 - 写文件/编辑文件前弹窗确认。
 - 托管异步任务：后台/长任务用 `task_start`（写私有输出文件、按节奏通知 agent），用 `task_check` / `task_read` / `task_kill` / `task_list` 管理；侧栏有任务面板。
 - 会话 checkpoint：记录当前目标、证据、决策、blocker、active refs 和下一步。
@@ -531,15 +531,19 @@ ssh -tt host 'tmux new -A -s ddtui-agent'
 - 闲置 10 分钟自动回收。
 - 子 agent 不能再嵌套调用子 agent。
 
-### Web Search
+### Web Search & Fetch
 
-`web_search` 使用 Brave Search API。默认从 `~/brave_apikey.txt` 读取 key，也可以设置：
+`web_search` 和 `web_fetch` 使用 [DeepSeek Search & Fetch API](https://api-docs.deepseek.com/guides/search/)，复用 DeepSeek provider 的密钥：优先读取 `DEEPSEEK_API_KEY` 环境变量，否则读取 `DEEPSEEK_API_KEY_FILE` 指定的文件（默认 `~/deepseek_apikey.txt`）。已配置 DeepSeek 对话密钥时，搜索和抓取无需额外配置；使用 Codex provider 时也可调用，但仍需提供 DeepSeek 密钥。两个工具均跟随 `DEEPSEEK_BASE_URL`（支持 API 根地址或以 `/v1` 结尾的地址）。
 
 ```bash
-export BRAVE_API_KEY_FILE="$HOME/brave_apikey.txt"
+export DEEPSEEK_API_KEY_FILE="$HOME/deepseek_apikey.txt"
 ```
 
-如果没有 key，工具会返回清晰错误，不会让 TUI 崩溃。
+`web_search` 使用 `POST /v1/tools/search`。查询长度为 1–128 个 Unicode 字符，支持 `site:`、`-site:`、引号短语、`lang:`、`after:` 和 `before:` 等语法；默认返回 5 条结果，最多 50 条。结果包含标题、链接、摘要及可用的发布时间。网页正文可继续用 `web_fetch` 抓取。
+
+`web_fetch` 使用 `POST /v1/tools/fetch`，返回页面标题和 Markdown 正文。URL 必须是带主机名的 HTTP(S) 地址，不含用户名或密码，最多 8192 个 Unicode 字符。默认预览 10,000 字符，可通过 `max_output_chars`（兼容别名 `max_chars`）调整为 512–50,000 字符；超过预览长度的全文可用 `history_read` 回读。API 响应在解压前后均限制为 2 MB，超过限制会返回错误；抓取结果取决于目标站点的可用性和访问策略。
+
+如果没有 key，或 API 返回认证、余额、限流等错误，工具会返回清晰错误，不会让 TUI 崩溃。
 
 ## 工具安全说明
 

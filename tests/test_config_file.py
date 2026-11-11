@@ -7,7 +7,7 @@ import pytest
 
 import ddtui.config as cfg
 
-_PREFIXES = ("DDTUI_", "DEEPSEEK_", "CODEX_", "BRAVE_")
+_PREFIXES = ("DDTUI_", "DEEPSEEK_", "CODEX_")
 
 
 @pytest.fixture
@@ -61,6 +61,21 @@ def test_api_retry_settings(load_config, values, expected):
     c = load_config(env={"DDTUI_API_MAX_RETRIES": str(retries),
                          "DDTUI_API_READ_TIMEOUT": str(timeout)})
     assert (c.API_MAX_RETRIES, c.API_READ_TIMEOUT) == expected
+
+
+@pytest.mark.parametrize("base_url, expected", [
+    (None, "https://api.deepseek.com/v1/tools"),
+    ("https://proxy.test", "https://proxy.test/v1/tools"),
+    ("https://proxy.test/", "https://proxy.test/v1/tools"),
+    ("https://proxy.test/v1", "https://proxy.test/v1/tools"),
+    ("https://proxy.test/prefix/v1/", "https://proxy.test/prefix/v1/tools"),
+])
+def test_web_tools_use_deepseek_api_base(load_config, base_url, expected):
+    toml = f'DEEPSEEK_BASE_URL = "{base_url}"\n' if base_url else None
+    c = load_config(toml)
+    assert c.WEB_SEARCH_ENDPOINT == expected + "/search"
+    assert c.WEB_FETCH_ENDPOINT == expected + "/fetch"
+    assert c.CONFIG_FILE_UNUSED_KEYS == ()
 
 
 def test_file_value_used(load_config):

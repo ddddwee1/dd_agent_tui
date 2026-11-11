@@ -1305,10 +1305,9 @@ TOOLS = [
         "function": {
             "name": "web_fetch",
             "description": (
-                "Fetch the contents of an http(s) URL. HTML pages are stripped to "
-                "plain text (script/style/svg removed, whitespace collapsed); JSON, "
-                "XML, plain text and similar are returned verbatim. Binary content "
-                "(images, video, pdf, octet-stream, …) is refused. Output is "
+                "Fetch an http(s) web page via DeepSeek Fetch and return its title "
+                "and content as Markdown. Fetching depends on the target site's "
+                "availability and access policies. Output is "
                 "previewed within 10,000 characters by default; full fetched text "
                 "is archived for history_read when shortened."
             ),
@@ -1317,7 +1316,12 @@ TOOLS = [
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "Absolute http(s) URL to fetch.",
+                        "minLength": 1,
+                        "maxLength": 8192,
+                        "description": (
+                            "Absolute http(s) URL with a host, at most 8192 Unicode "
+                            "characters. Must not contain a username or password."
+                        ),
                     },
                     "max_output_chars": {
                         "type": "integer",
@@ -1336,25 +1340,32 @@ TOOLS = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the web via Brave Search and return a ranked "
-                "list of results (title / URL / snippet). Use this to "
+                "Search the web via DeepSeek Search and return a ranked "
+                "list of results (title / URL / summary / publication date when available). Use this to "
                 "find authoritative URLs to feed into web_fetch, or "
                 "to get a quick survey of recent information not in "
                 "the model's training. Returns plain text, one block "
-                "per result. Default 5 results, max 20."
+                "per result. Default 5 results, max 50."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query — same syntax as a Brave search box.",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": (
+                            "Search query, 1–128 Unicode characters. Supports site:, "
+                            "-site:, quoted phrases, lang:, after: and before: operators."
+                        ),
                     },
                     "count": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
                         "description": (
                             "Number of results to return. Default 5, "
-                            "max 20."
+                            "max 50."
                         ),
                     },
                 },
