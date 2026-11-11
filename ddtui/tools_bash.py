@@ -25,6 +25,7 @@ from .tool_utils import (
     _check_dangerous,
     _safe_path,
     _sandbox_error,
+    collab_spawn_kwargs,
 )
 
 
@@ -65,6 +66,7 @@ def tool_bash(
             text=True,
             timeout=BASH_TIMEOUT,
             cwd=cwd,
+            **collab_spawn_kwargs(ctx),
         )
     except subprocess.TimeoutExpired:
         return (

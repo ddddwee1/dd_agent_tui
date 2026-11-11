@@ -111,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 cwd=str(spec["workdir"]),
+                **({"pass_fds": (spec["collab_lock_fd"],)} if spec.get("collab_lock_fd") is not None else {}),
             )
             command_pid = _child.pid
             _write_status(

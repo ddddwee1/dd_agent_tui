@@ -224,6 +224,8 @@ class AppSubagentMixin:
         """
 
         async def before_round() -> None:
+            if getattr(self, "_collab_pausing", False):
+                raise asyncio.CancelledError("Parent collaboration task is pausing")
             if sess.park_requested:
                 sess.park_requested = False
                 sess.phase = "waiting"
@@ -545,6 +547,7 @@ class AppSubagentMixin:
             work_dir=self.ctx.work_dir,
             session_id=f"{self._session_id}-{sub_id}",
             is_subagent=True,
+            collab_lock_fd=getattr(self.ctx, "collab_lock_fd", None),
         )
         # Subagents get their OWN framework prompt — they must know they
         # are subagents (output returns to the parent, truncated) and

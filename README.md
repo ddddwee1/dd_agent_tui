@@ -138,7 +138,120 @@ flash 便宜约 3 倍）；Codex 则从 `~/.codex/models_cache.json` 里读服�
 
 切换 provider/model/effort 后，从下一轮请求开始生效。
 
-### 模型请求断线重连
+### 本地 OpenAI 兼容服务
+
+本地服务使用独立的 `local` provider，必须明确配置服务地址和模型名。该 provider 配置失败时直接报错，不回退到云模型；请求不附带 DeepSeek 专属的 `thinking`、`reasoning_effort` 字段，也不启用 DeepSeek 网页工具和旁路思考摘要。
+
+```toml
+# ~/.ddtui/config.toml
+DDTUI_PROVIDER = "local"
+DDTUI_LOCAL_BASE_URL = "http://127.0.0.1:8000/v1"
+DDTUI_LOCAL_MODEL = "your-served-model"
+# 按服务实际支持范围配置；0 表示上下文上限未知。
+DDTUI_LOCAL_CONTEXT_LIMIT = 0
+DDTUI_LOCAL_STREAM_USAGE = false
+# 服务要求认证时设置私有 key 文件，默认使用非秘密的 local 占位值。
+# DDTUI_LOCAL_API_KEY_FILE = "~/.ddtui/local_api_key"
+```
+
+服务须支持流式 chat completions、function tool calls 和明确的 `stop` / `tool_calls` 结束标记。真实服务兼容性需要连接目标服务验证。使用 DeepSeek 特有协议的自托管服务仍可选择 `deepseek` 并配置它的 base URL。
+
+如果本地 LLM 推理与 kernel 评测共用物理卡，可将**项目既有锁链**按顺序配置到 `DDTUI_LOCAL_RESOURCE_LOCKS`，值为绝对路径的 TOML 数组，或环境变量中的 JSON 数组。推理在请求期间获取这些锁的共享锁；使用同一物理卡锁的独占评测等待推理请求结束，其他会话的推理也会等待独占评测结束。路径必须已存在，不创建替代锁；等待上限由 `DDTUI_LOCAL_LOCK_TIMEOUT` 设置，默认 60 秒。实际设备预检、环境锁/包安装锁/卡锁顺序、模型服务的其他客户端和显存驻留仍需按目标机器核实。
+
+## 可选 Git 任务交接
+
+`ddtui-collab` 是独立的本地常驻收发进程，只使用 Git 和 Python 标准库，通过权限为 0600 的 Unix socket 与 TUI 通信。跨机通信通过交接仓完成，不需要 VPS relay、入站端口或双方直连。默认不启动，绑定后默认不监听；多个 TUI 会话共用一个收发进程，每个会话同时承接一个任务。
+
+安装或更新 `pip install -e .` 后提供 `ddtui-collab` 命令；也可使用 `python -m ddtui.collab`。当前实现支持 macOS 和 Linux/WSL。运行数据默认保存在 `~/.ddtui/collab`，可用 `DDTUI_COLLAB_HOME` 指定较短的私有路径；同机各会话应使用相同路径。
+
+### TUI 操作
+
+```text
+/collab bind <repo-url> --worker-id dt32
+/collab on
+/collab status
+/collab tasks
+/collab task resume <task-id>
+/collab task pause <task-id>
+/collab task release <task-id>
+/collab off
+```
+
+`bind` 支持 `--binding <name>` 和 `--interval <seconds>`；默认绑定名为 `default`，检查周期为 15 秒，允许 5–3600 秒。`/collab use <name>` 将空闲会话接到已有绑定。同一个绑定的仓库和 worker 身份固定；更换仓库使用另一个绑定名。每台执行机器使用唯一的 `worker_id`，协调端明确分配任务，不在断网后自动抢占或改派任务。
+
+`on` / `off` 只控制新请求的收取。`off` 后已领取的任务继续运行，已有结果和释放回执仍重试发送。检查分支没有变化时不 fetch；检查本身不生成提交，状态变化覆盖当前回执。Git 失败有退避，待发送消息留在本地，恢复后发送，不因此重新运行实验。
+
+`task resume` 获取任务的操作系统占用锁和版本化领取凭证，准备固定源码的独立 checkout，恢复该任务保存的上下文，然后启动当前 TUI 的 agent。不同任务具有独立目录、分支和历史；同一个任务已被会话或存活工具进程占用时拒绝重复领取。新请求修订在当前一轮结束后投递，源码只允许保留已有工作或干净地快进，不能覆盖运行中的目录。普通助手回答只表示一轮结束，不等于任务验证完成。
+
+恢复时重新读取当前项目规则与环境提示。已执行任务的历史缺失、损坏或目录不匹配时拒绝自动继续；模型失败时保留已提交的工具消息，状态变为 `needs_attention`，由用户或协调端核对后推进，避免丢失副作用证据后重复实验。
+
+`task pause` 在下一次模型请求边界停止新增操作，等待已运行的工具、子会话和后台任务结束，保存上下文后释放。交互终端仍存活时需要先结束该任务的终端。暂停后的任务保持暂停，新修订不会自动重新领取。`/clear`、`/load`、`/resume` 在持有任务时要求先释放，防止上下文与任务目录混用。
+
+正常 `/exit`、`/quit` 或 `Ctrl+Q` 先完成上述暂停和释放。异常退出后，存活的 bash、托管任务 runner 和终端继承占用锁，锁持续到这些进程结束；收发进程将消失的会话标为 `orphaned`，不会凭超时直接开放第二份执行。可在 TUI 已退出时使用恢复命令：
+
+```bash
+ddtui-collab --binding default task status <task-id>
+ddtui-collab --binding default task release <task-id>
+```
+
+`release` 可重复调用，但不能清除仍由执行进程持有的锁；旧会话的凭证不能释放新领取记录。断网时可以完成本地释放，远端回执保留待发状态。退出 TUI 不会关闭独立的收发进程；后者接收并缓存消息，LLM 执行由连接的 TUI 承担。`ddtui-collab stop` 在没有被领取任务时停止收发进程；也可用系统服务管理 `ddtui-collab serve`。
+
+协作占用锁用于防止任务重复执行。NPU 执行继续使用项目原评测入口及其共享环境锁、包安装锁和物理卡锁；不同任务在同卡进行完整 A/B 采集时串行执行。
+
+### 对侧发布请求与读取回执
+
+交接仓必须是**全新干净历史的源码仓**，只包含当前协作需要的白名单文件。不要将含凭据的完整项目仓或其旧历史镜像到交接仓；Git 认证通过 credential helper 或 SSH 身份提供，URL 禁止内嵌密码/token。
+
+协调端先将干净源码提交推到交接仓，再准备一个小型请求 JSON：
+
+```json
+{
+  "schema_version": 1,
+  "task_id": "operator-a",
+  "worker_id": "dt32",
+  "revision": 1,
+  "source_commit": "填写交接仓中实际存在的完整提交ID",
+  "paths": ["ascriptor/a5dt/operator_a"],
+  "instructions": "任务目标、有效域、固定依赖、实验预算和验证要求。",
+  "priority": 0,
+  "depends_on": [],
+  "state": "active"
+}
+```
+
+在协调端建立独立绑定并发布；发布行为不要求开启该绑定的收件监听：
+
+```bash
+ddtui-collab --binding coordinator bind <repo-url> --worker-id coordinator
+ddtui-collab --binding coordinator task publish /path/to/request.json
+```
+
+协调端独占写入 `codex/collab-requests` 分支的 `collab/tasks/<task-id>.json`。同一修订内容不可变化，修改时增加 `revision`。`worker_id` 必须匹配远端绑定；`priority` 影响任务列表顺序，领取由各 TUI 显式执行。`depends_on` 要求同一绑定内依赖任务的当前修订已有完成结果。协调端仍需审查证据后再决定后续任务。
+
+执行端独占写入 `codex/collab-<worker-id>` 分支，当前回执位于 `collab/results/<task-id>.json`。字段包括接收修订、执行修订、领取代次、状态，以及已准备好的结果。源码候选位于 `codex/<task-id>-<worker-id>` 分支。所有 push 均为普通快进，不强推，不回写协调端分支。协调端读取上述分支即可实现 Codex 或其他 agent 适配。
+
+### 结构化交接结果
+
+agent 提交允许范围内的源码后，将以下结构写入任务 checkout 的 `.ddtui-collab/result.json`；该目录和 `.local/` 仅保存在本机，并加入该 checkout 的 Git exclude：
+
+```json
+{
+  "task_id": "operator-a",
+  "revision": 1,
+  "status": "completed",
+  "summary": "实际完成内容、验证范围及仍存在的限制。",
+  "evidence": [".local/current-summary.json"],
+  "metrics": {"passed_cases": 3, "total_cases": 20}
+}
+```
+
+`status` 支持 `completed`、`blocked`、`failed`。`completed` 必须引用实际存在的相对证据文件；metrics 为可选的数值、布尔、null 及其列表/对象，不能以子集结果冒充完整验收。交接摘要最多 128 KiB，summary 最多 4000 字符；原始日志、完整环境和大型 profiler 产物留在执行机器。对侧直接读取 summary/metrics 和源码身份，原始证据路径是执行机上的相对引用。
+
+发布前检查工作区已提交、候选基于声明起点、每个候选提交均遵守 paths 范围、普通文本文件限制和已知敏感内容。新增文本每个 blob 最多 2 MiB，候选历史中不同 blob 合计最多 32 MiB。该检查覆盖新增历史中的中间提交，不能通过先提交敏感文件再删除绕过。任务自身的正式打包和隐私检查仍按项目要求执行。
+
+源码提交和结果一旦排入发件箱即固定身份；发送失败只重试这些已固定内容。回执中的 `validation=executor_report_requires_review` 表示执行端提供的证据，不能当作评测服务器验收或正式成绩。任务完成并回收成果后，协调端可发布增加修订号的 `state=retired` 请求，等待在途任务暂停，再移出共享范围；协作目录退场不代表删除完整项目中的归档源码。本地 checkout 和历史保留供明确的后续恢复或清理。
+
+## 模型请求断线重连
 
 DeepSeek 和 Codex 的模型请求遇到网络断开、读取超时、流式输出提前结束，或 HTTP 408/409/429/5xx 时，会自动重新发起当前请求。默认最多重试 5 次，依次等待 1、2、4、8、16 秒；更多重试的单次等待上限是 30 秒。认证失败、参数错误、输出长度限制等错误直接显示失败。
 

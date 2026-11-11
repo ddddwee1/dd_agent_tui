@@ -91,6 +91,7 @@ class AppUiMixin:
         # Managed async tasks can notify the agent when they complete.
         # Polling is cheap and avoids a thread per task.
         self.set_interval(1.0, self._poll_task_notifications)
+        self.set_interval(1.0, self._collab_poll)
         # Idle-reaper: end_agent any session that hasn't seen a
         # chat_agent call in SUBAGENT_IDLE_TIMEOUT_SEC. Coarse interval
         # — the only work to do is "kill timed-out sessions", not worth
@@ -102,6 +103,7 @@ class AppUiMixin:
             self.call_later(self._maybe_start_remote_from_config)
 
     def on_unmount(self) -> None:
+        self._collab_unmount()
         cancel_thinking_summaries(self)
         client = getattr(self, "_remote_client", None)
         if client is not None:
@@ -140,7 +142,7 @@ class AppUiMixin:
         worker_alive = (
             self._agent_worker is not None and not self._agent_worker.is_finished
         )
-        if self._busy or worker_alive or self._task_event_wake_scheduled:
+        if self._busy or worker_alive or self._task_event_wake_scheduled or getattr(self, "_collab_pausing", False):
             return
         self._task_event_wake_scheduled = True
         self.call_later(self._start_task_event_turn)
@@ -665,6 +667,9 @@ class AppUiMixin:
             self.call_later(self._remove_sub_tab, sid)
 
     def action_clear_chat(self) -> None:
+        if getattr(self, "_collab_task", None) and not getattr(self, "_collab_loading", False):
+            self.notify("先暂停并释放协作任务，再清空会话。", timeout=5)
+            return
         cancel_thinking_summaries(self)
         self._set_thinking_summary("")
         self._clear_timeline()

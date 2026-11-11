@@ -48,6 +48,7 @@ Repository = "https://github.com/ddddwee1/dd_agent_tui"
 ddtui = "ddtui.app:main"
 ddtui-remote-server = "ddtui.remote_server:main"
 ddtui-mcp = "ddtui.mcp_server:main"
+ddtui-collab = "ddtui.collab:main"
 
 [tool.setuptools]
 py-modules = ["agent"]

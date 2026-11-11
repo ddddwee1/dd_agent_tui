@@ -167,6 +167,7 @@ def tool_terminal_start(
             env=env,
             preexec_fn=_setup_child,
             close_fds=True,
+            **({"pass_fds": (ctx.collab_lock_fd,)} if getattr(ctx, "collab_lock_fd", None) is not None else {}),
         )
     except Exception as e:
         os.close(master_fd)

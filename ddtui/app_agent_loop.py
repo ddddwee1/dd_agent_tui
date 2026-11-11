@@ -279,6 +279,7 @@ class AppAgentLoopMixin:
         error), and then either pops the next queued message or returns.
         """
         self._set_busy(True)
+        self._collab_turn_error = False
         pending = user_text
         pending_is_runtime = runtime_event
         try:
@@ -309,6 +310,10 @@ class AppAgentLoopMixin:
                     pass
                 await self._autosave_conversation()
                 ok = await self._run_one_turn()
+                if getattr(self, "_collab_pausing", False):
+                    self._drop_queue()
+                    self._clear_turn_journal()
+                    return
                 if not ok:
                     self._clear_turn_journal()
                     # Turn-level runtime error already surfaced + rolled back.
@@ -338,6 +343,8 @@ class AppAgentLoopMixin:
                 await self._mount_widget(UserBubble(pending))
                 self._refresh_status()
         except asyncio.CancelledError:
+            if getattr(self, "_collab_task", None) and not getattr(self, "_collab_pausing", False):
+                self._collab_turn_error = True
             # ESC×2 cancellation: keep `self.messages` and the user's
             # bubble so the next submission picks up with full context.
             # The engine appends a "⛔ cancelled" stub for a tool that
@@ -371,12 +378,16 @@ class AppAgentLoopMixin:
                 self._remote_emit_snapshot("turn_finished")
             except Exception:
                 pass
+            if hasattr(self, "_collab_after_turn"):
+                await self._collab_after_turn()
 
     # ── inner loop: TurnEngine host ──
 
     async def _before_round(self, *, model=None, effort=None) -> None:
         """Pre-round hook: deliver managed-task completions and steer
         interjections at model-call boundaries, then journal."""
+        if hasattr(self, "_collab_before_round"):
+            await self._collab_before_round()
         await self._drain_task_events_to_messages()
 
         if self._steer:
@@ -455,9 +466,15 @@ class AppAgentLoopMixin:
             # slot. Otherwise the UserBubble + half-streamed thinking
             # would linger on screen as ghost content no longer in
             # `self.messages` — confusing on retry.
-            self._rollback_last_user_turn()
-            self._wipe_orphaned_turn_widgets()
-            notice = _exception_block("本轮运行失败（已回滚）", e)
+            if getattr(self, "_collab_task", None):
+                self._collab_turn_error = True
+                self._pair_orphan_tool_calls()
+                title = "协作运行失败（保留已执行工具，等待核对）"
+            else:
+                self._rollback_last_user_turn()
+                self._wipe_orphaned_turn_widgets()
+                title = "本轮运行失败（已回滚）"
+            notice = _exception_block(title, e)
             await self._mount_widget(notice)
             view.link("request", notice)
             return False

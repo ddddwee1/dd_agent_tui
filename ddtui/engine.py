@@ -182,7 +182,8 @@ class TurnEngine:
         self.provider = provider
         self.ctx = ctx
         self.messages = messages
-        self.tools = tools
+        self.tools = [tool for tool in tools if tool["function"]["name"] not in
+                      getattr(provider, "blocked_tools", ())]
         self.model = model
         self.effort = effort
         self.observer = observer or TurnObserver()
@@ -422,6 +423,8 @@ class TurnEngine:
         return await self._execute(name, args)
 
     async def _execute(self, name: str, args: dict) -> ToolOutcome:
+        if name in getattr(self.provider, "blocked_tools", ()):
+            return outcome_from_result(name, f"Error: {name} is disabled for this provider")
         result = await asyncio.to_thread(self.executor, self.ctx, name, args)
         return outcome_from_result(name, result)
 

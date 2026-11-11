@@ -16,6 +16,11 @@ from .config import DANGEROUS_SHELL_PATTERNS, NO_GITIGNORE
 _BASH_HARD_CHAR_CAP = 100_000
 
 
+def collab_spawn_kwargs(ctx) -> dict:
+    fd = getattr(ctx, "collab_lock_fd", None)
+    return {"pass_fds": (fd,)} if fd is not None else {}
+
+
 def ensure_private_dir(path: Path) -> Path:
     """Create *path* (and parents) and restrict it to the owner (0o700).
 

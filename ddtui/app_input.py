@@ -57,7 +57,15 @@ class AppInputMixin:
         if not text:
             return
         if text in ("/exit", "/quit"):
-            self.exit()
+            await self.action_quit()
+            return
+        if text == "/collab" or text.startswith("/collab "):
+            inp.text = ""
+            self.run_worker(self._handle_collab_command(text), group="collab-command", exclusive=False)
+            return
+        if (getattr(self, "_collab_task", None) and not getattr(self, "_collab_loading", False)
+                and (text in ("/clear", "/resume", "/load") or text.startswith(("/resume ", "/load ")))):
+            self.notify("先 /collab task pause 释放当前任务，再切换会话。", timeout=5)
             return
         if text == "/clear":
             self.action_clear_chat()
@@ -160,7 +168,7 @@ class AppInputMixin:
                 await self._mount_widget(Static(Text(
                     f"当前 provider: {self.provider_name}\n"
                     f"可用 provider: {', '.join(provider_names())}\n"
-                    "用法：/provider <deepseek|codex>  （切换后下一轮请求生效）",
+                    "用法：/provider <deepseek|codex|local>  （切换后下一轮请求生效）",
                     style="dim",
                 )))
                 return

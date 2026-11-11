@@ -32,6 +32,13 @@ from .config import (
     DEEPSEEK_MODEL,
     DEEPSEEK_REASONING_EFFORT,
     THINKING_SUMMARY_ENABLED,
+    LOCAL_BASE_URL,
+    LOCAL_MODEL,
+    LOCAL_API_KEY_PATH,
+    LOCAL_CONTEXT_LIMIT,
+    LOCAL_STREAM_USAGE,
+    LOCAL_RESOURCE_LOCKS,
+    LOCAL_LOCK_TIMEOUT,
 )
 
 
@@ -179,6 +186,7 @@ class DeepSeekProvider(LLMProvider):
     default_effort = DEEPSEEK_REASONING_EFFORT
     default_context_limit = DEEPSEEK_CONTEXT_LIMIT
     supports_thinking_summary = True
+    include_stream_usage = True
 
     # DeepSeek publishes no catalog endpoint, so the candidates are
     # inline; specs from the official pricing docs (both models: 1M
@@ -263,7 +271,7 @@ class DeepSeekProvider(LLMProvider):
             model=model,
             messages=_messages_for_wire(messages),
             stream=True,
-            stream_options={"include_usage": True},
+            **({"stream_options": {"include_usage": True}} if self.include_stream_usage else {}),
             **options,
         )
         completed = False
@@ -308,6 +316,71 @@ class DeepSeekProvider(LLMProvider):
                     )
         if not completed:
             raise IncompleteStreamError("DeepSeek 流式输出未完成：未收到结束标记")
+
+
+class LocalProvider(DeepSeekProvider):
+    """Explicit OpenAI-compatible endpoint, without DeepSeek-only request fields."""
+
+    key = "local"
+    label = "Local LLM"
+    default_model = LOCAL_MODEL
+    default_effort = "default"
+    default_context_limit = LOCAL_CONTEXT_LIMIT or None
+    supports_thinking_summary = False
+    include_stream_usage = LOCAL_STREAM_USAGE
+    blocked_tools = frozenset({"web_fetch", "web_search"})
+
+    def __init__(self):
+        from pathlib import Path
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(LOCAL_BASE_URL)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username
+                or parsed.password or not LOCAL_MODEL):
+            raise ProviderConfigError("local requires DDTUI_LOCAL_BASE_URL and DDTUI_LOCAL_MODEL; no provider fallback")
+        self.default_model = LOCAL_MODEL
+        locks = LOCAL_RESOURCE_LOCKS
+        try:
+            if isinstance(locks, str):
+                locks = json.loads(locks)
+            if not isinstance(locks, list) or not all(isinstance(p, str) and Path(p).expanduser().is_absolute() for p in locks):
+                raise ValueError("Expected absolute lock paths")
+        except (ValueError, TypeError) as error:
+            raise ProviderConfigError("DDTUI_LOCAL_RESOURCE_LOCKS must be an ordered list of existing absolute lock paths") from error
+        self.resource_locks = locks
+        key = "local"
+        if LOCAL_API_KEY_PATH:
+            try:
+                key = Path(LOCAL_API_KEY_PATH).expanduser().read_text().strip()
+            except OSError as error:
+                raise ProviderConfigError("Cannot read DDTUI_LOCAL_API_KEY_FILE") from error
+            if not key:
+                raise ProviderConfigError("DDTUI_LOCAL_API_KEY_FILE is empty")
+        self.client = AsyncOpenAI(api_key=key, base_url=LOCAL_BASE_URL, max_retries=0,
+                                  timeout=httpx.Timeout(60.0, read=API_READ_TIMEOUT))
+
+    def available_models(self):
+        return [ModelChoice(self.default_model, "Configured local model")]
+
+    async def stream(self, messages, tools, model, effort):
+        options = {"tools": tools, "tool_choice": "auto"} if tools else {}
+        async with aclosing(self._stream_response(messages, model, **options)) as stream:
+            async for event in stream:
+                yield event
+
+    async def complete_text(self, messages, model, effort):
+        from .local_resource import inference_locks
+        wire = [{k: v for k, v in m.items() if k != "reasoning_content"} for m in messages]
+        async with inference_locks(getattr(self, "resource_locks", ()), LOCAL_LOCK_TIMEOUT):
+            return await super().complete_text(wire, model, effort)
+
+    async def _stream_response(self, messages, model, **options):
+        from .local_resource import inference_locks
+        wire = [{k: v for k, v in m.items() if k != "reasoning_content"} for m in messages]
+        async with inference_locks(getattr(self, "resource_locks", ()), LOCAL_LOCK_TIMEOUT):
+            async with aclosing(super()._stream_response(wire, model, **options)) as stream:
+                async for event in stream:
+                    yield event
 
 
 class CodexResponsesProvider(LLMProvider):
@@ -821,7 +894,7 @@ def load_deepseek_api_key() -> str:
 
 
 def provider_names() -> tuple[str, ...]:
-    return ("deepseek", "codex")
+    return ("deepseek", "codex", "local")
 
 
 def build_provider(name: str) -> LLMProvider:
@@ -830,6 +903,8 @@ def build_provider(name: str) -> LLMProvider:
         return DeepSeekProvider()
     if normalized == "codex":
         return CodexResponsesProvider()
+    if normalized == "local":
+        return LocalProvider()
     raise ProviderConfigError(
         f"Unknown provider {name!r}. Available: {', '.join(provider_names())}"
     )

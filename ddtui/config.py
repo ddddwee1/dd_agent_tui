@@ -109,6 +109,14 @@ DEEPSEEK_BASE_URL = _setting_str("DEEPSEEK_BASE_URL", BASE_URL)
 DEEPSEEK_MODEL = MODEL
 DEEPSEEK_REASONING_EFFORT = REASONING_EFFORT
 
+LOCAL_BASE_URL = _setting_str("DDTUI_LOCAL_BASE_URL", "").strip()
+LOCAL_MODEL = _setting_str("DDTUI_LOCAL_MODEL", "").strip()
+LOCAL_API_KEY_PATH = _setting_str("DDTUI_LOCAL_API_KEY_FILE", "").strip()
+LOCAL_CONTEXT_LIMIT = max(0, _setting_int("DDTUI_LOCAL_CONTEXT_LIMIT", default=0))
+LOCAL_STREAM_USAGE = _setting_flag("DDTUI_LOCAL_STREAM_USAGE", default=False)
+LOCAL_RESOURCE_LOCKS = _raw_setting("DDTUI_LOCAL_RESOURCE_LOCKS") or []
+LOCAL_LOCK_TIMEOUT = max(1, _setting_int("DDTUI_LOCAL_LOCK_TIMEOUT", default=60))
+
 CODEX_HOME = Path(_setting_str("CODEX_HOME", str(Path.home() / ".codex")))
 CODEX_AUTH_PATH = Path(
     _setting_str("CODEX_AUTH_FILE", str(CODEX_HOME / "auth.json"))

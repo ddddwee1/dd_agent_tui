@@ -17,6 +17,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Static, TabbedContent, TabPane
 
 from .app_agent_loop import AppAgentLoopMixin
+from .app_collab import AppCollabMixin
 from .app_confirm import AppConfirmMixin, ToolConfirmHook, always_allow
 from .app_explore import AppExploreMixin
 from .app_history import AppHistoryMixin
@@ -53,6 +54,7 @@ from .widgets import (
 
 
 class AgentApp(
+    AppCollabMixin,
     AppRemoteMixin,
     AppInputMixin,
     AppHistoryMixin,
@@ -182,7 +184,7 @@ class AgentApp(
         try:
             self.provider = build_provider(provider_name)
         except ProviderConfigError as first_error:
-            fallback = None if provider_name.strip().lower() == "codex" else "codex"
+            fallback = None if provider_name.strip().lower() in ("codex", "local") else "codex"
             if fallback is not None:
                 try:
                     self.provider = build_provider(fallback)
@@ -297,6 +299,7 @@ class AgentApp(
         self._esc_armed = False
         self._esc_disarm_timer = None
         self._init_remote_state()
+        self._init_collab_state()
 
     # ─ conversation history ─
 
@@ -396,7 +399,8 @@ def main() -> None:
             "Provider configuration error: "
             f"{e}\n"
             "请设置 DEEPSEEK_API_KEY / DEEPSEEK_API_KEY_FILE，"
-            "或先运行 `codex login` 后用 DDTUI_PROVIDER=codex。"
+            "或先运行 `codex login` 后用 DDTUI_PROVIDER=codex；"
+            "本地服务使用 DDTUI_PROVIDER=local、DDTUI_LOCAL_BASE_URL 和 DDTUI_LOCAL_MODEL。"
         ) from e
     app.run()
 

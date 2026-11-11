@@ -234,6 +234,8 @@ class ToolContext:
 
     work_dir: str
     session_id: str = ""
+    # Optional collaboration claim, inherited by tool supervisors until they exit.
+    collab_lock_fd: int | None = None
     terminals: dict[str, TerminalSession] = field(default_factory=dict)
     tasks: dict[str, AsyncTask] = field(default_factory=dict)
     checkpoint: dict | None = None

@@ -540,6 +540,7 @@ def tool_task_start(
         "artifact_hashes": artifact_hashes,
         "experiment_id": experiment_id,
         "started_wall": started_wall,
+        "collab_lock_fd": getattr(ctx, "collab_lock_fd", None),
     }
     atomic_write_json(spec_path, spec)
     try:
@@ -558,6 +559,7 @@ def tool_task_start(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            **({"pass_fds": (ctx.collab_lock_fd,)} if getattr(ctx, "collab_lock_fd", None) is not None else {}),
         )
     except Exception as e:
         clear_path(spec_path)
