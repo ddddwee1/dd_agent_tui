@@ -150,6 +150,22 @@ def test_evidence_excerpt_keeps_middle_errors_and_tail():
     assert len(excerpt) <= 1600
 
 
+def test_evidence_excerpt_preserves_compiler_location_and_details():
+    diagnostic = (
+        "error: incompatible tensor shape\n"
+        "  --> kernels/add.py:34:7\n"
+        "   |\n"
+        "34 |     add(left, right)\n"
+        "   |     ^^^^^^^^^^^^^^^^\n"
+        "hint: check the input dimensions"
+    )
+    body = "opening\n" + "ordinary log\n" * 1000 + diagnostic + "\n" + "ordinary log\n" * 1000 + "exit code: 1"
+    excerpt = cc.evidence_excerpt(body)
+    assert diagnostic in excerpt
+    assert "exit code: 1" in excerpt
+    assert len(excerpt) <= 1600
+
+
 def test_full_arguments_and_runtime_event_identity_reach_archive():
     messages = long_task()
     messages[2]["tool_calls"][0]["function"]["arguments"] = json.dumps({"path": "source.py", "content": "x" * 3000 + "argument-end"})

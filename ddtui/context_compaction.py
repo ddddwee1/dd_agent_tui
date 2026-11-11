@@ -25,6 +25,8 @@ MEMORY_KINDS = {"history_summary", "context_recovery", "explore_summary"}
 CompactionProgress = Callable[[str, str], Awaitable[None]]
 _SIGNAL = re.compile(r"error|fail|exception|traceback|assert|exit.?code|return.?code|"
                      r"passed|success|sha.?256|正确|失败|错误|耗时", re.I)
+_DIAGNOSTIC_LOCATION = re.compile(r"^\s*-->\s+.+:\d+:-?\d+\s*$")
+_DIAGNOSTIC_DETAIL = re.compile(r"^\s*(?:(?:\d+\s+)?\||hint:)")
 
 
 def estimate_tokens(value) -> int:
@@ -56,16 +58,30 @@ def is_user_instruction(message: dict) -> bool:
 
 
 def evidence_excerpt(text: str, limit: int = COMPACT_TOOL_SNIPPET_CHARS) -> str:
-    """Head, diagnostic lines and tail, with explicit gaps; never a claim of completeness."""
+    """Head, located diagnostic blocks and tail, with explicit gaps."""
     if len(text) <= limit:
         return text
     edge = max(1, limit // 4)
     head, tail = text[:edge], text[-edge:]
     diagnostic_budget = max(0, limit - 2 * edge - 100)
     selected = []
+    selected_lines = set()
     used = 0
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not index or not _DIAGNOSTIC_LOCATION.match(line) or not _SIGNAL.search(lines[index - 1]):
+            continue
+        end = index + 1
+        while end < len(lines) and _DIAGNOSTIC_DETAIL.match(lines[end]):
+            end += 1
+        block_lines = lines[index - 1:end]
+        block = "\n".join(block_lines)
+        if block not in head and block not in tail and used + len(block) + 1 <= diagnostic_budget:
+            selected.append(block)
+            selected_lines.update(block_lines)
+            used += len(block) + 1
     for line in text[edge:-edge].splitlines():
-        if _SIGNAL.search(line):
+        if line not in selected_lines and _SIGNAL.search(line):
             snippet = line[:min(400, diagnostic_budget - used)]
             if snippet:
                 selected.append(snippet)
